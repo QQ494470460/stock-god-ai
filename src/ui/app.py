@@ -31,210 +31,95 @@ st.set_page_config(
 # ========== 全局样式 ==========
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
-    /* 基础 */
-    * { font-family: 'Inter', -apple-system, sans-serif; }
-
-    /* 🚨 核弹：所有自定义卡片子元素强制深色文字 */
-    .kpi-card, .kpi-card *, .predict-card, .predict-card *,
-    .signal-tag, .signal-tag *, .stat-mini, .stat-mini *,
-    .chart-box, .chart-box h3 {
-        color: #1e293b !important;
-    }
-    /* 辅助色标签覆盖 */
-    .kpi-label, .predict-card .label, .stat-mini .label, .signal-tag .desc {
-        color: #94a3b8 !important;
-    }
-
-    /* ----- 渐变大标题 ----- */
+    /* ====== 纯色大标题（不用渐变偷懒，避免透明字） ====== */
     .main-header {
-        font-size: 2.8rem;
+        font-size: 2.4rem;
         font-weight: 800;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.3rem;
+        color: #5b21b6;
+        margin-bottom: 0.2rem;
         letter-spacing: -0.02em;
     }
     .sub-header {
-        font-size: 1.1rem;
-        color: #64748b !important;
-        margin-bottom: 1.5rem;
-    }
-
-    /* ----- 指标卡片（概览顶栏）----- */
-    .kpi-row {
-        display: flex;
-        gap: 1rem;
-        flex-wrap: wrap;
-        margin: 1rem 0;
-    }
-    .kpi-card {
-        flex: 1;
-        min-width: 160px;
-        background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 1.2rem 1.4rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.02);
-        transition: box-shadow 0.2s, transform 0.2s;
-    }
-    .kpi-card:hover {
-        box-shadow: 0 4px 12px rgba(102,126,234,0.12);
-        transform: translateY(-1px);
-    }
-    .kpi-label {
-        font-size: 0.78rem;
-        font-weight: 500;
-        color: #94a3b8 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-bottom: 0.25rem;
-    }
-    .kpi-value {
-        font-size: 1.35rem;
-        font-weight: 700;
-        color: #1e293b !important;
-    }
-
-    /* ----- AI 预测卡片（个股分析）----- */
-    .predict-row {
-        display: flex;
-        gap: 0.8rem;
-        flex-wrap: wrap;
-        margin: 1.2rem 0;
-    }
-    .predict-card {
-        flex: 1;
-        min-width: 140px;
-        border-radius: 14px;
-        padding: 1rem 1.2rem;
-        text-align: center;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        transition: transform 0.15s;
-        border: 1px solid #f1f5f9;
-    }
-    .predict-card:hover { transform: translateY(-2px); }
-    .predict-card .label {
-        font-size: 0.75rem;
-        font-weight: 500;
-        color: #94a3b8 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    .predict-card .value {
-        font-size: 1.6rem;
-        font-weight: 700;
-        margin-top: 0.3rem;
-    }
-    .predict-card.score  { background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%); border-color: #e9d5ff; }
-    .predict-card.up     { background: linear-gradient(135deg, #fff5f5 0%, #fee2e2 100%); border-color: #fecaca; }
-    .predict-card.neutral{ background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); border-color: #fde68a; }
-    .predict-card.down   { background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border-color: #bbf7d0; }
-    .predict-card.signal { background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%); border-color: #e2e8f0; }
-
-    /* ----- 图表区容器 ----- */
-    .chart-box {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 0.5rem 1rem 0.2rem 1rem;
-        margin-bottom: 1rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    }
-    .chart-box h3 {
-        color: #1e293b !important;
-        font-weight: 600;
         font-size: 1rem;
-        margin: 0.6rem 0 0.3rem 0;
+        color: #6b7280;
+        margin-bottom: 1rem;
     }
 
-    /* ----- 信号卡片 ----- */
-    .signal-row {
+    /* ====== 节标题 ====== */
+    .section-title {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: #1f2937;
+        margin: 1.2rem 0 0.5rem 0;
+        padding-bottom: 0.35rem;
+        border-bottom: 2px solid #e5e7eb;
+    }
+
+    /* ====== 卡片组通用 ====== */
+    .card-row {
+        display: flex;
+        gap: 0.75rem;
+        flex-wrap: wrap;
+        margin: 0.8rem 0;
+    }
+    .mini-card {
+        flex: 1;
+        min-width: 120px;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 0.9rem 1rem;
+        text-align: center;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .mini-card .label {
+        font-size: 0.72rem;
+        font-weight: 500;
+        color: #9ca3af;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .mini-card .val {
+        font-size: 1.2rem;
+        font-weight: 700;
+        color: #1f2937;
+        margin-top: 0.2rem;
+    }
+
+    /* ====== 信号标签 ====== */
+    .tag-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 0.5rem;
-        margin: 0.6rem 0;
+        gap: 0.4rem;
+        margin: 0.5rem 0;
     }
-    .signal-tag {
+    .tag {
         display: inline-flex;
         align-items: center;
-        gap: 0.35rem;
-        padding: 0.45rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.82rem;
+        gap: 0.3rem;
+        padding: 0.35rem 0.7rem;
+        border-radius: 18px;
+        font-size: 0.8rem;
         font-weight: 500;
-        color: #1e293b !important;
-        border: 1px solid transparent;
+        color: #1f2937;
         white-space: nowrap;
     }
-    .signal-tag.bullish { background: #dcfce7; border-color: #bbf7d0; }
-    .signal-tag.bearish { background: #fee2e2; border-color: #fecaca; }
-    .signal-tag.warning { background: #fef3c7; border-color: #fde68a; }
-    .signal-tag.info    { background: #dbeafe; border-color: #bfdbfe; }
+    .tag.bull { background: #d1fae5; border: 1px solid #6ee7b7; }
+    .tag.bear { background: #fee2e2; border: 1px solid #fca5a5; }
+    .tag.warn { background: #fef3c7; border: 1px solid #fcd34d; }
+    .tag.info { background: #dbeafe; border: 1px solid #93c5fd; }
 
-    /* ----- 统计卡片 ----- */
-    .stat-row {
-        display: flex;
-        gap: 0.6rem;
-        flex-wrap: wrap;
-        margin: 0.4rem 0;
-    }
-    .stat-mini {
-        flex: 1;
-        min-width: 90px;
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 0.6rem 0.8rem;
-        text-align: center;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-    }
-    .stat-mini .label {
-        font-size: 0.7rem;
-        font-weight: 500;
-        color: #94a3b8 !important;
-        text-transform: uppercase;
-    }
-    .stat-mini .val {
-        font-size: 1.05rem;
-        font-weight: 700;
-        color: #1e293b !important;
-        margin-top: 0.15rem;
-    }
-
-    /* ----- 节标题 ----- */
-    .section-title {
-        font-size: 1.15rem;
-        font-weight: 700;
-        color: #1e293b !important;
-        margin: 1.5rem 0 0.5rem 0;
-        padding-bottom: 0.4rem;
-        border-bottom: 2px solid #e2e8f0;
-    }
-    .section-title span {
-        background: linear-gradient(135deg, #667eea, #764ba2);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-
-    /* ----- 侧边栏美化 ----- */
+    /* ====== 侧边栏 ====== */
     section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
-        border-right: 1px solid #e2e8f0;
+        background: #f9fafb;
     }
 
-    /* ----- 通用颜色类 ----- */
-    .c-red    { color: #ef4444 !important; }
-    .c-green  { color: #10b981 !important; }
-    .c-amber  { color: #f59e0b !important; }
-    .c-purple { color: #8b5cf6 !important; }
-    .c-slate  { color: #64748b !important; }
-    .c-dark   { color: #1e293b !important; }
-
-    /* plotly 容器去边距 */
-    .js-plotly-plot, .plot-container { border-radius: 10px !important; }
+    /* ====== 颜色快捷类 ====== */
+    .red   { color: #dc2626; font-weight: 600; }
+    .green { color: #059669; font-weight: 600; }
+    .amber { color: #d97706; font-weight: 600; }
+    .purple{ color: #7c3aed; font-weight: 600; }
+    .gray  { color: #6b7280; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -257,7 +142,7 @@ with st.sidebar:
 
     st.markdown("---")
     ready = predictor.is_ready
-    s_cls = "c-green" if ready else "c-red"
+    s_cls = "green" if ready else "red"
     dot_clr = "#10b981" if ready else "#ef4444"
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
@@ -274,28 +159,28 @@ if page == "🏠 概览":
 
     # KPI卡片
     st.markdown(f"""
-    <div class="kpi-row">
-        <div class="kpi-card">
-            <div class="kpi-label">📊 股票池</div>
-            <div class="kpi-value">{len(fetcher.get_stock_list())} 只</div>
+    <div class="card-row">
+        <div class="mini-card">
+            <div class="label">📊 股票池</div>
+            <div class="val">{len(fetcher.get_stock_list())} 只</div>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">🧠 模型状态</div>
-            <div class="kpi-value">{'✅ 就绪' if predictor.is_ready else '❌ 未训练'}</div>
+        <div class="mini-card">
+            <div class="label">🧠 模型状态</div>
+            <div class="val">{'✅ 就绪' if predictor.is_ready else '❌ 未训练'}</div>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">⚡ 集成引擎</div>
-            <div class="kpi-value">XGB + LGBM</div>
+        <div class="mini-card">
+            <div class="label">⚡ 集成引擎</div>
+            <div class="val">XGB + LGBM</div>
         </div>
-        <div class="kpi-card">
-            <div class="kpi-label">🎯 决策树数量</div>
-            <div class="kpi-value">{predictor.xgb_model.n_estimators if predictor.xgb_model else '—'}</div>
+        <div class="mini-card">
+            <div class="label">🎯 决策树数量</div>
+            <div class="val">{predictor.xgb_model.n_estimators if predictor.xgb_model else '—'}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     # 市场热点
-    st.markdown('<div class="section-title"><span>🔥</span> 市场热点板块</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔥 市场热点板块</div>', unsafe_allow_html=True)
 
     try:
         hotspots = fetcher.get_sector_hotspots()
@@ -304,7 +189,7 @@ if page == "🏠 概览":
             for i, (_, row) in enumerate(hotspots.head(5).iterrows()):
                 with cols[i]:
                     pct = row.get("涨跌幅", 0)
-                    c_cls = "c-red" if pct > 0 else "c-green"
+                    c_cls = "red" if pct > 0 else "green"
                     st.markdown(f"""
                     <div style="text-align:center; padding:14px 8px; border-radius:12px;
                                 background:linear-gradient(135deg, #ffffff, #f8fafc);
@@ -318,10 +203,10 @@ if page == "🏠 概览":
 
     st.markdown("---")
     st.markdown("""
-    <div style="background:linear-gradient(135deg, #faf5ff, #f3e8ff); border:1px solid #e9d5ff;
-                border-radius:14px; padding:1.2rem 1.5rem; margin-top:1rem;">
-        <h4 style="color:#7c3aed; margin-bottom:0.5rem;">🚀 快速开始</h4>
-        <p style="color:#64748b; margin:0; font-size:0.9rem;">
+    <div style="background:#f5f3ff; border:1px solid #ddd6fe;
+                border-radius:12px; padding:1rem 1.2rem; margin-top:1rem;">
+        <h4 style="color:#7c3aed; margin:0 0 0.3rem 0;">🚀 快速开始</h4>
+        <p style="color:#4b5563; margin:0; font-size:0.85rem;">
             ① 训练模型 → ② <b>AI选股</b>获取推荐 → ③ <b>个股分析</b>深度研判
         </p>
     </div>
@@ -397,7 +282,7 @@ elif page == "🔍 AI选股":
                                       yaxis=dict(autorange="reversed"), margin=dict(l=10, r=30, t=10, b=10))
                     st.plotly_chart(fig, use_container_width=True)
 
-                st.markdown('<div class="section-title"><span>📋</span> 推荐详情</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">📋 推荐详情</div>', unsafe_allow_html=True)
                 st.dataframe(
                     result_df,
                     use_container_width=True,
@@ -436,33 +321,33 @@ elif page == "📊 个股分析":
             if predictor.is_ready:
                 pred = predictor.predict_single(df, stock_code, stock_code)
                 score = pred.score
-                s_cls = "c-red" if score >= 80 else ("c-amber" if score >= 60 else "c-green")
+                s_cls = "red" if score >= 80 else ("amber" if score >= 60 else "green")
                 xgb_sig = "📈 买入" if pred.xgb_signal == 1 else ("📉 卖出" if pred.xgb_signal == -1 else "➡️ 持有")
                 lgb_sig = "📈 买入" if pred.lgb_signal == 1 else ("📉 卖出" if pred.lgb_signal == -1 else "➡️ 持有")
 
                 st.markdown(f"""
-                <div class="predict-row">
-                    <div class="predict-card score">
+                <div class="card-row">
+                    <div class="mini-card" style="background:#f5f3ff; border-color:#ddd6fe;">
                         <div class="label">🤖 AI 综合评分</div>
-                        <div class="value {s_cls}">{score:.0f}</div>
+                        <div class="val {s_cls}">{score:.0f}</div>
                     </div>
-                    <div class="predict-card up">
+                    <div class="mini-card" style="background:#fef2f2; border-color:#fecaca;">
                         <div class="label">📈 上涨概率</div>
-                        <div class="value c-red">{pred.prob_up*100:.1f}%</div>
+                        <div class="val red">{pred.prob_up*100:.1f}%</div>
                     </div>
-                    <div class="predict-card neutral">
+                    <div class="mini-card" style="background:#fffbeb; border-color:#fde68a;">
                         <div class="label">➡️ 震荡概率</div>
-                        <div class="value c-amber">{pred.prob_neutral*100:.1f}%</div>
+                        <div class="val amber">{pred.prob_neutral*100:.1f}%</div>
                     </div>
-                    <div class="predict-card down">
+                    <div class="mini-card" style="background:#ecfdf5; border-color:#a7f3d0;">
                         <div class="label">📉 下跌概率</div>
-                        <div class="value c-green">{pred.prob_down*100:.1f}%</div>
+                        <div class="val green">{pred.prob_down*100:.1f}%</div>
                     </div>
-                    <div class="predict-card signal">
+                    <div class="mini-card">
                         <div class="label">🔮 模型信号</div>
-                        <div class="value" style="font-size:0.9rem; line-height:1.5;">
-                            <span class="c-red">XGB</span> {xgb_sig}<br>
-                            <span class="c-purple">LGB</span> {lgb_sig}
+                        <div class="val" style="font-size:0.85rem; line-height:1.6;">
+                            <span class="red">XGB</span> {xgb_sig}<br>
+                            <span class="purple">LGB</span> {lgb_sig}
                         </div>
                     </div>
                 </div>
@@ -566,7 +451,7 @@ elif page == "📊 个股分析":
             st.markdown('</div>', unsafe_allow_html=True)
 
             # ====== 技术信号 ======
-            st.markdown('<div class="section-title"><span>🧠</span> 技术信号总结</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">🧠 技术信号总结</div>', unsafe_allow_html=True)
 
             last_close = float(close.iloc[-1])
             ma5_now = float(close.rolling(5).mean().iloc[-1])
@@ -587,7 +472,7 @@ elif page == "📊 个股分析":
             elif last_close < ma5_now < ma20_now < ma60_now:
                 signals.append(("bearish", "📉 空头排列", "均线全面下行"))
             else:
-                signals.append(("warning", "⚠️ 均线交织", "方向不明，震荡整理"))
+                signals.append(("warn", "⚠️ 均线交织", "方向不明，震荡整理"))
 
             ma5_prev = float(close.rolling(5).mean().iloc[-2])
             ma20_prev = float(close.rolling(20).mean().iloc[-2])
@@ -597,7 +482,7 @@ elif page == "📊 个股分析":
                 signals.append(("bearish", "🔻 MA死叉", "MA5下穿MA20"))
 
             if rsi14_now > 70:
-                signals.append(("warning", f"⚠️ RSI超买({rsi14_now:.0f})", "注意回调"))
+                signals.append(("warn", f"⚠️ RSI超买({rsi14_now:.0f})", "注意回调"))
             elif rsi14_now < 30:
                 signals.append(("bullish", f"💡 RSI超卖({rsi14_now:.0f})", "可能反弹"))
             else:
@@ -610,10 +495,10 @@ elif page == "📊 个股分析":
             elif j_now < 0:
                 signals.append(("bullish", "💡 KDJ超卖", "J<0 极度超卖"))
             elif j_now > 100:
-                signals.append(("warning", "⚠️ KDJ超买", "J>100 极度超买"))
+                signals.append(("warn", "⚠️ KDJ超买", "J>100 极度超买"))
 
             if boll_pos > 0.95:
-                signals.append(("warning", "⚠️ 触及BOLL上轨", "压力位"))
+                signals.append(("warn", "⚠️ 触及BOLL上轨", "压力位"))
             elif boll_pos < 0.05:
                 signals.append(("bullish", "💡 触及BOLL下轨", "支撑位"))
             else:
@@ -622,15 +507,15 @@ elif page == "📊 个股分析":
             if vol_ratio > 2:
                 signals.append(("info", f"🔥 大幅放量", f"量比 {vol_ratio:.1f}x"))
             elif vol_ratio < 0.5:
-                signals.append(("warning", "💤 极度缩量", "交投冷清"))
+                signals.append(("warn", "💤 极度缩量", "交投冷清"))
 
-            st.markdown('<div class="signal-row">', unsafe_allow_html=True)
-            for tag_cls, title, desc in signals:
-                st.markdown(f'<span class="signal-tag {tag_cls}"><b>{title}</b> {desc}</span>', unsafe_allow_html=True)
+            st.markdown('<div class="tag-row">', unsafe_allow_html=True)
+        for tag_cls, title, desc in signals:
+            st.markdown(f'<span class="tag {tag_cls}"><b>{title}</b> {desc}</span>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
             # ====== 多周期统计 ======
-            st.markdown('<div class="section-title"><span>📊</span> 多周期统计</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">📊 多周期统计</div>', unsafe_allow_html=True)
 
             for label, period_data in [("近 5 日", df.tail(5)), ("近 20 日", df.tail(20)), ("近 60 日", df.tail(60))]:
                 c = period_data["close"]
@@ -639,22 +524,22 @@ elif page == "📊 个股分析":
                 low_p = c.min()
                 amp = (period_data["high"].max() - period_data["low"].min()) / c.iloc[0] * 100
                 vol_price = c.pct_change().std() * 100
-                rc_cls = "c-red" if ret > 0 else "c-green"
+                rc_cls = "red" if ret > 0 else "green"
 
                 st.markdown(f"""
-                <div class="stat-row">
-                    <div class="stat-mini"><div class="label">周期</div><div class="val c-purple">{label}</div></div>
-                    <div class="stat-mini"><div class="label">涨跌幅</div><div class="val {rc_cls}">{ret:+.2f}%</div></div>
-                    <div class="stat-mini"><div class="label">最高</div><div class="val c-red">{high_p:.2f}</div></div>
-                    <div class="stat-mini"><div class="label">最低</div><div class="val c-green">{low_p:.2f}</div></div>
-                    <div class="stat-mini"><div class="label">波动率</div><div class="val">{vol_price:.2f}%</div></div>
-                    <div class="stat-mini"><div class="label">振幅</div><div class="val">{amp:.2f}%</div></div>
+                <div class="card-row">
+                    <div class="mini-card"><div class="label">周期</div><div class="val purple">{label}</div></div>
+                    <div class="mini-card"><div class="label">涨跌幅</div><div class="val {rc_cls}">{ret:+.2f}%</div></div>
+                    <div class="mini-card"><div class="label">最高</div><div class="val red">{high_p:.2f}</div></div>
+                    <div class="mini-card"><div class="label">最低</div><div class="val green">{low_p:.2f}</div></div>
+                    <div class="mini-card"><div class="label">波动率</div><div class="val">{vol_price:.2f}%</div></div>
+                    <div class="mini-card"><div class="label">振幅</div><div class="val">{amp:.2f}%</div></div>
                 </div>
                 """, unsafe_allow_html=True)
 
             # ====== AI特征贡献 ======
             if predictor.is_ready and pred.features_snapshot:
-                st.markdown('<div class="section-title"><span>🧬</span> AI 特征快照 Top 15</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">🧬 AI 特征快照 Top 15</div>', unsafe_allow_html=True)
 
                 feat = pred.features_snapshot
                 meaningful = {k: v for k, v in feat.items() if abs(v) > 1e-6}
@@ -679,7 +564,7 @@ elif page == "📊 个股分析":
 elif page == "⚙️ 设置":
     st.markdown('<p class="main-header">⚙️ 系统设置</p>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title"><span>🧠</span> 模型配置</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🧠 模型配置</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -698,7 +583,7 @@ elif page == "⚙️ 设置":
         """, unsafe_allow_html=True)
         st.json({"n_estimators": 300, "max_depth": 7, "learning_rate": 0.05, "subsample": 0.8})
 
-    st.markdown('<div class="section-title"><span>📡</span> 数据 & 缓存</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📡 数据 & 缓存</div>', unsafe_allow_html=True)
     st.info("🔌 数据源: **AKShare** (新浪财经) · 免费沪深A股行情")
 
     if st.button("🗑️ 清除数据缓存", use_container_width=True):
