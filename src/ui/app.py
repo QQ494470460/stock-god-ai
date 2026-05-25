@@ -36,6 +36,17 @@ st.markdown("""
     /* 基础 */
     * { font-family: 'Inter', -apple-system, sans-serif; }
 
+    /* 🚨 核弹：所有自定义卡片子元素强制深色文字 */
+    .kpi-card, .kpi-card *, .predict-card, .predict-card *,
+    .signal-tag, .signal-tag *, .stat-mini, .stat-mini *,
+    .chart-box, .chart-box h3 {
+        color: #1e293b !important;
+    }
+    /* 辅助色标签覆盖 */
+    .kpi-label, .predict-card .label, .stat-mini .label, .signal-tag .desc {
+        color: #94a3b8 !important;
+    }
+
     /* ----- 渐变大标题 ----- */
     .main-header {
         font-size: 2.8rem;
@@ -246,10 +257,12 @@ with st.sidebar:
 
     st.markdown("---")
     ready = predictor.is_ready
+    s_cls = "c-green" if ready else "c-red"
+    dot_clr = "#10b981" if ready else "#ef4444"
     st.markdown(f"""
     <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
-        <span style="width:8px; height:8px; border-radius:50%; background:{'#10b981' if ready else '#ef4444'}; display:inline-block;"></span>
-        <span style="font-size:0.82rem; color:#64748b;">模型: {'<b style=color:#10b981>就绪</b>' if ready else '<b style=color:#ef4444>未训练</b>'}</span>
+        <span style="width:8px; height:8px; border-radius:50%; background:{dot_clr}; display:inline-block;"></span>
+        <span style="font-size:0.82rem; color:#64748b;">模型: <b class="{s_cls}">{'就绪' if ready else '未训练'}</b></span>
     </div>
     """, unsafe_allow_html=True)
     st.caption(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -291,13 +304,13 @@ if page == "🏠 概览":
             for i, (_, row) in enumerate(hotspots.head(5).iterrows()):
                 with cols[i]:
                     pct = row.get("涨跌幅", 0)
-                    clr = "#ef4444" if pct > 0 else "#10b981"
+                    c_cls = "c-red" if pct > 0 else "c-green"
                     st.markdown(f"""
                     <div style="text-align:center; padding:14px 8px; border-radius:12px;
                                 background:linear-gradient(135deg, #ffffff, #f8fafc);
                                 border:1px solid #e2e8f0; box-shadow:0 1px 3px rgba(0,0,0,0.03);">
                         <div style="font-weight:600; color:#1e293b; margin-bottom:6px;">{row.get('板块名称', '未知')[:6]}</div>
-                        <div style="font-size:1.3rem; font-weight:700; color:{clr};">{pct:+.2f}%</div>
+                        <div class="{c_cls}" style="font-size:1.3rem; font-weight:700;">{pct:+.2f}%</div>
                     </div>
                     """, unsafe_allow_html=True)
     except Exception as e:
@@ -448,8 +461,8 @@ elif page == "📊 个股分析":
                     <div class="predict-card signal">
                         <div class="label">🔮 模型信号</div>
                         <div class="value" style="font-size:0.9rem; line-height:1.5;">
-                            <span style="color:#ef4444;">XGB</span> {xgb_sig}<br>
-                            <span style="color:#8b5cf6;">LGB</span> {lgb_sig}
+                            <span class="c-red">XGB</span> {xgb_sig}<br>
+                            <span class="c-purple">LGB</span> {lgb_sig}
                         </div>
                     </div>
                 </div>
@@ -626,12 +639,12 @@ elif page == "📊 个股分析":
                 low_p = c.min()
                 amp = (period_data["high"].max() - period_data["low"].min()) / c.iloc[0] * 100
                 vol_price = c.pct_change().std() * 100
-                rc = "#ef4444" if ret > 0 else "#10b981"
+                rc_cls = "c-red" if ret > 0 else "c-green"
 
                 st.markdown(f"""
                 <div class="stat-row">
-                    <div class="stat-mini"><div class="label">周期</div><div class="val" style="color:#8b5cf6;">{label}</div></div>
-                    <div class="stat-mini"><div class="label">涨跌幅</div><div class="val" style="color:{rc};">{ret:+.2f}%</div></div>
+                    <div class="stat-mini"><div class="label">周期</div><div class="val c-purple">{label}</div></div>
+                    <div class="stat-mini"><div class="label">涨跌幅</div><div class="val {rc_cls}">{ret:+.2f}%</div></div>
                     <div class="stat-mini"><div class="label">最高</div><div class="val c-red">{high_p:.2f}</div></div>
                     <div class="stat-mini"><div class="label">最低</div><div class="val c-green">{low_p:.2f}</div></div>
                     <div class="stat-mini"><div class="label">波动率</div><div class="val">{vol_price:.2f}%</div></div>
