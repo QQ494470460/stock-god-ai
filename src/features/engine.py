@@ -237,15 +237,20 @@ class FeatureEngine:
         result = pd.DataFrame(index=df.index)
         
         if financials is None or len(financials) == 0:
+            # 无财务数据时，用0填充（避免全NaN导致样本丢弃）
             for col in self._get_fundamental_cols():
-                result[col] = np.nan
+                result[col] = 0.0
             return result
         
         # 将财务数据映射到日期
-        # 实际项目中需要更复杂的日期对齐，这里简化处理
         for col in financials.columns:
             if col not in ["code", "date"]:
-                result[col] = financials[col].iloc[-1] if len(financials) > 0 else np.nan
+                result[col] = financials[col].iloc[-1] if len(financials) > 0 else 0.0
+        
+        # 补充缺失列
+        for col in self._get_fundamental_cols():
+            if col not in result.columns:
+                result[col] = 0.0
         
         return result.astype(float)
     
