@@ -26,14 +26,14 @@ class MLConfig:
     """机器学习配置"""
     # XGBoost参数
     xgb_params: dict = field(default_factory=lambda: {
-        "n_estimators": 300,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 3,
-        "gamma": 0.1,
-        "reg_alpha": 0.1,
+        "n_estimators": 500,
+        "max_depth": 5,
+        "learning_rate": 0.03,
+        "subsample": 0.75,
+        "colsample_bytree": 0.75,
+        "min_child_weight": 5,
+        "gamma": 0.2,
+        "reg_alpha": 0.5,
         "reg_lambda": 1.0,
         "random_state": 42,
         "n_jobs": -1,
@@ -41,14 +41,14 @@ class MLConfig:
     
     # LightGBM参数
     lgb_params: dict = field(default_factory=lambda: {
-        "n_estimators": 300,
-        "max_depth": 7,
-        "learning_rate": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_samples": 20,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
+        "n_estimators": 500,
+        "max_depth": 6,
+        "learning_rate": 0.03,
+        "subsample": 0.75,
+        "colsample_bytree": 0.75,"min_child_samples": 30,
+        "num_leaves": 63,
+        "reg_alpha": 0.5,
+        "reg_lambda": 1.5,
         "random_state": 42,
         "n_jobs": -1,
     })
@@ -74,6 +74,7 @@ class MLConfig:
     forecast_days: int = 5  # 预测未来N日涨跌
     threshold_up: float = 0.03  # 涨幅阈值（3%以上为涨）
     threshold_down: float = -0.02  # 跌幅阈值（-2%以下为跌）
+    binary_mode: bool = True  # 二分类（涨 vs 跌），忽略震荡
 
 
 @dataclass  

@@ -12,7 +12,7 @@ from typing import Tuple, Dict, Optional, Any
 from dataclasses import dataclass
 from loguru import logger
 
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score, GridSearchCV
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
@@ -73,6 +73,80 @@ class MLTrainer:
         
         return X, y
     
+    def grid_search(
+        self,
+        features: pd.DataFrame,
+        labels: pd.Series,
+        model_type: str = "xgboost",
+        cv_folds: int = 5
+    ) -> dict:
+        """超参数网格搜索"""
+        X, y = self.preprocess(features, labels, fit_scaler=True)
+        X, y = self.balance_samples(X, y)
+        
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        
+        if model_type == "xgboost":
+            param_grid = {
+                "n_estimators": [200, 400, 600],
+                "max_depth": [4, 6, 8],
+                "learning_rate": [0.01, 0.03, 0.05],
+                "subsample": [0.7, 0.8, 0.9],
+                "colsample_bytree": [0.7, 0.8],
+            }
+            base_model = xgb.XGBClassifier(random_state=42, n_jobs=-1, verbosity=0)
+        else:
+            param_grid = {
+                "n_estimators": [200, 400, 600],
+                "max_depth": [5, 7, 9],
+                "learning_rate": [0.01, 0.03, 0.05],
+                "subsample": [0.7, 0.8, 0.9],
+                "num_leaves": [31, 63, 127],
+            }
+            base_model = lgb.LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1)
+        
+        logger.info(f"GridSearch {model_type}: {len(param_grid)} 参数, 实际测试组合取决于cv")
+        
+        # 用小的随机搜索代替完整grid（更快）
+        from sklearn.model_selection import RandomizedSearchCV
+        from scipy.stats import randint, uniform
+        
+        if model_type == "xgboost":
+            param_dist = {
+                "n_estimators": randint(200, 800),
+                "max_depth": randint(4, 10),
+                "learning_rate": uniform(0.01, 0.08),
+                "subsample": uniform(0.6, 0.4),
+                "colsample_bytree": uniform(0.6, 0.4),
+                "min_child_weight": randint(1, 10),
+                "gamma": uniform(0, 0.5),
+                "reg_alpha": uniform(0, 1),
+                "reg_lambda": uniform(0, 2),
+            }
+        else:
+            param_dist = {
+                "n_estimators": randint(200, 800),
+                "max_depth": randint(4, 12),
+                "learning_rate": uniform(0.01, 0.08),
+                "subsample": uniform(0.6, 0.4),
+                "num_leaves": randint(20, 150),
+                "min_child_samples": randint(5, 50),
+                "reg_alpha": uniform(0, 1),
+                "reg_lambda": uniform(0, 2),
+            }
+        
+        search = RandomizedSearchCV(
+            base_model, param_dist,
+            n_iter=30, cv=tscv,
+            scoring="f1_macro",
+            random_state=42, n_jobs=-1, verbose=1
+        )
+        search.fit(X, y)
+        
+        logger.info(f"最佳参数: {search.best_params_}")
+        logger.info(f"最佳F1: {search.best_score_:.4f}")
+        return search.best_params_
+
     def balance_samples(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """SMOTE样本平衡"""
         from collections import Counter

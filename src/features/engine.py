@@ -355,6 +355,10 @@ class FeatureEngine:
         labels[future_ret > threshold_up] = 1
         labels[future_ret < threshold_down] = -1
         
+        # 二分类模式：去掉震荡样本
+        if app_config.ml.binary_mode:
+            labels[labels == 0] = np.nan
+        
         # 最后N天没有未来数据，标记为NaN
         labels.iloc[-forecast_days:] = np.nan
         

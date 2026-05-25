@@ -38,8 +38,10 @@ def parse_args():
                        help="使用GPU训练LSTM")
     parser.add_argument("--update-data-only", action="store_true",
                        help="仅更新数据，不训练")
-    parser.add_argument("--max-stocks", type=int, default=100,
-                       help="最大训练股票数 (默认: 100)")
+    parser.add_argument("--max-stocks", type=int, default=200,
+                       help="最大训练股票数 (默认: 200)")
+    parser.add_argument("--tune", action="store_true",
+                       help="超参数搜索 (耗时较长)")
     args = parser.parse_args()
     return args
 
@@ -127,6 +129,21 @@ def main():
     logger.info("\n🧠 Step 3/4: 训练机器学习模型...")
     
     trainer = MLTrainer()
+    
+    # 超参数搜索（可选）
+    if args.tune:
+        logger.info("🔍 超参数搜索中... (~5分钟)")
+        try:
+            xgb_best = trainer.grid_search(X_all, y_all, "xgboost")
+            lgb_best = trainer.grid_search(X_all, y_all, "lightgbm")
+            logger.info(f"XGBoost最佳参数: {xgb_best}")
+            logger.info(f"LightGBM最佳参数: {lgb_best}")
+            # 更新config
+            app_config.ml.xgb_params.update(xgb_best)
+            app_config.ml.lgb_params.update(lgb_best)
+        except Exception as e:
+            logger.warning(f"GridSearch失败: {e}，使用默认参数")
+    
     results = {}
     
     if args.model in ("xgboost", "ensemble", "all"):
