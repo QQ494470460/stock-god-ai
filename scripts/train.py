@@ -137,6 +137,9 @@ def main():
         lgb_result = trainer.train_lightgbm(X_all, y_all)
         results["lightgbm"] = lgb_result
     
+    # 保存预处理器（scaler + label_encoder）
+    trainer._save_preprocessing()
+    
     # ============ Step 4: 训练LSTM（可选）============
     if not args.no_lstm:
         try:
