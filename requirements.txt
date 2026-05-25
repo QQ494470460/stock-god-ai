@@ -4,6 +4,7 @@ pandas>=2.0.0
 numpy>=1.24.0
 # 机器学习
 scikit-learn>=1.3.0
+imbalanced-learn>=0.12.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
 # 深度学习（可选，用于LSTM）
