@@ -88,7 +88,7 @@ class DataConfig:
     # 缓存
     cache_days: int = 1  # 缓存天数
     # 限速（请求间隔秒数）
-    rate_limit: float = 0.5
+    rate_limit: float = 1.5
 
 
 @dataclass

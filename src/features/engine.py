@@ -40,8 +40,8 @@ class FeatureEngine:
         # 多头/空头排列
         if len(periods) >= 3:
             result["ma_bullish"] = (
-                (df[f"ma_{periods[0]}"] > df[f"ma_{periods[1]}"]) &
-                (df[f"ma_{periods[1]}"] > df[f"ma_{periods[2]}"])
+                (result[f"ma_{periods[0]}"] > result[f"ma_{periods[1]}"]) &
+                (result[f"ma_{periods[1]}"] > result[f"ma_{periods[2]}"])
             ).astype(int)
         
         return result

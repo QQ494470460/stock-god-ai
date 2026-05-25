@@ -125,56 +125,61 @@ class DataFetcher:
                     self._daily_cache[cache_key] = cached
                     return cached.copy()
         
-        # 从AKShare获取
-        try:
-            logger.debug(f"获取 {code} 日线数据...")
-            time.sleep(app_config.data.rate_limit)  # 限速
-            
-            # 判断市场
-            market = "sh" if code.startswith(("6", "9")) else "sz"
-            symbol = f"{market}{code}"
-            
-            df = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust
-            )
-            
-            if df is None or len(df) == 0:
-                logger.warning(f"{code} 无日线数据")
-                return pd.DataFrame()
-            
-            # 标准化列名
-            column_mapping = {
-                "日期": "date",
-                "开盘": "open",
-                "收盘": "close",
-                "最高": "high",
-                "最低": "low",
-                "成交量": "volume",
-                "成交额": "amount",
-                "振幅": "amplitude",
-                "涨跌幅": "pct_change",
-                "涨跌额": "change",
-                "换手率": "turnover",
-            }
-            df = df.rename(columns=column_mapping)
-            df["date"] = pd.to_datetime(df["date"])
-            
-            # 保留需要的列
-            cols = [c for c in column_mapping.values() if c in df.columns]
-            df = df[cols].copy()
-            
-            # 缓存
-            df.to_parquet(cache_file, index=False)
-            self._daily_cache[cache_key] = df
-            
-            return df
-        except Exception as e:
-            logger.error(f"获取 {code} 日线数据失败: {e}")
-            return pd.DataFrame()
+        # 从AKShare获取（加重试和退避）
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                wait = app_config.data.rate_limit * (attempt + 1)
+                time.sleep(wait)  # 限速
+                logger.debug(f"获取 {code} 日线数据... (尝试 {attempt+1}/{max_retries})")
+                
+                df = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust
+                )
+                
+                if df is None or len(df) == 0:
+                    logger.warning(f"{code} 无日线数据")
+                    return pd.DataFrame()
+                
+                # 标准化列名
+                column_mapping = {
+                    "日期": "date",
+                    "开盘": "open",
+                    "收盘": "close",
+                    "最高": "high",
+                    "最低": "low",
+                    "成交量": "volume",
+                    "成交额": "amount",
+                    "振幅": "amplitude",
+                    "涨跌幅": "pct_change",
+                    "涨跌额": "change",
+                    "换手率": "turnover",
+                }
+                df = df.rename(columns=column_mapping)
+                df["date"] = pd.to_datetime(df["date"])
+                
+                # 保留需要的列
+                cols = [c for c in column_mapping.values() if c in df.columns]
+                df = df[cols].copy()
+                
+                # 缓存
+                df.to_parquet(cache_file, index=False)
+                self._daily_cache[cache_key] = df
+                
+                return df
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    backoff = (attempt + 1) * 3
+                    logger.warning(f"{code} 第{attempt+1}次失败，{backoff}s后重试: {e}")
+                    time.sleep(backoff)
+                else:
+                    logger.error(f"获取 {code} 日线数据失败 (已重试{max_retries}次): {e}")
+        
+        return pd.DataFrame()
     
     def get_batch_daily_kline(
         self,
