@@ -1,0 +1,39 @@
+# ============ 核心依赖 ============
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+# 机器学习
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+# 深度学习（可选，用于LSTM）
+torch>=2.0.0
+# 技术指标 & 数据获取
+akshare>=1.14.0
+tushare>=1.4.0
+ta-lib>=0.4.28; platform_system != "Windows"
+# 如果Windows上安装ta-lib有问题，用纯Python替代
+pandas-ta>=0.3.14b
+# API服务
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+# Web UI
+streamlit>=1.29.0
+plotly>=5.18.0
+# 工具
+pyyaml>=6.0
+python-dotenv>=1.0.0
+# 日志
+loguru>=0.7.0
+# 进度条
+tqdm>=4.66.0
+# 数据存储
+sqlalchemy>=2.0.0
+# 定时任务
+apscheduler>=3.10.0
+# ============ 开发依赖 ============
+pytest>=7.4.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
