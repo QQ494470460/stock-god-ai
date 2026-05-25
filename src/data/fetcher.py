@@ -125,7 +125,7 @@ class DataFetcher:
                     self._daily_cache[cache_key] = cached
                     return cached.copy()
         
-        # 从AKShare获取（加重试和退避）
+        # 从AKShare获取（新浪数据源，稳定可靠）
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -133,38 +133,40 @@ class DataFetcher:
                 time.sleep(wait)  # 限速
                 logger.debug(f"获取 {code} 日线数据... (尝试 {attempt+1}/{max_retries})")
                 
-                df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust
-                )
+                # 判断市场，构建symbol
+                market = "sh" if code.startswith(("6", "9")) else "sz"
+                symbol = f"{market}{code}"
+                
+                # 使用新浪数据源（stock_zh_a_daily），比东方财富更稳定
+                df = ak.stock_zh_a_daily(symbol=symbol, adjust=adjust)
                 
                 if df is None or len(df) == 0:
                     logger.warning(f"{code} 无日线数据")
                     return pd.DataFrame()
                 
-                # 标准化列名
-                column_mapping = {
-                    "日期": "date",
-                    "开盘": "open",
-                    "收盘": "close",
-                    "最高": "high",
-                    "最低": "low",
-                    "成交量": "volume",
-                    "成交额": "amount",
-                    "振幅": "amplitude",
-                    "涨跌幅": "pct_change",
-                    "涨跌额": "change",
-                    "换手率": "turnover",
-                }
-                df = df.rename(columns=column_mapping)
+                # 标准化列名（新浪数据源列名不同于东方财富）
                 df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date")
                 
-                # 保留需要的列
-                cols = [c for c in column_mapping.values() if c in df.columns]
-                df = df[cols].copy()
+                # 按日期过滤
+                df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+                
+                if len(df) == 0:
+                    logger.warning(f"{code} 指定日期范围内无数据")
+                    return pd.DataFrame()
+                
+                # 确保必要列存在并补齐缺失字段
+                if "pct_change" not in df.columns:
+                    df["pct_change"] = df["close"].pct_change() * 100
+                if "amplitude" not in df.columns:
+                    df["amplitude"] = (df["high"] - df["low"]) / df["close"].shift(1) * 100
+                if "change" not in df.columns:
+                    df["change"] = df["close"].diff()
+                if "turnover" not in df.columns:
+                    df["turnover"] = 0.0
+                
+                # 清理NaN
+                df = df.dropna(subset=["open", "close", "high", "low", "volume"])
                 
                 # 缓存
                 df.to_parquet(cache_file, index=False)
