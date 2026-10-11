@@ -347,7 +347,9 @@ def run_walk_forward_validation(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="生产部署模型训练（零泄漏 walk-forward + 5档 + V3权重）")
-    ap.add_argument("--pool", default="hs300", help="股票池（本地 parquet 模式实际忽略，保留兼容）")
+    ap.add_argument("--pool", default="hs300",
+                    help="股票池（真实生效，与线上服务侧 fetcher.get_stock_pool 同源）："
+                         "hs300/zz500/hs300_zz500/all；legacy=旧口径按代码排序取前 N 只")
     ap.add_argument("--max-stocks", type=int, default=200)
     ap.add_argument("--horizon", type=int, default=5)
     ap.add_argument("--top-n", type=int, default=20)
@@ -365,7 +367,8 @@ def main() -> int:
     if len(store) < 50:
         print("  数据不足，退出")
         return 1
-    print(f"  有效股票: {len(store)} 只")
+    print(f"  股票池: {args.pool} | 有效股票: {len(store)} 只 | "
+          f"前5个代码: {list(store.keys())[:5]}")
 
     # 2) 逐股生产特征
     print("\n[2/4] 构建生产特征（build_features，剔除 close）...")

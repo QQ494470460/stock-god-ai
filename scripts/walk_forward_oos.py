@@ -322,7 +322,9 @@ def main() -> int:
     ap.add_argument("--horizon", type=int, default=5)
     ap.add_argument("--top-n", type=int, default=20)
     ap.add_argument("--label-mode", choices=["rank", "abs"], default="rank")
-    ap.add_argument("--pool", default="hs300", help="保留兼容（本地 parquet 模式实际忽略）")
+    ap.add_argument("--pool", default="hs300",
+                    help="股票池（真实生效）：hs300/zz500/hs300_zz500/all；"
+                         "legacy=旧口径按代码排序取前 N 只")
     args = ap.parse_args()
 
     print("=" * 78)
@@ -332,11 +334,12 @@ def main() -> int:
     # 1) 数据
     print(f"\n[1/3] 加载数据（最多 {args.max_stocks} 只，离线 parquet）...")
     global _STORE
-    _STORE = load_pool(args.max_stocks)
+    _STORE = load_pool(args.max_stocks, pool=args.pool)
     if len(_STORE) < 50:
         print("  数据不足，退出")
         return 1
-    print(f"  有效股票: {len(_STORE)} 只")
+    print(f"  股票池: {args.pool} | 有效股票: {len(_STORE)} 只 | "
+          f"前5个代码: {list(_STORE.keys())[:5]}")
 
     # 2) 特征（构建一次，两种模式共用）
     print("\n[2/3] 构建生产特征（build_features，剔除 close）...")

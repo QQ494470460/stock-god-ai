@@ -36,6 +36,12 @@ A 股选股真实样本外 RankIC 的影响，定位现有模型「准确率不�
 运行
 ----
   py -3.12 scripts/walk_forward_labels.py --max-stocks 150
+  py -3.12 scripts/walk_forward_labels.py --variants V3 --max-stocks 150 --pool hs300
+
+--pool 说明
+-----------
+  legacy(默认)  : 旧口径，按股票代码字典序取前 N 只本地 parquet（复现历史基线）
+  hs300/zz500/all : 真成分股池（与线上服务侧 fetcher.get_stock_pool 同源）
 """
 
 from __future__ import annotations
@@ -159,6 +165,9 @@ def main():
     ap.add_argument("--variants", nargs="*", default=None,
                     choices=["V0", "V1", "V2", "V3"],
                     help="只跑指定变体子集，默认全跑")
+    ap.add_argument("--pool", default="legacy",
+                    help="股票池: hs300/zz500/hs300_zz500/all 为真成分股；"
+                         "legacy(默认) 为旧口径「按代码排序取前 N 只」，用于复现历史基线")
     args = ap.parse_args()
 
     variants = args.variants or ["V0", "V1", "V2", "V3"]
@@ -170,11 +179,12 @@ def main():
     print("=" * 72)
     print(f" 变体: {variants} | max_stocks={args.max_stocks} | "
           f"n_splits={args.n_splits} | horizon={args.horizon} | top_n={args.top_n}")
+    print(f" 股票池: {args.pool}")
 
     # ---------- 1. 加载数据（离线，本地 parquet） ----------
     print("\n[1/5] 加载本地数据 (load_pool)...")
-    store = load_pool(args.max_stocks)
-    print(f"  有效股票: {len(store)} 只")
+    store = load_pool(args.max_stocks, pool=args.pool)
+    print(f"  有效股票: {len(store)} 只 | 前5个代码: {list(store.keys())[:5]}")
     if len(store) < 50:
         print("  !! 数据不足，退出")
         return
@@ -403,10 +413,17 @@ def main():
           f"  (RankIC={results[winner]['ic']:+.4f}, "
           f"Top{args.top_n}超额={results[winner]['top_excess']:+.4%})")
 
-    v1_better = (results.get("V1", {}).get("ic", -1e9) >
-                 results.get("V0", {}).get("ic", -1e9))
-    print(f"  >>> V1 lambdarank 是否优于 V0: {'是' if v1_better else '否'} "
-          f"(V1={results.get('V1',{}).get('ic'):+.4f} vs V0={results.get('V0',{}).get('ic'):+.4f})")
+    # 只跑部分变体（如 --variants V3）时 results 里没有 V0/V1，
+    # 直接格式化 None 会抛 TypeError: unsupported format string passed to NoneType。
+    ic_v1 = results.get("V1", {}).get("ic")
+    ic_v0 = results.get("V0", {}).get("ic")
+    v1_better = False
+    if ic_v1 is None or ic_v0 is None:
+        print("  >>> V1 lambdarank 是否优于 V0: 未比较（本次未同时跑 V0 与 V1）")
+    else:
+        v1_better = bool(ic_v1 > ic_v0)
+        print(f"  >>> V1 lambdarank 是否优于 V0: {'是' if v1_better else '否'} "
+              f"(V1={ic_v1:+.4f} vs V0={ic_v0:+.4f})")
 
     # ---------- 7. 写 JSON ----------
     out = {
@@ -416,6 +433,9 @@ def main():
             "horizon": args.horizon,
             "top_n": args.top_n,
             "variants": variants,
+            "pool": args.pool,
+            "n_stocks_loaded": len(store),
+            "codes_head5": list(store.keys())[:5],
             "embargo_days": args.horizon,
             "half_life": HALF_LIFE,
             "alpha": ALPHA,

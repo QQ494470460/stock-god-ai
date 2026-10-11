@@ -435,7 +435,8 @@ def main() -> int:
     # 1) 数据
     print(f"\n[1/4] 加载数据（最多 {args.max_stocks} 只，离线 parquet）...")
     global _STORE
-    _STORE = load_pool(args.max_stocks)
+    # 显式 legacy：本脚本沿用旧口径（按代码排序取前 N 只），避免池子被静默改变
+    _STORE = load_pool(args.max_stocks, pool="legacy")
     if len(_STORE) < 50:
         print("  数据不足，退出")
         return 1
@@ -475,7 +476,11 @@ def main() -> int:
 
     print_comparison(result, alpha_set)
 
-    # 消融（可选）
+    # 先保存主结果到 walk_forward_alpha.json（干净的 A/B/Δ，不含消融细节）
+    save_result(result, args, alpha_set)
+
+    # 消融（可选）：单独落盘到 walk_forward_alpha_ablation.json，
+    # 避免覆盖上面的主结果文件。
     if args.ablation:
         print("\n[消融] leave-one-out：逐个关掉 alpha 子集，重跑双模型...")
         ablation = {}
@@ -486,9 +491,15 @@ def main() -> int:
             r2 = run_dual(args, ref_cols, a2, fwd_excess, labels_panel)
             ablation[sub] = r2["delta_B_minus_A"]["rank_ic"]
             print(f"  去掉 {sub:<10} → Δ(RankIC)={ablation[sub]:+.4f}")
-        result["ablation"] = ablation
-
-    save_result(result, args, alpha_set)
+        abl_path = MODEL_DIR / "walk_forward_alpha_ablation.json"
+        try:
+            abl_path.write_text(
+                json.dumps({"main_result": result, "ablation_delta_rankic": ablation},
+                           ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8")
+            print(f"\n消融结果已保存: {abl_path}（主结果不受影响，仍在 walk_forward_alpha.json）")
+        except Exception as e:  # noqa: BLE001
+            print(f"消融保存失败: {e}")
     return 0
 
 

@@ -538,7 +538,8 @@ if __name__ == "__main__":
 
     from scripts.train_v2 import load_pool
 
-    store = load_pool(10)
+    # 显式 legacy：仅做接口自检，股票池无关紧要，固定旧口径保证可复现
+    store = load_pool(10, pool="legacy")
     codes = list(store.keys())
     print(f"[self-check] codes({len(codes)}): {codes[:10]}  range {s_str}~{e_str}")
 
