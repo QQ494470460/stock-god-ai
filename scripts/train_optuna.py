@@ -37,6 +37,13 @@ import shap
 from config.settings import config as app_config, MODEL_DIR, LOG_DIR
 from src.data.fetcher import fetcher
 from src.features.engine import feature_engine
+from src.models.labeling import (
+    forward_excess_return,
+    make_rank_labels,
+    mean_rank_ic,
+    top_portfolio_return,
+)
+from src.models.trainer_v2 import walk_forward_split
 
 LOG_FILE = LOG_DIR / f"optuna_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 RESULT_FILE = MODEL_DIR / "optuna_search_result.json"
@@ -45,6 +52,11 @@ SHAP_FEATURES_FILE = MODEL_DIR / "shap_features.json"
 # 参照基线：train_production_v2.py（5档截面分位标签 + V3序数权重 + leak-safe）
 # 诚实 walk-forward 实测的样本外 RankIC。本脚本走的是旧管线，结果要跟它比。
 PROD_BASELINE_RANKIC = 0.1256
+
+# RankIC 目标（新口径）固定参数：与 train_production_v2.py / walk_forward_labels.py 保持一致
+HORIZON = 5        # 前瞻 5 日
+N_BINS = 5         # 截面分位档数（0=最弱 … 4=最强）
+ORD_ALPHA = 1.0    # V3 ordinal_cost：极端档(0/4)=3倍权重，中性档(2)=1倍
 
 # 生产产物（被本脚本覆盖前必须先备份）
 PROD_ARTIFACTS = ["xgboost_model.pkl", "scaler.pkl", "label_encoder.pkl"]
@@ -59,9 +71,10 @@ class _TrialProgress:
     这里每个 trial 结束都落一行文本日志（含最佳值与 ETA）。
     """
 
-    def __init__(self, total: int, model_type: str):
+    def __init__(self, total: int, model_type: str, metric: str = "F1"):
         self.total = total
         self.model_type = model_type
+        self.metric = metric
         self.t0 = time.time()
         self.best = -np.inf
         self.done = 0
@@ -85,7 +98,7 @@ class _TrialProgress:
         flag = " 🏆新最佳" if improved else ""
         logger.info(
             f"  [{self.done}/{self.total}] Trial #{trial.number} "
-            f"F1={trial.value:.5f}  最佳={self.best:.5f}{flag}  "
+            f"{self.metric}={trial.value:+.5f}  最佳={self.best:+.5f}{flag}  "
             f"| 已用 {elapsed/60:.1f}min，预计还需 {eta/60:.1f}min"
         )
 
@@ -133,6 +146,11 @@ def parse_args():
     p.add_argument("--no-deploy", action="store_true",
                    help="不覆盖生产产物（xgboost_model.pkl/scaler.pkl/label_encoder.pkl），"
                         "结果另存为 *_optuna_*.pkl。默认会覆盖（但覆盖前自动备份）")
+    p.add_argument("--objective", default="rankic", choices=["rankic", "f1"],
+                   help="优化目标。rankic=直接优化样本外 RankIC（新口径，推荐，与生产模型一致）；"
+                        "f1=旧口径 F1(macro)（三分类绝对涨跌标签，仅作对照）")
+    p.add_argument("--valid-ratio", type=float, default=0.25,
+                   help="rankic 目标下用作验证的尾部交易日比例（默认 0.25）")
     return p.parse_args()
 
 
@@ -454,6 +472,313 @@ def retrain_final(X, y, best_params, model_type, rounds, features, result, deplo
     }
 
 
+# ==================== RankIC 目标（新口径，与生产模型一致）====================
+
+def gather_panel(args):
+    """按 (date, code) 取数面板 —— RankIC 必须有横截面。
+
+    旧管线用 prepare_training_data 逐股生成三分类绝对涨跌标签，concat 时把
+    date/code 丢了，于是永远算不出截面 RankIC（这正是旧口径不可信的根因）。
+    这里改为：
+      逐股 build_features(drop close) → 长表保留 __date__/__code__
+      → close 面板 → forward_excess_return(HORIZON) → make_rank_labels(N_BINS)
+      → melt 回长表按 (date, code) 对齐
+    标签口径与 train_production_v2.py 完全一致。
+    """
+    codes = fetcher.get_stock_pool(args.pool)
+    codes = codes[:args.max_stocks]
+    end_date = datetime.now().strftime("%Y%m%d")
+
+    frames, close_map = [], {}
+    t0 = time.time()
+    for i, code in enumerate(codes):
+        if i == 0 or (i + 1) % 20 == 0:
+            logger.info(f"   进度 {i+1}/{len(codes)} — 已收集 {len(frames)} 只"
+                        f"  (用时 {time.time()-t0:.0f}s)")
+        try:
+            df = fetcher.get_daily_kline(code, start_date=args.start_date, end_date=end_date)
+            if len(df) < 120:
+                continue
+            f = feature_engine.build_features(df)
+            if "close" in f.columns:
+                f = f.drop(columns=["close"])
+            f = f.copy()
+            # ★ 关键：get_daily_kline 返回的是 **RangeIndex + 'date' 列**，不是 DatetimeIndex。
+            #   早先误把 f.index（0,1,2...）当日期传给 pd.to_datetime → 全部落在 1970-01-01，
+            #   于是"按日期做截面"实际是按行号对齐：不同股票上市/停牌长度不同，
+            #   行号 i 在 A 股和 B 股根本不是同一天 → RankIC 看着有值其实是假的。
+            #   必须用 df['date'] 这一列。
+            _dates = pd.to_datetime(df["date"]).reset_index(drop=True).values
+            f["__date__"] = _dates
+            f["__code__"] = code
+            frames.append(f)
+            close_map[code] = pd.Series(df["close"].values, index=_dates)
+        except Exception:
+            continue
+
+    if not frames:
+        return None
+
+    long = pd.concat(frames, ignore_index=True)
+
+    # close_map 的 Series 已带真实日期索引，直接拼即可（不再需要 to_datetime 兜底）
+    close_panel = pd.DataFrame(close_map).sort_index()
+    # 个别股票可能有重复日期行，去重避免 pivot 报错
+    close_panel = close_panel[~close_panel.index.duplicated(keep="last")]
+
+    fwd = forward_excess_return(close_panel, horizon=HORIZON, winsorize=0.01)
+    labels = make_rank_labels(fwd, n_bins=N_BINS)
+
+    def _melt(panel, name):
+        s = panel.stack()
+        s.name = name
+        out = s.reset_index()
+        out.columns = ["__date__", "__code__", name]
+        return out
+
+    long = long.merge(_melt(labels, "__label__"), on=["__date__", "__code__"], how="left")
+    long = long.merge(_melt(fwd, "__fwd__"), on=["__date__", "__code__"], how="left")
+    long = long.dropna(subset=["__label__"]).reset_index(drop=True)
+
+    y = long["__label__"].astype(int)
+    meta = long[["__date__", "__code__", "__fwd__"]].copy()
+    feat_cols = [c for c in long.columns
+                 if c not in ("__date__", "__code__", "__label__", "__fwd__")]
+    X = long[feat_cols].select_dtypes(include=[np.number]).fillna(0.0)
+
+    logger.info(f"面板: {len(X)} 样本 × {X.shape[1]} 特征 | "
+                f"{meta['__date__'].nunique()} 个交易日 | "
+                f"{meta['__code__'].nunique()} 只股票 | 标签={dict(Counter(y.values))}")
+    return X, y, meta, fwd
+
+
+def _ic_from_scores(meta_part, scores, fwd_panel):
+    """(date, code, score) 长表 → 面板 → 逐日 RankIC 均值。"""
+    tmp = pd.DataFrame({
+        "__date__": meta_part["__date__"].values,
+        "__code__": meta_part["__code__"].values,
+        "s": np.asarray(scores),
+    })
+    panel = tmp.pivot_table(index="__date__", columns="__code__", values="s", aggfunc="mean")
+    return mean_rank_ic(panel, fwd_panel)
+
+
+def _v3_weights(y):
+    """V3 ordinal_cost 权重：balanced × (1 + ALPHA*|y - 2|)。
+
+    与 walk_forward_labels.py 的赢家变体一致：极端档(0/4)=3倍、中性档(2)=1倍，
+    让模型把力气花在"选最强 / 避最弱"上，而不是磨中间档。
+    """
+    y = np.asarray(y)
+    classes = np.unique(y)
+    cw = compute_class_weight("balanced", classes=classes, y=y)
+    cw_map = {c: w for c, w in zip(classes, cw)}
+    base = np.array([cw_map[v] for v in y], dtype=float)
+    return base * (1.0 + ORD_ALPHA * np.abs(y - (N_BINS - 1) / 2.0))
+
+
+def _fit_rankic(Xtr, ytr, params):
+    """leak-safe 训练：scaler 只在 train 段 fit（★），配 V3 权重。"""
+    scaler = StandardScaler().fit(Xtr)
+    model = xgb.XGBClassifier(**params)
+    model.fit(scaler.transform(Xtr), ytr, sample_weight=_v3_weights(ytr))
+    return model, scaler
+
+
+def _suggest_params(trial, max_estimators):
+    """RankIC 目标的搜索空间（去掉 scale_pos_weight：多分类无意义）。"""
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 50, max_estimators),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+        "gamma": trial.suggest_float("gamma", 0, 2.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-6, 3.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-6, 5.0, log=True),
+        "random_state": 42,
+        "n_jobs": 1,
+        "verbosity": 0,
+        "eval_metric": "mlogloss",
+    }
+
+
+def rankic_objective(trial, X, y, meta, fwd, args, max_estimators):
+    """一个 trial = 一次时序切分上的样本外 RankIC（越大越好）。"""
+    params = _suggest_params(trial, max_estimators)
+    dates = meta["__date__"]
+    uniq = np.sort(pd.unique(dates.values))
+    if len(uniq) < 60:
+        return -1.0
+    cut_i = int(len(uniq) * (1.0 - args.valid_ratio))
+    tr_end_i = max(1, cut_i - HORIZON)          # ★ embargo：留 HORIZON 个交易日
+    tr_mask = dates.isin(uniq[:tr_end_i]).values
+    va_mask = dates.isin(uniq[cut_i:]).values
+    if tr_mask.sum() < 2000 or va_mask.sum() < 200:
+        return -1.0
+
+    model, scaler = _fit_rankic(X[tr_mask], y[tr_mask].values, params)
+    proba = model.predict_proba(scaler.transform(X[va_mask]))
+    score = proba @ np.arange(proba.shape[1])   # 期望档位分（越高越看多）
+    ic, _icir, _nd = _ic_from_scores(meta[va_mask], score, fwd)
+    return float(ic) if not np.isnan(ic) else -1.0
+
+
+def rankic_search(X, y, meta, fwd, args):
+    """以 RankIC 为目标的 Optuna 搜索（搜索期只切一刀，保证 trial 够快）。"""
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🔍 XGBOOST Optuna TPE — {args.n_trials} trials   目标: 样本外 RankIC")
+    logger.info(f"{'='*60}")
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+    )
+    max_est = getattr(args, "max_estimators", 1500)
+    obj = lambda t: rankic_objective(t, X, y, meta, fwd, args, max_est)
+    timeout = args.optuna_timeout if args.optuna_timeout > 0 else None
+    cb = _TrialProgress(args.n_trials, "xgboost", metric="RankIC")
+    study.optimize(obj, n_trials=args.n_trials, timeout=timeout,
+                   n_jobs=1, show_progress_bar=True, callbacks=[cb])
+
+    logger.info(f"\n🏆 最佳: Trial #{study.best_trial.number}  "
+                f"验证集 RankIC = {study.best_value:+.6f}")
+    logger.info(f"  参数 = {json.dumps(study.best_params, indent=2)}")
+    return {
+        "best_params": study.best_params,
+        "best_score": float(study.best_value),
+        "n_trials": len(study.trials),
+        "n_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
+    }
+
+
+def rankic_final(X, y, meta, fwd, args, best_params, deploy=True):
+    """全量训练最终模型 + 多折 walk-forward 报诚实的样本外 RankIC。"""
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🔄 最终模型：全量训练 + {args.cv_folds} 折 walk-forward 诚实验证")
+    logger.info(f"{'='*60}")
+
+    params = {k: v for k, v in best_params.items() if k != "scale_pos_weight"}
+    params.update({"random_state": 42, "n_jobs": -1, "verbosity": 0,
+                   "eval_metric": "mlogloss"})
+
+    # ---- 诚实样本外评估：每折 scaler 只在该折 train 段 fit ----
+    splits = walk_forward_split(meta["__date__"].values, n_splits=args.cv_folds,
+                                embargo_days=HORIZON)
+    ics = []
+    for sp in splits:
+        tr = ((meta["__date__"] >= sp.train_start) & (meta["__date__"] <= sp.train_end)).values
+        va = ((meta["__date__"] >= sp.valid_start) & (meta["__date__"] <= sp.valid_end)).values
+        if tr.sum() < 5000 or va.sum() < 500:
+            continue
+        model, scaler = _fit_rankic(X[tr], y[tr].values, params)
+        proba = model.predict_proba(scaler.transform(X[va]))
+        score = proba @ np.arange(proba.shape[1])
+        ic, icir, nd = _ic_from_scores(meta[va], score, fwd)
+        if not np.isnan(ic):
+            ics.append(ic)
+            logger.info(f"   折: {sp.train_start.date()}~{sp.train_end.date()} → "
+                        f"{sp.valid_start.date()}~{sp.valid_end.date()}  "
+                        f"RankIC={ic:+.4f} (IC_IR={icir:.1f}, {nd}天)")
+    oos_ic = float(np.mean(ics)) if ics else float("nan")
+
+    # ---- 全量训练部署模型 ----
+    scaler = StandardScaler().fit(X)
+    final_model = xgb.XGBClassifier(**params)
+    final_model.fit(scaler.transform(X), y.values, sample_weight=_v3_weights(y.values))
+
+    if deploy:
+        logger.warning("⚠️ 即将覆盖生产产物 (xgboost_model.pkl / scaler.pkl / label_encoder.pkl)")
+        _backup_production()
+        model_path = MODEL_DIR / "xgboost_model.pkl"
+        scaler_path = MODEL_DIR / "scaler.pkl"
+        enc_path = MODEL_DIR / "label_encoder.pkl"
+        feat_path = MODEL_DIR / "features_xgboost.json"
+    else:
+        logger.info("（--no-deploy）不触碰生产产物，结果另存为 *_optuna_*.pkl")
+        model_path = MODEL_DIR / "xgboost_optuna_model.pkl"
+        scaler_path = MODEL_DIR / "xgboost_optuna_scaler.pkl"
+        enc_path = MODEL_DIR / "xgboost_optuna_label_encoder.pkl"
+        feat_path = MODEL_DIR / "features_xgboost_optuna.json"
+
+    with open(model_path, "wb") as f:
+        pickle.dump(final_model, f)
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
+    # 5 档标签 0..4 —— predictor 靠 classes_ 判断走 5 类分支
+    le = LabelEncoder()
+    le.fit(np.arange(N_BINS))
+    with open(enc_path, "wb") as f:
+        pickle.dump(le, f)
+    with open(feat_path, "w", encoding="utf-8") as f:
+        json.dump({"features": list(X.columns), "n_features": int(X.shape[1])},
+                  f, ensure_ascii=False)
+
+    logger.info(f"💾 模型: {model_path}")
+    logger.info(f"💾 预处理器: {scaler_path.name} / {enc_path.name}")
+
+    return {
+        "oos_rank_ic": oos_ic,
+        "n_features_used": int(X.shape[1]),
+        "deployed": bool(deploy),
+        "model_path": str(model_path),
+    }
+
+
+def _run_rankic(args, t_start, deploy):
+    logger.info("\n📊 收集面板数据（保留 date/code，供截面 RankIC）…")
+    got = gather_panel(args)
+    if got is None or len(got[0]) == 0:
+        logger.error("无训练数据!")
+        logger.error("===TRAINING_FAILED=== (原因: 未收集到任何训练样本)")
+        return
+    X, y, meta, fwd = got
+
+    r = rankic_search(X, y, meta, fwd, args)
+    fin = rankic_final(X, y, meta, fwd, args, r["best_params"], deploy=deploy)
+
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "objective": "rankic",
+        "method": "Optuna TPE (目标=样本外 RankIC) + V3序数权重 + leak-safe scaler",
+        "n_samples": len(X),
+        "n_features": int(X.shape[1]),
+        "n_trials": args.n_trials,
+        "best_params": r["best_params"],
+        "valid_rank_ic": r["best_score"],
+        "oos_rank_ic_walkforward": fin["oos_rank_ic"],
+        "baseline_rank_ic": PROD_BASELINE_RANKIC,
+        "deployed": fin["deployed"],
+        "model_path": fin["model_path"],
+    }
+    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+
+    elapsed = time.time() - t_start
+    oos = fin["oos_rank_ic"]
+    logger.info("\n" + "=" * 70)
+    logger.info("🎉 Optuna（目标=RankIC）完成!")
+    logger.info(f"   总耗时: {elapsed/60:.1f} 分钟")
+    logger.info(f"   搜索期验证 RankIC        : {r['best_score']:+.4f}")
+    logger.info(f"   诚实 walk-forward 样本外 : {oos:+.4f}  (生产基线 {PROD_BASELINE_RANKIC:.4f})")
+    if not np.isnan(oos):
+        if oos >= PROD_BASELINE_RANKIC:
+            logger.info(f"   ✅ 达到/超过生产基线（{oos - PROD_BASELINE_RANKIC:+.4f}）")
+        else:
+            logger.warning(f"   ⚠️ 低于生产基线（{oos - PROD_BASELINE_RANKIC:+.4f}）")
+            if fin["deployed"]:
+                logger.warning("   且已覆盖生产产物 —— 建议用 models/*.bak_* 回滚，"
+                               "或直接跑 scripts/train_production_v2.py 重训基线模型")
+    logger.info(f"   产物: {fin['model_path']}"
+                + ("（已覆盖生产产物，旧件已备份 .bak_*）" if fin["deployed"]
+                   else "（未覆盖生产产物）"))
+    logger.info(f"   结果 JSON: {RESULT_FILE}")
+    logger.info("===TRAINING_COMPLETE===")
+    logger.info("=" * 70)
+
+
 def main():
     """入口：负责把 _run() 的任何失败都翻译成 ===TRAINING_FAILED=== 标记。
 
@@ -481,9 +806,15 @@ def _run(args):
     logger.info(f"   部署: {'覆盖生产产物（覆盖前自动备份）' if deploy else '不覆盖，另存 *_optuna_*.pkl'}")
     logger.info(f"   日志: {LOG_FILE}")
     logger.info(f"   结果: {RESULT_FILE}")
+    logger.info(f"   目标: {'RankIC（新口径，与生产模型一致）' if args.objective == 'rankic' else 'F1(macro)（旧口径）'}")
     logger.info("=" * 70)
+
+    # 新口径：直接优化样本外 RankIC（面板取数 + 5档截面分位标签 + V3权重 + leak-safe）
+    if args.objective == "rankic":
+        return _run_rankic(args, time.time(), deploy)
+
     logger.warning(
-        "⚠️ 口径提示：本脚本仍走旧管线（三分类绝对涨跌标签 + SMOTE 全量 + scaler 全量 fit），"
+        "⚠️ 你正在用旧口径（--objective f1）：三分类绝对涨跌标签 + SMOTE 全量 + scaler 全量 fit，"
         f"优化目标是 F1(macro)。选股真正的决策指标是 RankIC —— 生产基线为 "
         f"{PROD_BASELINE_RANKIC:.4f}（train_production_v2.py，诚实 walk-forward）。"
         "F1 变高不等于选股变强，别只看这个数。"
