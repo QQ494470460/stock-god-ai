@@ -7,6 +7,7 @@
 import pickle
 import json
 import threading
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -22,6 +23,14 @@ from loguru import logger
 from config.settings import config as app_config, MODEL_DIR
 from src.features.engine import feature_engine
 from src.models.scoring import compute_score, get_score_interpretation
+
+# LLM 定性叠加覆盖层（可选，默认不用）：用 try/except 包住，避免无 openai 时
+# 导入失败影响核心预测路径（核心 xgboost 推理完全不依赖它）。
+try:
+    from src.data.llm_features import LLMFeatureProvider, LLMFeatureConfig
+except Exception:  # noqa: BLE001
+    LLMFeatureProvider = None
+    LLMFeatureConfig = None
 
 
 @dataclass
@@ -53,6 +62,10 @@ class StockPrediction:
     # 关联板块
     sector: str = ""
     sector_change: float = 0.0
+    # LLM 定性叠加覆盖层输出（仅在启用覆盖层时填充；默认 0.0/0，不影响核心评分）
+    llm_sentiment: float = 0.0    # 情绪分 (-1~1, +看多 / -看空)
+    llm_risk: float = 0.0         # 风险标记 (0/1, 1=利空/风险事件)
+    llm_confidence: float = 0.0   # 置信度 (0~1)
 
 
 class Predictor:
@@ -77,6 +90,10 @@ class Predictor:
 
         # 单模型（xgboost）权重恒为 1.0；保留 dict 结构以兼容历史读法
         self.model_weights: Dict[str, float] = {"xgboost": 1.0}
+
+        # LLM 定性叠加覆盖层（默认关闭；仅 _enable_llm 后才会构造 provider）
+        # 覆盖层对 predict_batch 产出的 score 做纯加性微调，绝不重训 xgboost。
+        self.llm_provider = None
 
     @property
     def trainer(self):
@@ -179,6 +196,74 @@ class Predictor:
         else:
             logger.warning("⚠️ 模型热重载失败，可能训练尚未完成")
     
+    def _enable_llm(self, mock: bool = False) -> None:
+        """按需启用 LLM 定性叠加覆盖层（纯加性 score 微调，绝不重训 xgboost）。
+
+        设计原则：
+          · 只有 config 主开关 enable_llm_overlay 为真时才真正构造 provider
+            （用 getattr 安全读取，默认 False，缺失该字段也不崩）。
+          · 任何异常都安全降级为 self.llm_provider=None，覆盖层等于无操作 + 警告，
+            绝不拖垮核心预测路径。
+          · 关闭时（默认）predict_batch 完全不碰 score，输出与改动前一致。
+
+        CLI（scripts/daily_recommend.py --llm / --llm-mock）会在调用本方法前
+        把 enable_llm_overlay 临时置 True，因此本方法无需再判 CLI 参数。
+        """
+        if not getattr(app_config.ml, "enable_llm_overlay", False):
+            logger.info("LLM 覆盖层未启用（enable_llm_overlay=False），跳过")
+            self.llm_provider = None
+            return
+        try:
+            # LLMFeatureProvider/LLMFeatureConfig 若顶层导入失败则为 None，
+            # 下面这行会抛 TypeError 并被捕获，最终降级为无操作（provider=None）。
+            self.llm_provider = LLMFeatureProvider(LLMFeatureConfig(mock=mock))
+            logger.info(f"✅ LLM 覆盖层已启用 (mock={mock})")
+        except Exception as e:  # noqa: BLE001
+            self.llm_provider = None
+            logger.warning(f"⚠️ LLM 覆盖层启用失败，已降级为无操作: {e}")
+
+    def _apply_llm_overlay(self, pred: "StockPrediction", as_of_date: str) -> None:
+        """对单只预测做 LLM 定性叠加微调（纯加性，就地修改 pred）。
+
+        约定：
+          · 只在 self.llm_provider 非 None 时生效（默认 None → 完全不动 score）。
+          · provider 取不到结果（本机 Ollama 未启动 / 该股无新闻 / 调用失败）时，
+            llm_features 返回中性 dict，此处 adj 恒为 0，等价无操作，绝不改分。
+          · 只改 score 与 llm_* 字段，绝不触碰 xgboost 概率、scaler、标签体系。
+        """
+        if self.llm_provider is None:
+            return
+        try:
+            feats = self.llm_provider.features_for_stock(pred.code, as_of_date)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"LLM 覆盖层取特征失败 {pred.code}: {e}")
+            return
+
+        sentiment = float(feats.get("llm_sentiment", 0.0))
+        risk = int(feats.get("llm_risk", 0))
+        conf = float(feats.get("llm_confidence", 0.0))
+
+        # 加性微调：情绪×置信度放大；命中风险事件再扣一档
+        adj = sentiment * conf * 8.0
+        if risk == 1:
+            adj -= 6.0 * conf
+        if abs(adj) < 1e-9:
+            return
+
+        pred.score = max(0.0, min(100.0, pred.score + adj))
+        pred.llm_sentiment = sentiment
+        pred.llm_risk = float(risk)
+        pred.llm_confidence = conf
+
+        if abs(adj) > 0.5 and pred.reasons is not None:
+            # 插到最前：get_top_recommendations 只展示 reasons[:3]，
+            # 放末尾会被截断，用户就看不到 LLM 到底说了什么。
+            if risk == 1:
+                pred.reasons.insert(0, "🤖LLM风险事件")
+            else:
+                direction = "多" if sentiment > 0 else "空"
+                pred.reasons.insert(0, f"🤖LLM偏{direction}({sentiment:+.2f}×{conf:.0%})")
+
     @property
     def is_ready(self) -> bool:
         """模型是否可用。
@@ -373,6 +458,13 @@ class Predictor:
             except Exception as e:
                 logger.warning(f"预测 {code} 失败: {e}")
         
+        # LLM 定性叠加覆盖层（默认 self.llm_provider is None → 完全不动 score）
+        if self.llm_provider is not None:
+            as_of_date = datetime.now().strftime("%Y-%m-%d")
+            for pred in predictions:
+                self._apply_llm_overlay(pred, as_of_date)
+            logger.info(f"🤖 LLM 覆盖层已应用: {len(predictions)} 只, as_of={as_of_date}")
+
         # 按评分排序
         predictions.sort(key=lambda x: x.score, reverse=True)
         
@@ -397,6 +489,9 @@ class Predictor:
         
         # 构建DataFrame
         records = []
+        # 仅当本批真的带 LLM 覆盖层数据时才加列：
+        # 覆盖层关闭时 schema 与改动前完全一致，下游（看板 / CSV）不受影响
+        has_llm = any((p.llm_sentiment != 0.0 or p.llm_risk != 0.0) for p in top)
         for p in top:
             # 一致性标签（agreement 恒为 1.0，需单独处理中性信号 0，
             # 否则会把"观望"误显示成"✅ 一致看跌"）
@@ -414,7 +509,7 @@ class Predictor:
             
             reasons_str = "; ".join(p.reasons[:3]) if p.reasons else "—"
             
-            records.append({
+            row = {
                 "排名": len(records) + 1,
                 "代码": p.code,
                 "名称": p.name,
@@ -427,7 +522,11 @@ class Predictor:
                 "波动率": f"{p.volatility*100:.1f}%",
                 "XGB信号": "📈买入" if p.xgb_signal == 1 else ("📉卖出" if p.xgb_signal == -1 else "➡️持有"),
                 "推荐理由": reasons_str,
-            })
+            }
+            if has_llm:
+                row["LLM情绪"] = round(p.llm_sentiment, 2)
+                row["LLM风险"] = "⚠️风险" if p.llm_risk else "—"
+            records.append(row)
         
         df = pd.DataFrame(records)
         return df
