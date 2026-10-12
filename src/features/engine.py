@@ -208,6 +208,133 @@ class FeatureEngine:
         
         return result.astype(float)
     
+    # ============ 新增技术指标 (Task 1) ============
+    
+    def _calc_adx_features(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """ADX趋势强度 + 方向指标（+DI/-DI）"""
+        result = pd.DataFrame(index=df.index)
+        
+        high, low, close = df["high"], df["low"], df["close"]
+        
+        # True Range
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.ewm(span=period, adjust=False).mean()
+        
+        # +DM / -DM
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(span=period, adjust=False).mean() / (atr + 1e-10)
+        minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(span=period, adjust=False).mean() / (atr + 1e-10)
+        
+        # DX → ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+        adx = dx.ewm(span=period, adjust=False).mean()
+        
+        result["adx"] = adx
+        result["adx_plus_di"] = plus_di
+        result["adx_minus_di"] = minus_di
+        result["adx_trend"] = (adx > 25).astype(int)  # ADX>25表示趋势明显
+        result["adx_di_cross"] = ((plus_di > minus_di) & (plus_di.shift(1) <= minus_di.shift(1))).astype(int)
+        
+        return result.astype(float)
+    
+    def _calc_atr_features(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """ATR平均真实波幅 + 标准化ATR%"""
+        result = pd.DataFrame(index=df.index)
+        
+        high, low, close = df["high"], df["low"], df["close"]
+        
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.ewm(span=period, adjust=False).mean()
+        
+        result["atr"] = atr
+        result["atr_pct"] = atr / close * 100  # 标准化ATR%
+        result["atr_change"] = atr.pct_change(period)  # ATR变化率
+        
+        return result.astype(float)
+    
+    def _calc_volume_price_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        """VPT (Volume-Price Trend) 量价趋势指标"""
+        result = pd.DataFrame(index=df.index)
+        
+        close = df["close"]
+        volume = df["volume"]
+        
+        # VPT = 累计(价格变动率 × 成交量)
+        price_change_pct = close.pct_change().fillna(0)
+        vpt = (price_change_pct * volume).cumsum()
+        
+        result["vpt"] = vpt
+        result["vpt_ma5"] = vpt.rolling(5).mean()
+        result["vpt_change"] = vpt.diff(5)
+        result["vpt_divergence"] = (close - close.shift(20)) * (vpt - vpt.shift(20))  # 量价背离
+        
+        return result.astype(float)
+    
+    def _calc_money_flow(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """简化MFI (Money Flow Index) 资金流量指标"""
+        result = pd.DataFrame(index=df.index)
+        
+        high, low, close = df["high"], df["low"], df["close"]
+        volume = df["volume"]
+        
+        # Typical Price
+        typical_price = (high + low + close) / 3
+        
+        # Raw Money Flow
+        raw_mf = typical_price * volume
+        
+        # Positive / Negative Flow
+        tp_diff = typical_price.diff()
+        pos_flow = raw_mf.where(tp_diff > 0, 0).rolling(period).sum()
+        neg_flow = raw_mf.where(tp_diff < 0, 0).rolling(period).sum()
+        
+        mfi = 100 - (100 / (1 + pos_flow / (neg_flow + 1e-10)))
+        
+        result["mfi"] = mfi
+        result["mfi_overbought"] = (mfi > 80).astype(int)
+        result["mfi_oversold"] = (mfi < 20).astype(int)
+        result["mfi_divergence"] = (close - close.shift(period)) * (mfi - mfi.shift(period))  # 与价格背离
+        
+        return result.astype(float)
+    
+    # ============ 市场状态检测 (Task 2) ============
+    
+    def _calc_market_regime(self, df: pd.DataFrame) -> pd.DataFrame:
+        """市场状态检测：牛市/熊市/震荡"""
+        result = pd.DataFrame(index=df.index)
+        
+        close = df["close"]
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        
+        # MA20斜率（5日变化率）
+        ma20_slope = ma20.diff(5)
+        
+        # 状态判断
+        bull = (close > ma60) & (ma20_slope > 0)
+        bear = (close < ma60) & (ma20_slope < 0)
+        sideways = ~(bull | bear)
+        
+        result["regime_bull"] = bull.astype(int)
+        result["regime_bear"] = bear.astype(int)
+        result["regime_sideways"] = sideways.astype(int)
+        
+        # 连续状态天数
+        regime_num = bull.astype(int) * 2 + bear.astype(int) * 1  # 2=牛, 1=熊, 0=震荡
+        result["regime_code"] = regime_num
+        
+        return result.astype(float)
+    
     def _calc_market_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """市场面特征"""
         result = pd.DataFrame(index=df.index)
@@ -305,6 +432,21 @@ class FeatureEngine:
         
         # 成交量
         feature_parts.append(self._calc_volume_features(df))
+        
+        # ADX 趋势强度
+        feature_parts.append(self._calc_adx_features(df))
+        
+        # ATR 波动指标
+        feature_parts.append(self._calc_atr_features(df))
+        
+        # VPT 量价趋势
+        feature_parts.append(self._calc_volume_price_trend(df))
+        
+        # MFI 资金流量
+        feature_parts.append(self._calc_money_flow(df))
+        
+        # 市场状态
+        feature_parts.append(self._calc_market_regime(df))
         
         # 市场面
         feature_parts.append(self._calc_market_features(df))
