@@ -45,7 +45,7 @@ MIN_ROWS = 400
 # 旧口径（按股票代码字典序取前 N 只本地 parquet）的别名
 LEGACY_POOL_ALIASES = {"legacy", "code_order", "default", "none", ""}
 # 真实成分股池：交给 DataFetcher.get_stock_pool 解析（与线上服务侧同一函数）
-KNOWN_POOLS = {"hs300", "zz500", "hs300_zz500", "all"}
+KNOWN_POOLS = {"hs300", "zz500", "zz1000", "hs300_zz500", "all"}
 
 
 def _resolve_pool_codes(pool: str) -> Optional[List[str]]:
@@ -162,7 +162,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-stocks", type=int, default=300)
     ap.add_argument("--pool", default="legacy",
-                    help="股票池: hs300/zz500/hs300_zz500/all 为真成分股；"
+                    help="股票池: hs300/zz500/zz1000/hs300_zz500/all 为真成分股；"
                          "legacy(默认) 为旧口径「按代码排序取前 N 只」")
     ap.add_argument("--factors-only", action="store_true", help="只做因子体检")
     # 单一模型口径：只用 xgboost

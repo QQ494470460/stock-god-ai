@@ -857,7 +857,15 @@ class DataFetcher:
                 stock_list = stock_list[stock_list["code"].isin(codes)]
             except Exception:
                 logger.warning("获取中证500成分股失败，使用全量")
-        
+
+        elif pool == "zz1000":
+            try:
+                zz1000 = _ak().index_stock_cons("000852")
+                codes = zz1000["品种代码"].tolist()
+                stock_list = stock_list[stock_list["code"].isin(codes)]
+            except Exception:
+                logger.warning("获取中证1000成分股失败，使用全量")
+
         elif pool == "hs300_zz500":
             try:
                 hs300 = _ak().index_stock_cons("000300")

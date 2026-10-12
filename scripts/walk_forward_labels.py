@@ -166,7 +166,7 @@ def main():
                     choices=["V0", "V1", "V2", "V3"],
                     help="只跑指定变体子集，默认全跑")
     ap.add_argument("--pool", default="legacy",
-                    help="股票池: hs300/zz500/hs300_zz500/all 为真成分股；"
+                    help="股票池: hs300/zz500/zz1000/hs300_zz500/all 为真成分股；"
                          "legacy(默认) 为旧口径「按代码排序取前 N 只」，用于复现历史基线")
     args = ap.parse_args()
 
