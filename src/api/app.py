@@ -55,7 +55,6 @@ class PredictionResult(BaseModel):
     prob_neutral: float
     prob_down: float
     xgb_signal: str
-    lgb_signal: str
 
 
 class RecommendationResponse(BaseModel):
@@ -96,7 +95,7 @@ async def root():
 @app.get("/api/v1/recommend", response_model=RecommendationResponse)
 async def get_recommendations(
     top_n: int = Query(20, ge=1, le=100, description="推荐数量"),
-    min_score: float = Query(60.0, ge=0, le=100, description="最低评分"),
+    min_score: float = Query(50.0, ge=0, le=100, description="最低评分"),
     pool: str = Query("hs300", description="股票池: all/hs300/zz500")
 ):
     """
@@ -130,7 +129,11 @@ async def get_recommendations(
             df = fetcher.get_daily_kline(code, start_date=start_date)
             if len(df) >= 60:
                 stock_data[code] = df
-                stock_names[code] = code  # 实际使用时从stock_list获取名称
+
+        # 从全市场 stock_list 构建 code→name 映射
+        stock_list = fetcher.get_stock_list()
+        name_map = dict(zip(stock_list["code"], stock_list["name"]))
+        stock_names = {c: name_map.get(c, c) for c in stock_data.keys()}
         
         # 预测
         df_result = predictor.get_top_recommendations(
@@ -147,7 +150,6 @@ async def get_recommendations(
                 prob_neutral=row["震荡概率"],
                 prob_down=row["下跌概率"],
                 xgb_signal=row["XGB信号"],
-                lgb_signal=row["LGB信号"],
             ))
         
         return RecommendationResponse(
@@ -187,7 +189,6 @@ async def analyze_stock(
                 prob_neutral=pred.prob_neutral,
                 prob_down=pred.prob_down,
                 xgb_signal="📈买入" if pred.xgb_signal == 1 else ("📉卖出" if pred.xgb_signal == -1 else "➡️持有"),
-                lgb_signal="📈买入" if pred.lgb_signal == 1 else ("📉卖出" if pred.lgb_signal == -1 else "➡️持有"),
             )
         
         # 近期表现
@@ -267,7 +268,6 @@ async def model_info():
         "model_ready": predictor.is_ready,
         "models": {
             "xgboost": predictor.xgb_model is not None,
-            "lightgbm": predictor.lgb_model is not None,
         },
         "config": {
             "forecast_days": app_config.ml.forecast_days,
