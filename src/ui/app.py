@@ -799,7 +799,7 @@ elif page == "🔍 AI选股":
         with st.expander("⚙️ 筛选条件", expanded=True):
             rc1, rc2, rc3 = st.columns(3)
             with rc1:
-                pool = st.selectbox("股票池", ["hs300", "zz500", "all"], index=0, help="hs300=大盘蓝筹, zz500=中盘成长")
+                pool = st.selectbox("股票池", ["hs300", "zz500", "all"], index=1, help="hs300=大盘蓝筹, zz500=中盘成长（默认中证500：样本外RankIC更高）")
                 top_n = st.slider("推荐数量", 5, 50, 20, 5)
             with rc2:
                 # 量程按单模型化后的实际评分区间（约 38~60）收窄，步长 1 便于微调
@@ -2595,18 +2595,22 @@ elif page == "⚙️ 设置":
         st.success("✅ 缓存已清除! 下次获取将重新下载数据。")
 
     st.markdown('<div class="section-title">🚀 一键训练优化</div>', unsafe_allow_html=True)
-    st.info("💡 Optuna TPE（智能贝叶斯搜索）+ SHAP 自动筛选最有价值的特征 Top 60 + SMOTE 过采样。")
+    st.info("💡 Optuna TPE（智能贝叶斯搜索）+ SHAP 自动筛选最有价值的特征 Top 60 + SMOTE 过采样。"
+            "⚠️ 只有「标准/深度」档会覆盖生产模型（训练前自动备份）；「快速」档仅作试验，结果另存 *_optuna_*，绝不覆盖生产模型。")
     
     # 3 个按钮此前是 3 段结构完全相同的复制粘贴，只差 3 个字符串。
     # 改成数据驱动：加/改一个档位只需动这里一行。
     _TRAIN_PRESETS = {
         "optuna": ("TPE 智能引导 · SHAP 特征筛选 Top 60 · SMOTE 过采样", [
-            ("⚡ Optuna 快速 (2分钟)", "optuna_fast", True,
-             "Optuna 50 trials · SHAP Top 60 · 3折CV · 3轮重训"),
-            ("🧠 Optuna 标准 (15分钟)", "optuna_mid", False,
-             "Optuna 150 trials · SHAP Top 60 · 5折CV · 3轮重训"),
-            ("🔬 Optuna 深度 (40分钟)", "optuna_deep", False,
-             "Optuna 300 trials · SHAP Top 70 · 5折CV · 5轮重训"),
+            ("⚡ Optuna 快速·试验 (2分钟)", "optuna_fast", True,
+             "Optuna 50 trials · SHAP Top 60 · 3折CV · 3轮重训 · hs300/100只 · "
+             "仅试验：不部署，结果另存 *_optuna_*，绝不覆盖生产模型"),
+            ("🧠 Optuna 标准·部署 (15分钟)", "optuna_mid", False,
+             "Optuna 150 trials · SHAP Top 60 · 5折CV · 3轮重训 · zz500 全池 · "
+             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）"),
+            ("🔬 Optuna 深度·部署 (40分钟)", "optuna_deep", False,
+             "Optuna 300 trials · SHAP Top 70 · 5折CV · 5轮重训 · zz500 全池 · "
+             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）"),
         ]),
     }
 
@@ -2651,18 +2655,23 @@ elif page == "⚙️ 设置":
 
         # Optuna TPE + SHAP 训练
         script = base / "scripts" / "train_optuna.py"
+        # 部署档（标准/深度）必须与生产 serve 池一致：本文件 :802 股票池默认 zz500，
+        # 训练 Universe ≠ serve Universe 时实测 RankIC 不反映实盘（2026-10-12 三池实测结论）。
+        # 快速档 = 纯试验：加 --no-deploy，绝不覆盖生产模型。
+        # 事故记录（2026-10-12 23:36）：快速档曾以 hs300/100只/SHAP Top60 静默部署，
+        # OOS RankIC 仅 0.046（生产 zz500 模型 0.0747），且未留下任何 metrics 记录。
         if mode == "optuna_deep":
             cmd = [py, str(script), "--n-trials", "300", "--cv-folds", "5", "--retrain-rounds", "5",
-                   "--pool", "all", "--max-stocks", "500", "--parallel", "--model", "xgboost", "--shap-top", "70"]
+                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost", "--shap-top", "70"]
             mode_label = "Optuna 深度"
         elif mode == "optuna_mid":
             cmd = [py, str(script), "--n-trials", "150", "--cv-folds", "5", "--retrain-rounds", "3",
-                   "--pool", "hs300_zz500", "--max-stocks", "400", "--parallel", "--model", "xgboost"]
+                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost"]
             mode_label = "Optuna 标准"
         else:  # optuna_fast
             cmd = [py, str(script), "--n-trials", "20", "--cv-folds", "3", "--retrain-rounds", "2",
                    "--pool", "hs300", "--max-stocks", "100", "--parallel", "--model", "xgboost",
-                   "--max-samples", "30000", "--max-estimators", "400", "--shap-top", "60"]
+                   "--max-samples", "30000", "--max-estimators", "400", "--shap-top", "60", "--no-deploy"]
             mode_label = "Optuna 快速"
 
         # 记住档位名称：终态提示在后续 rerun 里也要用，而那时启动块不会执行

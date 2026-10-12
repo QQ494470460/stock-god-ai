@@ -49,9 +49,12 @@ LOG_FILE = LOG_DIR / f"optuna_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.l
 RESULT_FILE = MODEL_DIR / "optuna_search_result.json"
 SHAP_FEATURES_FILE = MODEL_DIR / "shap_features.json"
 
-# 参照基线：train_production_v2.py（5档截面分位标签 + V3序数权重 + leak-safe）
-# 诚实 walk-forward 实测的样本外 RankIC。本脚本走的是旧管线，结果要跟它比。
-PROD_BASELINE_RANKIC = 0.1256
+# 参照基线：当前生产部署模型（train_production_v2.py --pool zz500，5档截面分位标签
+# + V3序数权重 + leak-safe）诚实 walk-forward 实测的样本外 RankIC。
+# ⚠️ 历史：这里曾写 0.1256，那是 legacy150「按代码序前150只」旧池的口径（且含成分股
+# 前视偏差，见 2026-10-12 三池实测），拿它当基线会把「明显更差的新模型」也显得达标。
+# 2026-10-12 起改为与 app 实际部署池(zz500)同口径的 0.0747。
+PROD_BASELINE_RANKIC = 0.0747
 
 # RankIC 目标（新口径）固定参数：与 train_production_v2.py / walk_forward_labels.py 保持一致
 HORIZON = 5        # 前瞻 5 日
@@ -126,11 +129,74 @@ def _backup_production() -> list:
     return backed
 
 
+def _pool_codes(args):
+    """取股票池代码；--max-stocks 0 = 全池（默认，与生产口径一致），>0 = 前 N 只。
+
+    历史 bug：原来直接 `codes[:args.max_stocks]`，默认值 200 会把 zz500(约430只) 截断；
+    app「Optuna 快速」预设更传 100 → 只用 100 只训练就部署，样本量约为生产模型的 1/3，
+    RankIC 天然更低。0=全池 让 in-app 训练与 train_production_v2.py 的 Universe 一致。
+    """
+    codes = fetcher.get_stock_pool(args.pool)
+    if args.max_stocks and args.max_stocks > 0:
+        codes = codes[:args.max_stocks]
+    return codes
+
+
+def _write_production_metrics(args, objective, n_folds, n_features, n_samples,
+                              best_params, model_path, oos_ic=None, f1=None):
+    """部署后同步重写 production_metrics.json —— 记录文件必须描述当前生产模型。
+
+    事故背景（2026-10-12 23:36）：app「Optuna 快速」预设静默部署了一个
+    hs300/100只/SHAP Top60 的模型（OOS RankIC 仅 0.046），而 production_metrics.json
+    仍停留在 train_production_v2.py 写的 zz500/0.0747 —— 记录与实物不符，
+    事后核对时完全无法从 metrics 看出跑的是哪个模型。
+    本函数保证：只要 deploy 覆盖了生产产物，metrics 立即同步成该模型的真实口径。
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = MODEL_DIR / "production_metrics.json"
+    if target.exists():
+        try:
+            shutil.copy2(target, MODEL_DIR / f"production_metrics.json.bak_{ts}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"备份旧 production_metrics.json 失败: {e}")
+    wf = {"objective": objective, "n_folds": int(n_folds)}
+    if objective == "rankic" and oos_ic is not None and oos_ic == oos_ic:
+        wf["rank_ic"] = float(oos_ic)
+    elif f1 is not None:
+        wf["f1_macro"] = float(f1)
+    payload = {
+        "config": {
+            "pool": args.pool,
+            "max_stocks": args.max_stocks,
+            "horizon": HORIZON,
+            "n_bins": N_BINS,
+            "n_splits": args.cv_folds,
+            "weight": "V3 ordinal_cost (balanced x (1+1.0*|y-2|))",
+            "xgb_params": {k: v for k, v in best_params.items()},
+            "n_samples": int(n_samples),
+            "n_features": int(n_features),
+            "source": f"train_optuna (objective={objective})",
+        },
+        "walk_forward": wf,
+        "saved_at": ts,
+        "model_path": str(model_path),
+    }
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    shown = wf.get("rank_ic", wf.get("f1_macro"))
+    logger.info(f"📝 已同步 production_metrics.json（pool={args.pool}, "
+                f"max_stocks={args.max_stocks or '全池'}, 指标={shown}）")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Optuna TPE 超参优化训练")
-    p.add_argument("--pool", default="hs300")
+    p.add_argument("--pool", default="zz500",
+                   help="训练股票池。默认 zz500=与生产部署池一致（app.py 股票池默认也是 zz500）；"
+                        "训练 Universe 必须等于 serve Universe，否则实测 RankIC 不反映实盘")
     p.add_argument("--start-date", default="2018-01-01")
-    p.add_argument("--max-stocks", type=int, default=200)
+    p.add_argument("--max-stocks", type=int, default=0,
+                   help="0=用全池（默认，与生产口径一致）；>0=只取前 N 只（仅快速试验用，"
+                        "注意是'按代码序前 N 只'不是随机抽样）")
     p.add_argument("--n-trials", type=int, default=50, help="Optuna trials 数（50=快速, 150=标准, 300=深度）")
     p.add_argument("--cv-folds", type=int, default=3)
     # 单一模型口径：只保留 xgboost。"all" 保留仅为兼容旧调用，实际仍只跑 xgboost。
@@ -156,8 +222,7 @@ def parse_args():
 
 def gather_data(args):
     """收集训练数据（并行优先）"""
-    codes = fetcher.get_stock_pool(args.pool)
-    codes = codes[:args.max_stocks]
+    codes = _pool_codes(args)
     end_date = datetime.now().strftime("%Y%m%d")
 
     df_map = {}
@@ -374,7 +439,7 @@ def shap_feature_selection(X, y, best_params, model_type, shap_top_n):
     return top_features, imp_df
 
 
-def retrain_final(X, y, best_params, model_type, rounds, features, result, deploy=True):
+def retrain_final(args, X, y, best_params, model_type, rounds, features, result, deploy=True):
     """SHAP 筛选后用最佳参数重训练"""
     n_feat = len(features) if features is not None else X.shape[1]
     logger.info(f"\n{'='*60}")
@@ -462,6 +527,15 @@ def retrain_final(X, y, best_params, model_type, rounds, features, result, deplo
         pickle.dump(le, f)
     logger.info(f"💾 预处理器: {scaler_path.name} / {enc_path.name}")
 
+    if deploy:
+        # f1 旧口径路径同样覆盖生产产物，metrics 也必须同步（否则记录再次失真）
+        _write_production_metrics(
+            args=args, objective="f1", n_folds=5,
+            n_features=int(n_feat), n_samples=int(len(X)),
+            best_params=best_params, model_path=model_path,
+            f1=float(np.mean(scores)),
+        )
+
     return {
         "mean_f1": float(np.mean(scores)),
         "std_f1": float(np.std(scores)),
@@ -485,8 +559,7 @@ def gather_panel(args):
       → melt 回长表按 (date, code) 对齐
     标签口径与 train_production_v2.py 完全一致。
     """
-    codes = fetcher.get_stock_pool(args.pool)
-    codes = codes[:args.max_stocks]
+    codes = _pool_codes(args)
     end_date = datetime.now().strftime("%Y%m%d")
 
     frames, close_map = [], {}
@@ -716,6 +789,14 @@ def rankic_final(X, y, meta, fwd, args, best_params, deploy=True):
         json.dump({"features": list(X.columns), "n_features": int(X.shape[1])},
                   f, ensure_ascii=False)
 
+    if deploy:
+        # 覆盖生产产物后立刻同步 metrics，杜绝"文件写旧模型指标、实际跑新模型"的记录失真
+        _write_production_metrics(
+            args=args, objective="rankic", n_folds=len(ics),
+            n_features=int(X.shape[1]), n_samples=int(len(X)),
+            best_params=params, model_path=model_path, oos_ic=oos_ic,
+        )
+
     logger.info(f"💾 模型: {model_path}")
     logger.info(f"💾 预处理器: {scaler_path.name} / {enc_path.name}")
 
@@ -851,7 +932,7 @@ def _run(args):
     final_scores = {}
     for mt in models_to_run:
         r = retrain_final(
-            X, y, all_results[mt]["best_params"], mt,
+            args, X, y, all_results[mt]["best_params"], mt,
             args.retrain_rounds, shap_features[mt], all_results[mt],
             deploy=deploy,
         )
