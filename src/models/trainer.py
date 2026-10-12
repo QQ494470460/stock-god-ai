@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 模型训练模块
-XGBoost + LightGBM 集成训练，含交叉验证、特征选择、样本平衡
+XGBoost 单模型训练，含交叉验证、特征选择、样本平衡
+
+注：历史上这里还训练 LightGBM 并与 XGBoost 做加权集成。样本外评估
+（200 只股票 × 45 天）显示 XGBoost 的 RankIC 0.0823 / IC_IR 0.55 优于
+LightGBM 的 0.0647 / 0.49，而陈旧的 lightgbm_model.pkl 反而把集成信号
+稀释到 RankIC 约 0.027。LightGBM 已于 2026-10 从本项目移除，
+train_ensemble() 仅保留函数名做兼容，实际只训练 XGBoost。
 """
 
 import pickle
@@ -19,10 +25,13 @@ from sklearn.metrics import (
     classification_report, confusion_matrix
 )
 from sklearn.utils.class_weight import compute_class_weight
-from imblearn.over_sampling import SMOTE
 
 import xgboost as xgb
-import lightgbm as lgb
+
+# 注意：这里**不要**再 import lightgbm。predictor.py 的 trainer property 会在
+# 加载任意一个模型时 `from src.models.trainer import MLTrainer`，本模块是顶层
+# import，加一行就会把 lightgbm（约 3.1 秒 + 打包后额外 DLL 映射）拖进每次
+# 模型加载。lightgbm 已从项目移除，如需训练请在函数内部局部导入。
 
 from config.settings import config as app_config, MODEL_DIR
 
@@ -80,30 +89,24 @@ class MLTrainer:
         model_type: str = "xgboost",
         cv_folds: int = 5
     ) -> dict:
-        """超参数网格搜索"""
+        """超参数网格搜索。
+
+        model_type 形参保留仅为兼容历史调用（如 scripts/train.py 传 "lightgbm"），
+        现已忽略——项目只用 XGBoost，任何取值都会走 XGBoost 参数空间。
+        """
         X, y = self.preprocess(features, labels, fit_scaler=True)
         X, y = self.balance_samples(X, y)
         
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         
-        if model_type == "xgboost":
-            param_grid = {
-                "n_estimators": [200, 400, 600],
-                "max_depth": [4, 6, 8],
-                "learning_rate": [0.01, 0.03, 0.05],
-                "subsample": [0.7, 0.8, 0.9],
-                "colsample_bytree": [0.7, 0.8],
-            }
-            base_model = xgb.XGBClassifier(random_state=42, n_jobs=-1, verbosity=0)
-        else:
-            param_grid = {
-                "n_estimators": [200, 400, 600],
-                "max_depth": [5, 7, 9],
-                "learning_rate": [0.01, 0.03, 0.05],
-                "subsample": [0.7, 0.8, 0.9],
-                "num_leaves": [31, 63, 127],
-            }
-            base_model = lgb.LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1)
+        param_grid = {
+            "n_estimators": [200, 400, 600],
+            "max_depth": [4, 6, 8],
+            "learning_rate": [0.01, 0.03, 0.05],
+            "subsample": [0.7, 0.8, 0.9],
+            "colsample_bytree": [0.7, 0.8],
+        }
+        base_model = xgb.XGBClassifier(random_state=42, n_jobs=-1, verbosity=0)
         
         logger.info(f"GridSearch {model_type}: {len(param_grid)} 参数, 实际测试组合取决于cv")
         
@@ -111,29 +114,17 @@ class MLTrainer:
         from sklearn.model_selection import RandomizedSearchCV
         from scipy.stats import randint, uniform
         
-        if model_type == "xgboost":
-            param_dist = {
-                "n_estimators": randint(200, 800),
-                "max_depth": randint(4, 10),
-                "learning_rate": uniform(0.01, 0.08),
-                "subsample": uniform(0.6, 0.4),
-                "colsample_bytree": uniform(0.6, 0.4),
-                "min_child_weight": randint(1, 10),
-                "gamma": uniform(0, 0.5),
-                "reg_alpha": uniform(0, 1),
-                "reg_lambda": uniform(0, 2),
-            }
-        else:
-            param_dist = {
-                "n_estimators": randint(200, 800),
-                "max_depth": randint(4, 12),
-                "learning_rate": uniform(0.01, 0.08),
-                "subsample": uniform(0.6, 0.4),
-                "num_leaves": randint(20, 150),
-                "min_child_samples": randint(5, 50),
-                "reg_alpha": uniform(0, 1),
-                "reg_lambda": uniform(0, 2),
-            }
+        param_dist = {
+            "n_estimators": randint(200, 800),
+            "max_depth": randint(4, 10),
+            "learning_rate": uniform(0.01, 0.08),
+            "subsample": uniform(0.6, 0.4),
+            "colsample_bytree": uniform(0.6, 0.4),
+            "min_child_weight": randint(1, 10),
+            "gamma": uniform(0, 0.5),
+            "reg_alpha": uniform(0, 1),
+            "reg_lambda": uniform(0, 2),
+        }
         
         search = RandomizedSearchCV(
             base_model, param_dist,
@@ -148,8 +139,9 @@ class MLTrainer:
         return search.best_params_
 
     def balance_samples(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """SMOTE样本平衡"""
+        """SMOTE样本平衡（imblearn 懒加载：预测部署不需要训练依赖，避免打包缺失）"""
         from collections import Counter
+        from imblearn.over_sampling import SMOTE
         before = Counter(y)
         
         try:
@@ -238,84 +230,23 @@ class MLTrainer:
         logger.info(f"XGBoost训练完成: F1={result.f1_macro:.4f}")
         return result
     
-    def train_lightgbm(
-        self,
-        features: pd.DataFrame,
-        labels: pd.Series,
-        use_smote: bool = True
-    ) -> TrainingResult:
-        """训练LightGBM模型"""
-        logger.info("=" * 50)
-        logger.info("训练 LightGBM 模型")
-        
-        X, y = self.preprocess(features, labels, fit_scaler=True)
-        
-        if use_smote:
-            X, y = self.balance_samples(X, y)
-        
-        params = app_config.ml.lgb_params.copy()
-        
-        tscv = TimeSeriesSplit(n_splits=app_config.ml.cv_folds)
-        cv_scores = []
-        
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            X_tr, X_val = X[train_idx], X[val_idx]
-            y_tr, y_val = y[train_idx], y[val_idx]
-            
-            model = lgb.LGBMClassifier(**params, verbose=-1)
-            model.fit(X_tr, y_tr)
-            
-            y_pred = model.predict(X_val)
-            acc = accuracy_score(y_val, y_pred)
-            cv_scores.append(acc)
-            logger.info(f"  Fold {fold+1}: Accuracy = {acc:.4f}")
-        
-        logger.info(f"  CV Mean Accuracy: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
-        
-        # 全量训练
-        final_model = lgb.LGBMClassifier(**params, verbose=-1)
-        final_model.fit(X, y)
-        
-        # 特征重要性
-        importance_df = pd.DataFrame({
-            "feature": features.columns,
-            "importance": final_model.feature_importances_
-        }).sort_values("importance", ascending=False)
-        
-        # 验证集评估
-        split_idx = int(len(X) * 0.8)
-        X_val, y_val = X[split_idx:], y[split_idx:]
-        y_pred = final_model.predict(X_val)
-        
-        result = TrainingResult(
-            model_name="lightgbm",
-            accuracy=accuracy_score(y_val, y_pred),
-            f1_macro=f1_score(y_val, y_pred, average="macro"),
-            precision=precision_score(y_val, y_pred, average="macro"),
-            recall=recall_score(y_val, y_pred, average="macro"),
-            feature_importance=importance_df,
-            cv_scores=cv_scores,
-            model=final_model
-        )
-        
-        self._save_model(result, "lightgbm_model.pkl")
-        logger.info(f"LightGBM训练完成: F1={result.f1_macro:.4f}")
-        return result
-    
     def train_ensemble(
         self,
         features: pd.DataFrame,
         labels: pd.Series,
     ) -> Dict[str, TrainingResult]:
-        """训练集成模型（XGBoost + LightGBM）"""
+        """训练集成模型。
+
+        函数名保留以兼容历史调用（如 scripts/train.py），但 LightGBM 已移除，
+        实际只训练 XGBoost 一个模型，返回 {"xgboost": ...}。
+        """
         results = {}
         
         results["xgboost"] = self.train_xgboost(features, labels)
-        results["lightgbm"] = self.train_lightgbm(features, labels)
         
-        # 打印对比
+        # 打印结果
         logger.info("\n" + "=" * 60)
-        logger.info("📊 模型对比")
+        logger.info("📊 模型结果")
         logger.info(f"{'模型':<15} {'Accuracy':<10} {'F1':<10} {'Precision':<10} {'Recall':<10}")
         logger.info("-" * 55)
         for name, r in results.items():

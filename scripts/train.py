@@ -29,9 +29,10 @@ def parse_args():
                        help="起始日期 (默认: 2018-01-01)")
     parser.add_argument("--days", type=int, default=200,
                        help="获取最近多少天的数据 (默认: 200)")
-    parser.add_argument("--model", type=str, default="ensemble",
-                       choices=["xgboost", "lightgbm", "ensemble", "all"],
-                       help="训练模型 (默认: ensemble)")
+    # 单一模型口径：只训 xgboost。"ensemble"/"all" 仅为兼容旧调用保留。
+    parser.add_argument("--model", type=str, default="xgboost",
+                       choices=["xgboost", "ensemble", "all"],
+                       help="训练模型 (默认: xgboost)")
     parser.add_argument("--no-lstm", action="store_true",
                        help="跳过LSTM训练 (Windows可能缺少PyTorch)")
     parser.add_argument("--gpu", action="store_true",
@@ -135,12 +136,9 @@ def main():
         logger.info("🔍 超参数搜索中... (~5分钟)")
         try:
             xgb_best = trainer.grid_search(X_all, y_all, "xgboost")
-            lgb_best = trainer.grid_search(X_all, y_all, "lightgbm")
             logger.info(f"XGBoost最佳参数: {xgb_best}")
-            logger.info(f"LightGBM最佳参数: {lgb_best}")
             # 更新config
             app_config.ml.xgb_params.update(xgb_best)
-            app_config.ml.lgb_params.update(lgb_best)
         except Exception as e:
             logger.warning(f"GridSearch失败: {e}，使用默认参数")
     
@@ -150,9 +148,6 @@ def main():
         xgb_result = trainer.train_xgboost(X_all, y_all)
         results["xgboost"] = xgb_result
     
-    if args.model in ("lightgbm", "ensemble", "all"):
-        lgb_result = trainer.train_lightgbm(X_all, y_all)
-        results["lightgbm"] = lgb_result
     
     # 保存预处理器（scaler + label_encoder）
     trainer._save_preprocessing()

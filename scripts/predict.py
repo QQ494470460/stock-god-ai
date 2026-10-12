@@ -74,18 +74,16 @@ def main():
                 "score": round(p.score, 1),
                 "prob_up": round(p.prob_up, 3),
                 "xgb_signal": p.xgb_signal,
-                "lgb_signal": p.lgb_signal,
             })
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         for p in predictions:
             xgb_emoji = "📈" if p.xgb_signal == 1 else ("📉" if p.xgb_signal == -1 else "➡️")
-            lgb_emoji = "📈" if p.lgb_signal == 1 else ("📉" if p.lgb_signal == -1 else "➡️")
             print(f"{p.code:<8} 评分:{p.score:6.1f}  "
                   f"涨:{p.prob_up*100:5.1f}%  "
                   f"平:{p.prob_neutral*100:5.1f}%  "
                   f"跌:{p.prob_down*100:5.1f}%  "
-                  f"XGB:{xgb_emoji} LGB:{lgb_emoji}")
+                  f"XGB:{xgb_emoji}")
 
 
 if __name__ == "__main__":
