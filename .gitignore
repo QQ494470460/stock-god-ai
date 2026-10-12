@@ -53,3 +53,10 @@ htmlcov/
 .coverage
 .coverage.*
 coverage.xml
+
+# Secrets (never commit)
+config/broker_accounts.enc
+config/.salt
+config/deepseek.yaml
+config/broker.yaml.template
+QClaw.lnk
