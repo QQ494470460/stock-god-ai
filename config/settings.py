@@ -7,13 +7,35 @@ A股智能选股系统，基于AI/机器学习的多因子选股模型
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
+import os
+import sys
 import yaml
 
 # 项目根目录
 ROOT_DIR = Path(__file__).parent.parent
-DATA_DIR = ROOT_DIR / "data"
-MODEL_DIR = ROOT_DIR / "models"
-LOG_DIR = ROOT_DIR / "logs"
+
+
+def _resolve_dir(env_key: str, default_name: str) -> Path:
+    """解析数据目录：优先环境变量，其次 exe 同级目录，最后源码目录
+
+    打包成 exe 后 PyInstaller 会把代码解包到临时目录（sys._MEIPASS），
+    那里的数据目录是只读且随退出销毁 —— 必须改指向 exe 同级的外挂目录。
+    """
+    env_val = os.environ.get(env_key)
+    if env_val:
+        return Path(env_val)
+
+    # 打包模式：exe 所在目录优先
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        return exe_dir / default_name
+
+    return ROOT_DIR / default_name
+
+
+DATA_DIR = _resolve_dir("STOCK_GOD_DATA_DIR", "data")
+MODEL_DIR = _resolve_dir("STOCK_GOD_MODEL_DIR", "models")
+LOG_DIR = _resolve_dir("STOCK_GOD_LOG_DIR", "logs")
 
 # 创建必要的目录
 DATA_DIR.mkdir(exist_ok=True)
@@ -72,9 +94,22 @@ class MLConfig:
     
     # 预测标签
     forecast_days: int = 5  # 预测未来N日涨跌
-    threshold_up: float = 0.03  # 涨幅阈值（3%以上为涨）
+    threshold_up: float = 0.02  # 涨幅阈值（2%以上为涨，放宽让模型更敢给方向）
     threshold_down: float = -0.02  # 跌幅阈值（-2%以下为跌）
-    binary_mode: bool = True  # 二分类（涨 vs 跌），忽略震荡
+    binary_mode: bool = False  # 三分类（涨/震荡/跌），更精准
+
+    # LLM 定性叠加覆盖层（详见 scripts/daily_recommend.py / src/models/predictor.py）
+    # 默认关闭：覆盖层仅对 predict_batch 产出的 score 做纯加性微调，
+    # 绝不重训 xgboost，不影响已验证的 walk-forward RankIC=0.1256。
+    # CLI（--llm / --llm-mock）会临时把 enable_llm_overlay 置 True。
+    enable_llm_overlay: bool = False  # 主开关（默认关闭，零影响）
+    llm_mock: bool = False            # 覆盖层是否走离线 mock（无需本地 Ollama）
+
+    # 自进化阈值调整开关（详见 src/models/evolution.py）
+    # True  = 有效阈值 = 用户设定 + 准确率调整 + 市场状态调整（熊市 +5、牛市 -3）
+    #         —— 这个 ±5 是硬编码启发式，无回测验证，且弱模型下准确率调整项长期≈0
+    # False = 有效阈值恒等于用户在 UI 拖的滑块值，不被市场状态静默改写（默认）
+    auto_threshold_adjust: bool = False
 
 
 @dataclass  
