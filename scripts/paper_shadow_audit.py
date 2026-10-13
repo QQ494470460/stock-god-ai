@@ -52,6 +52,7 @@ except Exception:  # noqa: BLE001
 MODELS_DIR = ROOT / "models"
 PROD_METRICS_FILE = MODELS_DIR / "production_metrics.json"
 ROLLING_IC_LOG = ROOT / "data" / "rolling_ic_log.json"
+TRIGGER_LOG = ROOT / "data" / "audit_triggers.jsonl"
 
 # ---- RiskConfig 真阈值（优先从 executor 取，失败退化为文档默认值） ----
 try:
@@ -148,6 +149,33 @@ def _count_trading_days(start: date, end: date) -> int:
         d = d + __import__("datetime").timedelta(days=1)
         guard += 1
     return cnt
+
+
+def _read_trigger_log(path: Path = TRIGGER_LOG) -> List[dict]:
+    """读取 audit_triggers.jsonl（AutoTrader 风控触发结构化日志）"""
+    out: List[dict] = []
+    try:
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _trigger_summary(log: List[dict]) -> dict:
+    counts: Dict[str, int] = {}
+    for r in log:
+        t = r.get("type", "?")
+        counts[t] = counts.get(t, 0) + 1
+    return {"total": len(log), "by_type": counts,
+            "recent": log[-5:] if log else []}
 
 
 # ============================ 成交解析 ============================
@@ -464,6 +492,7 @@ def run_audit(args) -> dict:
     pnl = panel_pnl(history, account, metrics)
     sig = panel_signal(history, args.rolling)
     risk = panel_risk(history, account)
+    risk["structured_triggers"] = _trigger_summary(_read_trigger_log(args.trigger_log))
 
     # 全局验收判定
     critical = []
@@ -541,6 +570,14 @@ def _print(report: dict):
     print(f"  日内亏损熔断    : {r['daily_loss_breach_count']} 天 {r['daily_loss_breach_days']}")
     print(f"  日成交上限突破  : {r['daily_trade_cap_breach_count']} 天 {r['daily_trade_cap_days']}")
     print(f"  止损触发(平仓)  : {r['stop_loss_trigger_lots']} 笔 | 止盈触发: {r['stop_profit_trigger_lots']} 笔")
+    st = r.get("structured_triggers")
+    if st and st["total"]:
+        print(f"  结构化触发日志  : 共 {st['total']} 条 {st['by_type']}")
+        for rec in st["recent"]:
+            print(f"      · {rec.get('ts','')[:19]} [{rec.get('type','')}] "
+                  f"{rec.get('code','')} {rec.get('reason','')}")
+    else:
+        print(f"  结构化触发日志  : 无（data/audit_triggers.jsonl 为空或不存在）")
     print(f"  ⓘ {r['note']}")
 
     print("\n【判定】")
@@ -671,6 +708,7 @@ def main(argv=None) -> int:
     ap.add_argument("--history", type=Path, default=PAPER_HISTORY_FILE, help="纸盘成交历史 JSON")
     ap.add_argument("--account", type=Path, default=PAPER_ACCOUNT_FILE, help="纸盘账户 JSON")
     ap.add_argument("--metrics", type=Path, default=PROD_METRICS_FILE, help="生产指标 JSON")
+    ap.add_argument("--trigger-log", type=Path, default=TRIGGER_LOG, help="风控触发日志 JSONL")
     ap.add_argument("--json", type=Path, default=ROOT / "data" / "paper_shadow_audit.json", help="JSON 输出")
     ap.add_argument("--rolling", type=int, default=20, help="Panel2 滚动窗口笔数")
     ap.add_argument("--live-ic", action="store_true", help="追加市场级滚动 IC（需模型+本地缓存）")
