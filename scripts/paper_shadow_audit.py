@@ -675,22 +675,27 @@ def cmd_live_ic(args) -> int:
     excess = fwd_arr - fwd_arr.mean()  # 相对等权宇宙的超额（与训练标签口径一致）
     ic = _spearman(scores, excess)
 
-    # 累积滚动日志
+    # 累积滚动日志（按评分日去重：非交易日/同日重复跑不追加，避免污染滚动序列）
     log = _load_json(ROLLING_IC_LOG) or []
-    log.append({"date": d.strftime("%Y-%m-%d"), "ic": round(float(ic), 4),
-                "n": len(scores), "offline": offline})
-    log = log[-60:]
-    try:
-        ROLLING_IC_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    d_str = d.strftime("%Y-%m-%d")
+    if log and log[-1].get("date") == d_str:
+        appended = False
+    else:
+        log.append({"date": d_str, "ic": round(float(ic), 4),
+                    "n": len(scores), "offline": offline})
+        log = log[-60:]
+        try:
+            ROLLING_IC_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        appended = True
 
     ics = [x["ic"] for x in log if x["ic"] == x["ic"]]
     roll_mean = float(np.mean(ics[-args.rolling:])) if len(ics) >= args.rolling else float(np.mean(ics))
     print(f"\n📡 市场级 RankIC（评分日 {d.strftime('%Y-%m-%d')}，样本 {len(scores)}，"
           f"{'离线样本' if offline else 'zz500'}）")
     print(f"  今日 IC      : {ic:+.4f}")
-    print(f"  滚动{args.rolling}日均值: {roll_mean:+.4f}  (日志共 {len(ics)} 点)")
+    print(f"  滚动{args.rolling}日均值: {roll_mean:+.4f}  (日志共 {len(ics)} 点，{'已追加' if appended else '今日已记录·跳过追加'})")
     print(f"  生产基线参考 : RankIC={_load_json(PROD_METRICS_FILE).get('walk_forward', {}).get('rank_ic')}")
     if ic <= 0:
         print("  🔴 今日市场级 IC<=0：模型全市场排序能力暂失，需警惕")
