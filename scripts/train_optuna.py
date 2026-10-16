@@ -217,6 +217,11 @@ def parse_args():
                         "f1=旧口径 F1(macro)（三分类绝对涨跌标签，仅作对照）")
     p.add_argument("--valid-ratio", type=float, default=0.25,
                    help="rankic 目标下用作验证的尾部交易日比例（默认 0.25）")
+    p.add_argument("--version-id", default="",
+                   help="可选：训练完成后额外写入一个带此 id 的版本化产物（versions/<id>/，"
+                        "含 model/scaler/encoder/features 四件套）。该版本经人工批准名单"
+                        "（或 ml.active_version 钉子）批准后，可由 predictor 真正切换加载。"
+                        "为空则不写版本（保持默认行为，仅覆盖生产产物）")
     return p.parse_args()
 
 
@@ -527,6 +532,22 @@ def retrain_final(args, X, y, best_params, model_type, rounds, features, result,
         pickle.dump(le, f)
     logger.info(f"💾 预处理器: {scaler_path.name} / {enc_path.name}")
 
+    # 版本化产物（可选，--version-id 为空则跳过）：额外写一份带 id 的可切换版本，
+    # 失败绝不拖垮主产物保存。
+    if getattr(args, "version_id", ""):
+        try:
+            from src.models.model_registry import write_version_bundle
+
+            write_version_bundle(
+                args.version_id,
+                model=best_model, scaler=scaler, label_encoder=le,
+                features=(features if features is not None else list(X.columns)),
+                metrics={"model_path": f"versions/{args.version_id}/model.pkl",
+                         "note": "由 train_optuna 自动版本化"},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 版本化保存失败（不影响主产物）：{e}")
+
     if deploy:
         # f1 旧口径路径同样覆盖生产产物，metrics 也必须同步（否则记录再次失真）
         _write_production_metrics(
@@ -788,6 +809,22 @@ def rankic_final(X, y, meta, fwd, args, best_params, deploy=True):
     with open(feat_path, "w", encoding="utf-8") as f:
         json.dump({"features": list(X.columns), "n_features": int(X.shape[1])},
                   f, ensure_ascii=False)
+
+    # 版本化产物（可选，--version-id 为空则跳过）：额外写一份带 id 的可切换版本，
+    # 失败绝不拖垮主产物保存。
+    if getattr(args, "version_id", ""):
+        try:
+            from src.models.model_registry import write_version_bundle
+
+            write_version_bundle(
+                args.version_id,
+                model=final_model, scaler=scaler, label_encoder=le,
+                features=list(X.columns),
+                metrics={"model_path": f"versions/{args.version_id}/model.pkl",
+                         "note": "由 train_optuna 自动版本化"},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 版本化保存失败（不影响主产物）：{e}")
 
     if deploy:
         # 覆盖生产产物后立刻同步 metrics，杜绝"文件写旧模型指标、实际跑新模型"的记录失真

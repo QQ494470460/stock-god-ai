@@ -25,11 +25,12 @@
 from __future__ import annotations
 
 import json
+import pickle
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from loguru import logger
@@ -37,11 +38,18 @@ from loguru import logger
 from config.settings import CONFIG_DIR, MODEL_DIR
 
 
+# 版本化产物根目录：每个「可切换」的模型产物放在 versions/<version_id>/ 下，
+# 含 model.pkl / scaler.pkl / label_encoder.pkl / features.json 四件套 + <id>.json 指标。
+# 这样训练不再只是原地覆盖 models/xgboost_model.pkl（「根本没有另一个可切换的产物」），
+# 而是一个带明确 id 的版本，经人工批准名单（或 ml.active_version 钉子）后由 predictor 真正加载。
+VERSION_ROOT = MODEL_DIR / "versions"
+
+
 @dataclass
 class ModelInfo:
     """单个已登记模型的信息"""
     key: str                                    # 唯一键，如 "production_metrics" / "alpha_xgboost"
-    display_name: str
+    display_name: str = ""                      # 展示名（测试可省略；生产登记均显式赋值）
     model_path: Optional[Path] = None           # 可加载的 .pkl（无则 None）
     prefix: str = ""                            # 文件前缀（如 "alpha"），用于定位 scaler/features
     rank_ic: float = float("nan")               # 样本外 RankIC（主排序指标）
@@ -61,6 +69,122 @@ class ModelInfo:
 
 # 主流 predictor 管线使用的特征/预处理文件名（用于判定可部署）
 _MAIN_FAMILY_FILES = ("xgboost_model.pkl", "scaler.pkl", "features_xgboost.json")
+
+
+@dataclass
+class VersionSet:
+    """一个模型版本对应的「模型 + 预处理 + 特征」四件套路径，及完整性。
+
+    - ``legacy=True`` 表示这是遗留平铺布局（models/xgboost_model.pkl + 平铺
+      scaler.pkl / features_xgboost.json），predictor 沿用旧路径加载，行为不变。
+    - ``legacy=False`` 表示版本化布局（versions/<id>/model.pkl 等四件套）。
+    - ``complete``：四件套是否齐全。predictor 加载前必查此项，不齐则**拒绝**
+      该版本并回退到遗留默认——这就是「拒绝三件套不齐的版本集」。
+    """
+    model_path: Path
+    scaler_path: Path
+    label_encoder_path: Path
+    features_path: Path
+    version_id: Optional[str] = None
+    legacy: bool = False
+    complete: bool = False
+
+
+def version_set_for(info: "ModelInfo", model_dir: Optional[Path] = None) -> Optional[VersionSet]:
+    """由一条 ModelInfo 解析出它应当加载的四件套路径与完整性。
+
+    布局判定规则（只看 model_path 落在哪）：
+    - 在 ``versions/<id>/`` 下 → 版本化：四件套都取该目录内的
+      model.pkl / scaler.pkl / label_encoder.pkl / features.json。
+    - 否则（平铺在 MODEL_DIR 根）→ 遗留：model 即 model_path，
+      scaler/label_encoder 取 MODEL_DIR 根的 scaler.pkl / label_encoder.pkl，
+      features 取 ``features_{prefix}.json``（prefix 为空时即 features_xgboost.json）。
+
+    返回 None 仅当 info 无 model_path；其余情况都返回 VersionSet，
+    ``complete`` 如实反映四件套是否齐全。
+    """
+    root = Path(model_dir) if model_dir else MODEL_DIR
+    mpath = getattr(info, "model_path", None)
+    if not mpath:
+        return None
+    mpath = Path(mpath)
+    vroot = root / "versions"
+
+    if mpath.parent.parent == vroot:  # versions/<id>/model.pkl
+        d = mpath.parent
+        vid = d.name
+        model = mpath
+        scaler = d / "scaler.pkl"
+        le = d / "label_encoder.pkl"
+        feats = d / "features.json"
+        legacy = False
+    else:
+        prefix = getattr(info, "prefix", "") or "xgboost"
+        d = mpath.parent
+        model = mpath
+        scaler = d / "scaler.pkl"
+        le = d / "label_encoder.pkl"
+        feats = d / f"features_{prefix}.json"
+        vid = None
+        legacy = True
+
+    complete = model.exists() and scaler.exists() and le.exists() and feats.exists()
+    return VersionSet(
+        model_path=model, scaler_path=scaler, label_encoder_path=le,
+        features_path=feats, version_id=vid, legacy=legacy, complete=complete,
+    )
+
+
+def write_version_bundle(
+    version_id: str,
+    *,
+    model: Any = None,
+    scaler: Any = None,
+    label_encoder: Any = None,
+    features: Optional[List[str]] = None,
+    metrics: Optional[dict] = None,
+) -> Path:
+    """把一个训练产物落盘为一个带明确 id 的版本化副本（四件套 + 指标）。
+
+    这是「产物按版本命名」的真正落点：训练完不再只覆盖 xgboost_model.pkl，
+    而是额外写一份 ``versions/<version_id>/`` 下的可切换产物。predictor 在
+    该版本被批准/钉住后，会经由 version_set_for 真正加载它。
+
+    任何单文件写入失败都不影响其余文件（各自 try），但最终若模型文件缺失则抛错。
+    """
+    vid = str(version_id).strip()
+    if not vid:
+        raise ValueError("version_id 不能为空")
+    # 用模块级 MODEL_DIR（可被测试 monkeypatch）动态推导 versions 根，
+    # 而非导入期冻结的 VERSION_ROOT 常量，确保测试隔离到临时目录。
+    vdir = (MODEL_DIR / "versions") / vid
+    vdir.mkdir(parents=True, exist_ok=True)
+
+    if model is not None:
+        with open(vdir / "model.pkl", "wb") as f:
+            pickle.dump(model, f)
+    if scaler is not None:
+        with open(vdir / "scaler.pkl", "wb") as f:
+            pickle.dump(scaler, f)
+    if label_encoder is not None:
+        with open(vdir / "label_encoder.pkl", "wb") as f:
+            pickle.dump(label_encoder, f)
+    if features is not None:
+        with open(vdir / "features.json", "w", encoding="utf-8") as f:
+            json.dump({"features": list(features)}, f, ensure_ascii=False, indent=2)
+
+    # 指标 JSON（供 scan_models 登记；rank_ic 缺失时仍登记为可加载候选）
+    if metrics is not None:
+        metrics = dict(metrics)
+        metrics.setdefault("model_path", f"versions/{vid}/model.pkl")
+        with open(vdir / f"{vid}.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    if not (vdir / "model.pkl").exists():
+        raise RuntimeError(f"版本 {vid} 的模型文件未能落盘：{vdir / 'model.pkl'}")
+    logger.info(f"📦 已写入版本化产物：versions/{vid}/（model+scaler+encoder+features）")
+    return vdir
+
 
 
 def _safe_num(v):
@@ -228,6 +352,51 @@ def scan_models(model_dir: Optional[Path] = None) -> List[ModelInfo]:
             if cur is None or _ranks_above(m, cur):
                 m.note = f"{m.note} ｜ 来源 {jf.name}"
                 picked[m.key] = m
+
+    # —— 版本化产物（versions/<id>/）发现 ——
+    # 每个版本目录是一个带明确 id 的、可切换的训练产物；其 model.pkl / scaler.pkl /
+    # features.json 三件套齐全即为「可作主模型」候选。登记键即版本 id，与平铺
+    # 指标文件的 key（如 production_metrics）互不冲突。predictor 在版本被批准/
+    # 钉住后会经由 version_set_for 真正加载它。
+    vroot = root / "versions"
+    if vroot.is_dir():
+        for vdir in sorted(d for d in vroot.iterdir() if d.is_dir()):
+            vid = vdir.name
+            model_p = vdir / "model.pkl"
+            if not model_p.exists():
+                continue  # 不是模型版本目录（可能是别的子目录）
+            rank_ic = float("nan")
+            for jf in sorted(vdir.glob("*.json")):
+                try:
+                    d = json.loads(jf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                wf = d.get("walk_forward") or {}
+                ric = _safe_num(wf.get("rank_ic"))
+                if np.isnan(ric):
+                    ric = _safe_num(d.get("rank_ic"))
+                if np.isnan(ric):
+                    ric = _safe_num(d.get("oos_rank_ic"))
+                if not np.isnan(ric):
+                    rank_ic = ric
+                    break
+            files_ok = (
+                model_p.exists()
+                and (vdir / "scaler.pkl").exists()
+                and (vdir / "label_encoder.pkl").exists()
+                and (vdir / "features.json").exists()
+            )
+            picked[vid] = ModelInfo(
+                key=vid,
+                display_name=f"版本 {vid}（已训练产物）",
+                model_path=model_p,
+                prefix=vid,
+                rank_ic=rank_ic,
+                loadable=bool(files_ok),
+                role="main",
+                note=("四件套齐全，可作为主模型候选"
+                      if files_ok else "版本四件套（model/scaler/label_encoder/features）不齐，暂不可部署"),
+            )
 
     infos = list(picked.values())
     # 按 RankIC 降序（NaN 排最后）

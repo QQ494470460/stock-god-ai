@@ -31,7 +31,7 @@ def _touch(p: Path, content=b"x"):
 
 
 def _main_family(d: Path):
-    for f in ("xgboost_model.pkl", "scaler.pkl", "features_xgboost.json"):
+    for f in ("xgboost_model.pkl", "scaler.pkl", "label_encoder.pkl", "features_xgboost.json"):
         _touch(d / f)
     (d / "production_metrics.json").write_text(json.dumps({
         "walk_forward": {"rank_ic": 0.075, "ic_ir": 6.0, "top_win_rate": 0.6, "n_days": 200},
@@ -217,3 +217,94 @@ def test_active_status_explains_when_nothing_approved(reg):
     _main_family(reg)
     s = mr.active_status(reg)
     assert "生产默认" in s or "批准" in s
+
+
+# ---------------------------------------------------------------------------
+# ④ 版本化产物（versions/<id>/）—— 让「批准/钉住」真的能切换到另一个模型
+# ---------------------------------------------------------------------------
+
+def _version_family(d: Path, vid: str, rank_ic: float = 0.2, with_metrics: bool = True):
+    vdir = d / "versions" / vid
+    vdir.mkdir(parents=True, exist_ok=True)
+    for f in ("model.pkl", "scaler.pkl", "label_encoder.pkl", "features.json"):
+        _touch(vdir / f)
+    if with_metrics:
+        (vdir / f"{vid}.json").write_text(json.dumps({
+            "walk_forward": {"rank_ic": rank_ic, "n_days": 120},
+            "model_path": f"versions/{vid}/model.pkl",
+        }), encoding="utf-8")
+    return vdir
+
+
+def test_version_discovery_registers_loadable(reg):
+    _main_family(reg)
+    vdir = _version_family(reg, "vbeta")
+    infos = mr.scan_models(reg)
+    keys = {m.key for m in infos}
+    assert "vbeta" in keys
+    vb = next(m for m in infos if m.key == "vbeta")
+    assert vb.loadable is True
+    # 用 Path 比较而非字符串 endswith：Windows 下分隔符是反斜杠，
+    # 写死 "versions/vbeta/model.pkl" 会在 Windows 上永远为 False。
+    assert vb.model_path == reg / "versions" / "vbeta" / "model.pkl"
+    assert abs(vb.rank_ic - 0.2) < 1e-9
+
+
+def test_version_set_for_versioned(reg):
+    vdir = _version_family(reg, "v1")
+    info = mr.ModelInfo(key="v1", model_path=vdir / "model.pkl", prefix="v1", loadable=True)
+    vs = mr.version_set_for(info, reg)
+    assert vs.legacy is False
+    assert vs.version_id == "v1"
+    assert vs.model_path == vdir / "model.pkl"
+    assert vs.scaler_path == vdir / "scaler.pkl"
+    assert vs.features_path == vdir / "features.json"
+    assert vs.complete is True
+
+
+def test_version_set_for_legacy(reg):
+    _main_family(reg)
+    prod = next(m for m in mr.scan_models(reg) if m.key == "production_metrics")
+    vs = mr.version_set_for(prod, reg)
+    assert vs.legacy is True
+    assert vs.model_path == reg / "xgboost_model.pkl"
+    assert vs.scaler_path == reg / "scaler.pkl"
+    assert vs.features_path == reg / "features_xgboost.json"
+    assert vs.complete is True
+
+
+def test_version_incomplete_not_loadable(reg):
+    vdir = reg / "versions" / "vincomplete"
+    vdir.mkdir(parents=True, exist_ok=True)
+    _touch(vdir / "model.pkl")  # 缺 scaler/features → 三件套不齐
+    inc = next((m for m in mr.scan_models(reg) if m.key == "vincomplete"), None)
+    assert inc is not None
+    assert inc.loadable is False
+    vs = mr.version_set_for(inc, reg)
+    assert vs.complete is False
+
+
+def test_resolve_active_path_returns_version_when_approved(reg):
+    _main_family(reg)
+    vdir = _version_family(reg, "v2", rank_ic=0.3)
+    mr.approve_version("v2", operator="bob")
+    got = mr.resolve_active(reg)
+    assert got is not None and got.key == "v2"
+    rp = mr.resolve_active_path(reg)
+    assert rp.name == "model.pkl"
+    assert "versions" in str(rp)
+
+
+def test_write_version_bundle_creates_four_piece_set(reg):
+    vdir = mr.write_version_bundle(
+        "vbundle", model=b"m", scaler=b"s", label_encoder=b"e",
+        features=["f1", "f2"], metrics={"rank_ic": 0.15},
+    )
+    for f in ("model.pkl", "scaler.pkl", "label_encoder.pkl", "features.json", "vbundle.json"):
+        assert (vdir / f).exists(), f"缺失 {f}"
+    feats = json.loads((vdir / "features.json").read_text(encoding="utf-8"))
+    assert feats["features"] == ["f1", "f2"]
+    # scan 能发现并标记为「可作主模型」
+    vb = next((m for m in mr.scan_models(reg) if m.key == "vbundle"), None)
+    assert vb is not None and vb.loadable is True
+

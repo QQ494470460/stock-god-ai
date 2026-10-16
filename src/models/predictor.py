@@ -35,7 +35,8 @@ except Exception:  # noqa: BLE001
 # 模型注册中心：只读扫描 + 「该用哪个」的裁决（受人工批准名单约束）
 try:
     from src.models.model_registry import (
-        scan_models, best_loadable, best_overall, active_status, resolve_active_path,
+        scan_models, best_loadable, best_overall, active_status,
+        resolve_active_path, resolve_active, version_set_for,
     )
 except Exception:  # noqa: BLE001
     scan_models = None
@@ -43,6 +44,8 @@ except Exception:  # noqa: BLE001
     best_overall = None
     active_status = None
     resolve_active_path = None
+    resolve_active = None
+    version_set_for = None
 
 
 @dataclass
@@ -165,31 +168,38 @@ class Predictor:
     def _log_model_resolution(self):
         """把「注册表裁决」与「实际加载的文件」并排记一条日志。
 
-        为什么要专门记这件事：加载路径目前是**硬编码**的 ——
-        ``trainer.load_model("xgboost")`` 把名字拼成 ``xgboost_model.pkl``。
-        于是注册表里那个「可部署最优」，以及 ``ml.active_version`` 那个「钉子」，
-        都**不影响**实际加载哪个文件：它们是展示层与审计层，不是加载层。
-
-        不把这句话写进日志，用户会看着「可部署最优：alpha RankIC=+0.1204」
-        而以为系统跑的是 0.1204 的模型，实际跑的是 0.0747 的那个。
-        宁可日志里明说「裁决与加载不一致」，也不要让人对着一行漂亮的指标
-        做出错误的判断。
+        现在 predictor 真的会跟随裁决加载：被批准/钉住的版本，其 model.pkl 会被
+        version_set_for 解析出的四件套真正 pickle.load 进来；四件套不齐则明确拒绝
+        并回退到生产默认。日志如实说明「跟随了哪个、是不是默认」。
         """
         try:
-            from src.models.model_registry import active_status, resolve_active_path
+            from src.models.model_registry import (
+                active_status, resolve_active_path, resolve_active, version_set_for,
+            )
 
             logger.info(f"📦 模型裁决：{active_status()}")
-            resolved = Path(resolve_active_path())
             default = MODEL_DIR / "xgboost_model.pkl"
-            if resolved != default:
+            resolved = Path(resolve_active_path())
+            if resolved == default:
+                logger.info(f"🔗 加载将跟随生产默认 {default.name}（无生效版本）")
+                return
+            info = resolve_active()
+            vs = version_set_for(info, self.model_dir) if info else None
+            if vs is not None and vs.complete:
+                logger.info(f"🔗 加载将跟随裁决版本 {info.key} @ {resolved.name}（四件套齐全）")
+            else:
                 logger.warning(
-                    f"⚠️ 裁决指向 {resolved.name}，但当前加载路径仍是硬编码的 "
-                    f"{default.name} —— 版本切换尚未接通，实际不会被加载")
+                    f"⚠️ 裁决指向 {resolved.name}，但其四件套不齐，加载将回退到默认 "
+                    f"{default.name}（版本切换被拒绝）")
         except Exception as e:  # noqa: BLE001 - 只是日志，绝不能影响加载
             logger.debug(f"模型裁决日志跳过: {e}")
 
     def _load_models(self):
         """加载已训练模型（当前只有 xgboost）。
+
+        加载路径现在**跟随注册表裁决**：被批准/钉住的版本经 version_set_for 解析出
+        四件套后真正 pickle.load 进来；未批准、或版本四件套不齐时，明确拒绝该版本、
+        回退到遗留默认 xgboost_model.pkl（行为与改动前完全一致）。
 
         注意：这里必须只碰私有属性 _xgb_model / _scaler。
         若写 self.xgb_model 会走 property getter -> _ensure_loaded() -> 再次
@@ -197,6 +207,34 @@ class Predictor:
         """
         try:
             self._log_model_resolution()
+
+            info = resolve_active() if resolve_active is not None else None
+            vs = None
+            if info is not None and version_set_for is not None:
+                try:
+                    vs = version_set_for(info, self.model_dir)
+                except Exception:  # noqa: BLE001
+                    vs = None
+
+            if vs is not None and not vs.legacy and vs.complete:
+                # —— 版本化产物：按解析出的四件套路径加载 ——
+                self._xgb_model = self.trainer.load_model_from(vs.model_path)
+                if self._xgb_model is not None:
+                    logger.info(f"✅ XGBoost 模型已加载（裁决版本 {info.key}）")
+                    self.xgb_features = self._load_feature_list_from(vs.features_path)
+                self._scaler, self._label_encoder = self.trainer.load_preprocessing_from(
+                    vs.scaler_path, vs.label_encoder_path)
+                if self._scaler is not None:
+                    logger.info(f"✅ 预处理器已加载（裁决版本 {info.key}）")
+                return
+
+            if vs is not None and not vs.complete:
+                logger.warning(
+                    f"⚠️ 裁决版本 {getattr(info, 'key', '?')} 四件套不齐，拒绝加载，"
+                    f"回退生产默认 xgboost_model.pkl")
+
+            # —— 遗留默认路径（无生效版本，或版本不齐时回退）——
+            # 这一段与改动前逐字一致，确保默认行为不被改变。
             self._xgb_model = self.trainer.load_model("xgboost")
             if self._xgb_model is not None:
                 logger.info("✅ XGBoost模型已加载")
@@ -208,7 +246,7 @@ class Predictor:
                 logger.info("✅ 预处理器已加载")
         except Exception as e:
             logger.warning(f"模型加载部分失败: {e}")
-    
+
     def _load_feature_list(self, model_type: str):
         """加载 Optuna 训练时保存的特征列表"""
         feat_file = MODEL_DIR / f"features_{model_type}.json"
@@ -221,6 +259,21 @@ class Predictor:
                 return feats
             except Exception:
                 pass
+        return None
+
+    def _load_feature_list_from(self, path):
+        """从任意 features.json 路径加载特征列表（版本化产物用 features.json）。"""
+        p = Path(path)
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                feats = data.get("features", [])
+                logger.info(f"✅ 特征列表: {len(feats)} 个（{p.name}）")
+                return feats
+            except Exception:
+                pass
+        logger.debug(f"特征列表缺失或解析失败: {p}")
         return None
     
     def reload(self):
@@ -276,9 +329,10 @@ class Predictor:
             lines.append("")
             lines.append(f"裁决：{active_status(self.model_dir)}")
         lines.append("")
-        lines.append("⚠️ 注意：注册表的排序与裁决目前**不改变**实际加载的文件 —— "
-                     "加载路径硬编码为 models/xgboost_model.pkl。"
-                     "上面的「可部署最优」只能说明「如果接通了，会选谁」。")
+        lines.append("⚠️ 注意：被批准/钉住的版本会**真正改变**加载路径（经 version_set_for "
+                     "解析四件套加载；四件套不齐则拒绝并回退默认）。"
+                     "未批准时一律回退 models/xgboost_model.pkl，"
+                     "新产物不会因指标更高而自动生效。")
         return "\n".join(lines)
 
     def reload_best(self):
@@ -395,6 +449,29 @@ class Predictor:
                 pred.reasons.insert(0, f"🤖LLM偏{direction}({sentiment:+.2f}×{conf:.0%})")
 
     @property
+    def _active_model_and_scaler_paths(self):
+        """返回「当前会被加载」的模型与 scaler 路径（跟随注册表裁决）。
+
+        无生效版本 / 解析器不可用时回退到遗留默认，保证调用方永远拿到合法路径。
+        """
+        if resolve_active is None or version_set_for is None:
+            return self.model_dir / "xgboost_model.pkl", self.model_dir / "scaler.pkl"
+        try:
+            info = resolve_active()
+            if info is None:
+                return self.model_dir / "xgboost_model.pkl", self.model_dir / "scaler.pkl"
+            vs = version_set_for(info, self.model_dir)
+            if vs is None:
+                return self.model_dir / "xgboost_model.pkl", self.model_dir / "scaler.pkl"
+            # 版本化产物四件套不齐时，_load_models 会拒绝它、回退到生产默认；
+            # 这里同步反映这一回退，让 is_ready 如实回答「此刻能否真的加载」。
+            if vs.legacy or vs.complete:
+                return vs.model_path, vs.scaler_path
+            return self.model_dir / "xgboost_model.pkl", self.model_dir / "scaler.pkl"
+        except Exception:  # noqa: BLE001
+            return self.model_dir / "xgboost_model.pkl", self.model_dir / "scaler.pkl"
+
+    @property
     def is_ready(self) -> bool:
         """模型是否可用。
 
@@ -402,15 +479,27 @@ class Predictor:
         `_ensure_loaded()` → 反序列化全部模型，等于**每次启动都先付
         xgboost + sklearn 的导入与加载开销（约 5 秒）**，
         而这个调用本来只是想问一句"模型在不在"。
-        改成：没加载时只看文件是否存在，绝不在"问状态"时偷偷加载。
+        改成：没加载时只看（裁决指向的）文件是否存在，绝不在"问状态"时偷偷加载。
+
+        现在「裁决指向的文件」可能是一个版本化产物（versions/<id>/model.pkl），
+        所以这里用 _active_model_and_scaler_paths 取到正确路径再判断存在性。
+
+        ⚠️ 必须是 @property：全项目一律按属性读它（`if not predictor.is_ready:`
+        / `ready = predictor.is_ready`），散落在 agent tools、API、scripts 与看板。
+        少了这个装饰器，`predictor.is_ready` 会是个**恒为真**的绑定方法对象，
+        于是「模型未加载」的保护一次都不会触发 —— 这类失效不报错，
+        只是那道闸门从来没关过。同理内部不能写成 `..._paths()`：
+        那是在调用一个已经返回元组的 property，会抛 TypeError 并被下面的
+        except 吞掉，让整套裁决解析变成死代码。
         """
         if self._models_loaded:
             return self._xgb_model is not None and self._scaler is not None
         # 未加载状态：只做一次轻量的文件存在性检查（不 import 任何重库）
         try:
-            return (self.model_dir / "xgboost_model.pkl").exists()
+            model_p, scaler_p = self._active_model_and_scaler_paths
+            return model_p.exists() and scaler_p.exists()
         except Exception:  # noqa: BLE001
-            return False
+            return (self.model_dir / "xgboost_model.pkl").exists()
 
     def predict_single(
         self,

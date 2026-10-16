@@ -158,7 +158,8 @@ class MLTrainer:
         self,
         features: pd.DataFrame,
         labels: pd.Series,
-        use_smote: bool = True
+        use_smote: bool = True,
+        version_id: Optional[str] = None,
     ) -> TrainingResult:
         """训练XGBoost模型"""
         logger.info("=" * 50)
@@ -228,12 +229,27 @@ class MLTrainer:
         
         self._save_model(result, "xgboost_model.pkl")
         logger.info(f"XGBoost训练完成: F1={result.f1_macro:.4f}")
+
+        # 版本化产物（可选）：除遗留默认 xgboost_model.pkl 外，额外写一份带 id 的
+        # 可切换版本。失败绝不拖垮主训练——主模型（遗留默认）已经落盘。
+        if version_id:
+            try:
+                self.save_version_bundle(
+                    version_id, result,
+                    features=list(features.columns),
+                    metrics={"model_path": f"versions/{version_id}/model.pkl",
+                             "note": "由 train_xgboost 自动版本化"},
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"⚠️ 版本化保存失败（不影响主模型）：{e}")
+
         return result
     
     def train_ensemble(
         self,
         features: pd.DataFrame,
         labels: pd.Series,
+        version_id: Optional[str] = None,
     ) -> Dict[str, TrainingResult]:
         """训练集成模型。
 
@@ -241,8 +257,8 @@ class MLTrainer:
         实际只训练 XGBoost 一个模型，返回 {"xgboost": ...}。
         """
         results = {}
-        
-        results["xgboost"] = self.train_xgboost(features, labels)
+
+        results["xgboost"] = self.train_xgboost(features, labels, version_id=version_id)
         
         # 打印结果
         logger.info("\n" + "=" * 60)
@@ -283,7 +299,21 @@ class MLTrainer:
         with open(path, "rb") as f:
             model = pickle.load(f)
         return model
-    
+
+    def load_model_from(self, path: Path) -> Optional[Any]:
+        """从任意路径加载模型（供版本化产物 / 注册表裁决加载使用）。
+
+        与 load_model 的区别：不再把名字拼成 ``<name>_model.pkl``，
+        而是直接 pickle.load 给定路径——predictor 经由 model_registry
+        解析出的「被批准版本的 model.pkl」就是这么加载的。
+        """
+        p = Path(path)
+        if not p.exists():
+            logger.error(f"模型文件不存在: {p}")
+            return None
+        with open(p, "rb") as f:
+            return pickle.load(f)
+
     def load_preprocessing(self) -> Tuple[StandardScaler, LabelEncoder]:
         """加载预处理器"""
         scaler_path = self.model_dir / "scaler.pkl"
@@ -297,3 +327,40 @@ class MLTrainer:
                 self.label_encoder = pickle.load(f)
         
         return self.scaler, self.label_encoder
+
+    def load_preprocessing_from(self, scaler_path: Path, encoder_path: Path) -> Tuple[StandardScaler, LabelEncoder]:
+        """从指定路径加载预处理器（供版本化产物使用）。缺失的文件跳过（保留内存中的）。"""
+        sp, ep = Path(scaler_path), Path(encoder_path)
+        if sp.exists():
+            with open(sp, "rb") as f:
+                self.scaler = pickle.load(f)
+        if ep.exists():
+            with open(ep, "rb") as f:
+                self.label_encoder = pickle.load(f)
+        return self.scaler, self.label_encoder
+
+    def save_version_bundle(
+        self,
+        version_id: str,
+        result: Any,
+        scaler: Any = None,
+        label_encoder: Any = None,
+        features: Optional[list] = None,
+        metrics: Optional[dict] = None,
+    ) -> Path:
+        """把一次训练产物落盘为带明确 id 的版本化副本（四件套 + 指标）。
+
+        见 model_registry.write_version_bundle。train_xgboost 在写完遗留默认
+        xgboost_model.pkl 之后调用本方法，让训练不再只是原地覆盖同名文件，
+        而是额外产出一个可切换、可经人工批准名单上线的版本。
+        """
+        from src.models.model_registry import write_version_bundle
+
+        return write_version_bundle(
+            version_id,
+            model=result.model if result is not None else None,
+            scaler=scaler if scaler is not None else self.scaler,
+            label_encoder=label_encoder if label_encoder is not None else self.label_encoder,
+            features=features,
+            metrics=metrics,
+        )
