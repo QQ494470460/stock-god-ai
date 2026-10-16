@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 
 import config.settings as settings_mod
 from src.agent import tools as agent_tools
-from src.agent.engine import _PENDING_ACTION_RE
+from src.agent.engine import _PENDING_ACTION_RE, SYSTEM_PROMPT, _build_tool_block
 
 
 PENDING = agent_tools.PENDING_ACTION_PREFIX
@@ -203,3 +203,24 @@ def test_engine_detects_pending_action_marker():
 
 def test_engine_no_false_positive():
     assert _PENDING_ACTION_RE.search("正常文本没有标记") is None
+
+
+# ---------------- SYSTEM_PROMPT 模板合法性（回归） ----------------
+
+def test_system_prompt_formats_without_keyerror():
+    """回归：示例中含字面 JSON 花括号，SYSTEM_PROMPT.format(tools=...) 必须不抛 KeyError。
+
+    曾因示例里的 ``{"key": ...}`` 被 .format 当作占位符 → KeyError: '"key"'，
+    导致 run_agent 在第一步就崩溃。所有字面花括号必须转义为 {{ }}。
+
+    直接复用引擎生产路径 `_build_tool_block()` + `.format()`，确保与运行时一致。
+    """
+    tool_block = _build_tool_block()
+    # 不应抛出 KeyError / IndexError
+    rendered = SYSTEM_PROMPT.format(tools=tool_block)
+    assert "set_config" in rendered
+    assert "FINAL:" in rendered
+    # 转义后的字面花括号应正常还原（示例里出现真实 JSON 示例）
+    assert "agent.screen_fetch_workers" in rendered
+
+
