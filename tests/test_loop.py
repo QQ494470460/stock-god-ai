@@ -308,6 +308,49 @@ def test_dry_run_does_not_touch_paper_account(force_trading_time):
 # PAPER 真实记账
 # ======================================================================
 
+def test_ensure_plan_uses_todays_plan_not_the_newer_tomorrow_plan(monkeypatch, tmp_path):
+    """磁盘上「明天的计划」更新时，也必须加载**今天**的那份。
+
+    计划是「收盘后为下一交易日」写的，所以 trade_plan_明天.json 的文件 mtime
+    天然比 trade_plan_今天.json 新。而 ``load_latest_plan()`` 挑的是**文件最新**
+    的那份 → 闭环一启动就抱着明天的计划交易今天。
+
+    实跑证据（2026-10-16）：磁盘上明明有 ``trade_plan_20261016.json``
+    （当天 14:17 刚生成），闭环却从 14:36 到 15:00 全天显示「计划 2026-10-19」，
+    结算报告里 ``plan_date`` 也是 2026-10-19 —— 用后天的计划交易今天。
+
+    这正是「跨日拿错计划」那个老 bug 没修完的残留：上次只堵了「过期就重建」，
+    没堵住「按文件新旧挑计划」这个更上游的口子。
+    """
+    import src.trading.loop as loopmod
+    import src.trading.trade_plan as tpmod
+
+    today, tomorrow = "2026-10-16", "2026-10-19"
+    # plan 目录 = <DATA_DIR>/trade_plans，两个模块各有自己的 DATA_DIR，都要指过去
+    monkeypatch.setattr(tpmod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(loopmod, "_now", lambda: datetime(2026, 10, 16, 10, 0, 0))
+
+    save_trade_plan(TradePlan(
+        plan_date=today,
+        targets=[PlanTarget(code="600177", name="雅戈尔", score=62.0, weight=0.09)],
+        cash_reserve_pct=0.10,
+    ))
+    save_trade_plan(TradePlan(          # 后写 → 它是「文件最新」的那份
+        plan_date=tomorrow,
+        targets=[PlanTarget(code="000001", name="平安银行", score=70.0, weight=0.09)],
+        cash_reserve_pct=0.10,
+    ))
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
+    loop.plan = None                     # 模拟冷启动
+    loop._ensure_plan(TickReport())
+
+    assert loop.plan is not None, "没加载到任何计划"
+    assert loop.plan.plan_date == today, (
+        f"应当用今天({today})的计划，实际拿到 {loop.plan.plan_date} —— "
+        "又变成「拿明天的计划交易今天」了")
+
+
 def test_paper_mode_actually_buys(force_trading_time):
     paper = FakePaper(total=1_000_000.0)
     b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
@@ -591,6 +634,21 @@ def _counting_build(loop, monkeypatch):
     return box
 
 
+def _fake_disk(monkeypatch, tp_mod, by_date=None, latest=None):
+    """把「磁盘上的计划」替换成注入的计划（两个入口都要接管）。
+
+    ⚠️ 必须**同时** patch ``load_trade_plan``（按日期精确查）和
+    ``load_latest_plan``（按文件新旧查）。实现现在**优先按今天日期**加载，
+    只接管其中一个的话，注入会失效、测试会读到真实的 ``data/trade_plans/``
+    —— 而且今天恰好有真实计划时会“碰巧通过”，是最坏的那种假绿。
+    """
+    by_date = dict(by_date or {})
+    monkeypatch.setattr(tp_mod, "load_trade_plan",
+                        lambda d=None, plan_dir=None: by_date.get(d))
+    monkeypatch.setattr(tp_mod, "load_latest_plan",
+                        lambda plan_dir=None: latest)
+
+
 def test_expired_in_memory_plan_is_reloaded_from_disk_before_rebuild(monkeypatch):
     """内存里是过期计划、磁盘上有「今天的」→ 必须用磁盘那份，不重建。
 
@@ -609,7 +667,7 @@ def test_expired_in_memory_plan_is_reloaded_from_disk_before_rebuild(monkeypatch
     loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
     loop.plan = _plan_for(yesterday)
     fresh = _plan_for(today_s, targets=[("000001", 80, 0.20)])
-    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: fresh)
+    _fake_disk(monkeypatch, tp, by_date={today_s: fresh}, latest=fresh)
 
     box = _counting_build(loop, monkeypatch)
     loop._ensure_plan(TickReport())
@@ -634,7 +692,7 @@ def test_pending_plan_for_next_session_is_kept_not_rebuilt(monkeypatch):
 
     loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
     loop.plan = _plan_for(pending_day)
-    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: None)
+    _fake_disk(monkeypatch, tp)          # 磁盘上什么都没有
 
     box = _counting_build(loop, monkeypatch)
     rep = TickReport()
@@ -652,7 +710,7 @@ def test_plan_is_built_when_nothing_usable_exists(monkeypatch):
 
     loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
     loop.plan = None
-    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: None)
+    _fake_disk(monkeypatch, tp)          # 磁盘上什么都没有
 
     built = _plan_for(loopmod._today().strftime("%Y-%m-%d"))
     monkeypatch.setattr(loop, "_build_plan", lambda: built)
@@ -675,7 +733,7 @@ def test_no_auto_build_never_rebuilds_and_skips_validity_check(monkeypatch):
     stale = _plan_for((loopmod._today() - timedelta(days=30)).strftime("%Y-%m-%d"))
     loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
     loop.plan = None
-    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: stale)
+    _fake_disk(monkeypatch, tp, latest=stale)   # 磁盘上只有这份手放的旧计划
 
     box = _counting_build(loop, monkeypatch)
     loop._ensure_plan(TickReport())

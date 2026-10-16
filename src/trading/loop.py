@@ -341,20 +341,30 @@ class TradingLoop:
         若手上一份是「为下一个交易日准备的」待生效计划，则保留它 ——
         重建只会得到同一份，白白重复写盘。
         """
-        from src.trading.trade_plan import load_latest_plan
+        from src.trading.trade_plan import load_latest_plan, load_trade_plan
 
+        today = _today()
+        today_s = today.strftime("%Y-%m-%d")
+
+        # ⚠️ 启动时就要按「今天」精确加载，不能用 load_latest_plan()。
+        # 后者挑的是**文件最新**的那份，而计划是「收盘后为下一交易日」写的 ——
+        # 于是昨晚/今早写好的 trade_plan_明天.json 反而成了"最新"，
+        # 闭环一启动就抱着明天的计划交易今天。
+        # 实跑证据（2026-10-16）：磁盘上明明有 trade_plan_20261016.json，
+        # 闭环却全天显示「计划 2026-10-19」，结算报告 plan_date 也是 2026-10-19。
         if self.plan is None:
-            self.plan = load_latest_plan()
+            self.plan = load_trade_plan(today_s) or load_latest_plan()
 
         if not self.config.auto_build_plan:
             return
 
-        today = _today()
         if self.plan is not None and self.plan.is_valid_for(today):
             return
 
-        # ① 过期/缺失 → 先回磁盘看看有没有「今天的」计划（常驻进程跨日必经此处）
-        fresh = load_latest_plan()
+        # ① 过期/缺失 → 先回磁盘按**日期**找「今天的」计划（常驻进程跨日必经此处）。
+        #    同样不能用 load_latest_plan()：它会拿到明天的那份，
+        #    而明天的 is_valid_for(今天) 恒为 False，于是永远找不到今天的。
+        fresh = load_trade_plan(today_s)
         if fresh is not None and fresh.is_valid_for(today):
             self.plan = fresh
             report.plan_built = False
@@ -362,7 +372,7 @@ class TradingLoop:
 
         # ② 手上这份是「下一个交易日」的待生效计划 → 保留，别重建
         #    （重建的结果与它同日，只是把同一个文件又写了一遍）
-        if self.plan is not None and (self.plan.plan_date or "") > today.strftime("%Y-%m-%d"):
+        if self.plan is not None and (self.plan.plan_date or "") > today_s:
             return
 
         # ③ 真的没有任何可用计划 → 按选股结果生成一份
