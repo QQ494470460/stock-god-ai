@@ -183,9 +183,30 @@ def _print_models() -> int:
     if approvals:
         print(f"   已批准名单：{'、'.join(sorted(approvals))}")
     print()
-    print("⚠️ 加载路径目前硬编码为 models/xgboost_model.pkl —— "
-          "上面的排序与裁决只决定「该不该换」，")
-    print("   真正接通版本切换还需要产物按版本命名 + 加载器读裁决（尚未实现）。")
+    # ⚠️ 以下说明必须**从代码的实际裁决结果**渲染，不能写死。
+    # 这里曾写着「版本切换尚未实现」，而加载器其实早已读裁决了 —— 提示与代码
+    # 反向，会把人往错误方向带（正是本项目最忌的那类「静默误导」）。
+    # 现在改成问 model_registry 要答案，代码一变文案跟着变。
+    try:
+        _active = mr.resolve_active()
+        _vs = mr.version_set_for(_active) if _active is not None else None
+    except Exception:  # noqa: BLE001
+        _active, _vs = None, None
+
+    print("🔗 加载链路：" + ("predictor._load_models → resolve_active() → version_set_for()"
+                            "（已接通裁决）"))
+    if _vs is not None and (_vs.complete or _vs.legacy):
+        _kind = "版本化四件套" if (not _vs.legacy and _vs.complete) else "遗留平铺布局"
+        print(f"   实际会加载：{_vs.model_path}")
+        print(f"   配套：scaler={_vs.scaler_path.name} "
+              f"label_encoder={_vs.label_encoder_path.name} "
+              f"features={_vs.features_path.name}（{_kind}）")
+        if not _vs.complete:
+            print("   ⚠️ 四件套不齐 → 加载器会拒绝该版本并回退生产默认")
+    else:
+        print(f"   无生效裁决（批准名单为空且未钉住）→ 回退生产默认："
+              f"{mr.resolve_active_path()}")
+        print("   想让新版本生效：scripts/evolve.py --approve-model <模型键>")
     return 0
 
 
@@ -407,7 +428,13 @@ def _doctor() -> int:
                  "scripts/evolve.py --run --verify（会写 prediction_history.json）")
         if n_pending:
             warn(f"另有 {n_pending} 个已走满持有期但未验证",
-                 "补验：scripts/evolve.py --run --verify")
+                 "补验：scripts/evolve.py --run --verify"
+                 "（⚠️ 须在**收盘后**跑：判定用的是实际有收盘价的交易日，"
+                 "盘中跑会因为当天价格还没出来而得到「新增 0 条」）")
+        n_unver = pf.get("n_unverifiable", 0)
+        if n_unver:
+            print(f"     ℹ️ 另有 {n_unver} 个空批次（当天没选出标的、也没留价格快照）"
+                  f"，永远验不出来，已从不计待验证里 —— 不是数据丢失。")
         if pf.get("missing_snapshot"):
             print(f"     ℹ️ {pf['missing_snapshot']} 批缺 price_snapshot："
                   "验证会回退用复权价反推，收益可能失真。看板新版已开始落快照。")

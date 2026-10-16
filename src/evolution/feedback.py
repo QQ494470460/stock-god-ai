@@ -284,11 +284,36 @@ def collect_prediction_feedback(
                        if batches else []),
         "missing_snapshot": sum(
             1 for e in batches if not e.get("price_snapshot")),
+        # 空批次：没标的也没快照，永远验不出来。单独报出来，
+        # 免得用户以为「数据丢了」——它们本来就是当天没选出标的的日子。
+        "n_unverifiable": sum(
+            1 for e in batches
+            if e.get("scan_date") and not _is_verifiable(e)),
     }
 
 
+def _is_verifiable(entry: dict) -> bool:
+    """这个批次**有没有可能被验证**（不看日期，只看有没有可验的东西）。
+
+    空批次（当天没选出标的、也没留 price_snapshot）**永远**验不出来：
+    ``tracker_v2.verify_predictions`` 一进门就 ``if not codes: return None``。
+
+    把它们算进 pending 会造出一个自我循环的错误指令：``--doctor`` 天天催
+    「另有 N 个已走满持有期但未验证 → 跑 --run --verify」，而真跑了
+    **永远是「新增 0 条」**（实测 2026-10-16：报 10 个，补验 0 个）。
+    计数口径必须和「能不能真的验」对齐，否则就是在骗人。
+    """
+    if entry.get("price_snapshot"):
+        return True
+    preds = entry.get("predictions") or []
+    return any(isinstance(p, dict) and p.get("code") for p in preds)
+
+
 def _count_pending(batches: List[dict], today: Optional[str] = None) -> int:
-    """统计「持有期已走满但尚无验证结果」的 (批次, 窗口) 数量。"""
+    """统计「持有期已走满但尚无验证结果」的 (批次, 窗口) 数量。
+
+    只统计**可验证**的批次（见 ``_is_verifiable``）—— 空批次不计。
+    """
     try:
         from src.trading.calendar import trading_days_between
     except Exception:  # noqa: BLE001
@@ -299,6 +324,8 @@ def _count_pending(batches: List[dict], today: Optional[str] = None) -> int:
     for e in batches:
         scan = e.get("scan_date")
         if not scan:
+            continue
+        if not _is_verifiable(e):
             continue
         done = set(_entry_verifications(e))
         for h in VERIFY_HORIZONS:

@@ -159,6 +159,55 @@ def test_pending_excludes_already_verified():
     assert out["pending_verify"] == 1
 
 
+def test_pending_excludes_empty_unverifiable_batches():
+    """空批次（没标的、也没快照）永远验不出来，不能算进「待验证」。
+
+    真实事故（2026-10-16）：`--doctor` 报「另有 10 个已走满持有期但未验证 →
+    跑 --run --verify」，而真跑了**永远是「新增 0 条」**。那 10 个来自 5 个
+    `n_predictions: 0` 的空批次（7 月没选出标的的日子）：
+    `tracker_v2.verify_predictions` 一进门就 `if not codes: return None`。
+
+    计数口径必须和「能不能真的验」对齐 —— 否则就是一条自我循环的错误指令：
+    天天催人补验，补了永远没结果。
+    """
+    from datetime import datetime, timedelta
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    old = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
+
+    empty = _batch(old)
+    empty.pop("verifications")
+    empty["predictions"] = []
+    empty["n_predictions"] = 0
+
+    out = feedback.collect_prediction_feedback([empty], today=today)
+    assert out["pending_verify"] == 0, (
+        f"空批次不该计为待验证（它永远验不出来），实际 {out['pending_verify']}")
+    assert out["n_unverifiable"] == 1, "空批次应被单独报出来，免得以为数据丢了"
+
+
+def test_batch_with_snapshot_but_no_predictions_is_still_verifiable():
+    """有 price_snapshot 的批次即使 predictions 为空，也算可验证。
+
+    快照里就有基准价，tracker 能反推收益 —— 不能一刀切按空批次丢掉。
+    """
+    from datetime import datetime, timedelta
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    old = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
+
+    e = _batch(old)
+    e.pop("verifications")
+    e["predictions"] = []
+    e["n_predictions"] = 0
+    e["price_snapshot"] = {"600000": 10.0}
+
+    out = feedback.collect_prediction_feedback([e], today=today)
+    assert out["pending_verify"] == 2, (
+        f"有快照的批次两个窗口都应计为待验证，实际 {out['pending_verify']}")
+    assert out["n_unverifiable"] == 0
+
+
 def test_missing_snapshot_is_counted():
     from datetime import datetime, timedelta
     old = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
