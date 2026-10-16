@@ -87,6 +87,21 @@ from src.models.evolution import evolution
 from config.settings import config as app_config
 from config.settings import save_scheduler_state, save_ml_state, save_agent_state
 from src.scheduler.auto_scheduler import start_scheduler, is_running
+
+
+def _ensure_scheduler_running():
+    """看板进程内拉起「收盘后自动化调度」（若已启用）。幂等，可反复调用。
+
+    关键改进：不再依赖浏览器会话（st.session_state）来触发。只要看板进程在、
+    且开关为启用，调度器就在**首个脚本运行（即首次有人打开看板）**时自动拉起，
+    并且之后每次脚本重跑都因 ``is_running()`` 短路而立刻返回，零额外开销。
+    start_scheduler 内部用锁保证只起一个实例，所以这里无需额外去重。
+    """
+    try:
+        if app_config.scheduler.enabled and not is_running():
+            start_scheduler()
+    except Exception as e:  # noqa: BLE001  非 Streamlit 上下文或导入失败时静默跳过
+        logger.debug(f"调度自动拉起跳过: {e}")
 from src.ui.trading_ui import render_autotrade_page
 from src.ui.agent_page import render_agent_page
 from src.ui.common import (
@@ -515,16 +530,9 @@ with st.sidebar:
     st.session_state.page = page
 
     # ---- 看板启动时自动拉起「收盘后自动化调度」（若已启用）----
-    # 让「启用」开关跨看板重启真正生效：重启后只要 enabled 仍为 True，调度器
-    # 就在首屏加载时自动拉起，无需再手动点「启动调度」，实现无人值守。
-    # st.session_state 保证每次浏览器会话只尝试一次；start_scheduler 本身幂等。
-    try:
-        if "scheduler_autostart_done" not in st.session_state:
-            st.session_state.scheduler_autostart_done = True
-            if app_config.scheduler.enabled and not is_running():
-                start_scheduler()
-    except Exception as e:  # noqa: BLE001  非 Streamlit 上下文或导入失败时静默跳过
-        logger.debug(f"调度自动拉起跳过: {e}")
+    # 幂等调用：首次脚本运行（有人打开看板）即拉起，之后每次重跑因 is_running()
+    # 短路而无开销。详见模块级 _ensure_scheduler_running()。
+    _ensure_scheduler_running()
 
     st.markdown("---")
     ready = predictor.is_ready

@@ -489,3 +489,105 @@ def test_normal_drawdown_still_halts(tmp_path):
     alerts = sup.tick_monitor()
     assert sup.safety.halted is True
     assert any("回撤" in a for a in alerts)
+
+
+# ======================================================================
+# 风控拦截必须留痕（审计）
+# ----------------------------------------------------------------------
+# 曾有一整天的「意图 N / 拦截 N / 成交 0」在 journal 里没有任何 risk_block 记录，
+# 原因无法追溯。根因：propose_trade 里有两条拦截路径（拿不到行情/账户、计算下单量
+# 不足 1 手）只 mark_blocked 却没 emit("risk_block")。下面把这两处钉死。
+# ======================================================================
+
+def test_propose_logs_risk_block_when_qty_below_one_lot(tmp_path):
+    """下单量不足 1 手被拦截时，必须写 risk_block 到 journal。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    cfg.base_risk_fraction = 1e-6          # 预算被压到 < 100 股 → 触发 qty<100 拦截
+    broker = FakeBroker()
+    paper = FakePaper()
+    sup = RiskSupervisor(broker, cfg, paper_account=paper)
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY,
+                             ai_score=70, agreement=1.0)
+    assert prop.status == "blocked", prop.reason
+    lines = (tmp_path / "j.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "journal 应至少有一条记录"
+    assert any(json.loads(l).get("event") == "risk_block" for l in lines)
+
+
+def test_propose_logs_risk_block_when_no_market_data(tmp_path, monkeypatch):
+    """拿不到行情/账户被拦截时，也必须写 risk_block（LIVE 模式走券商账户）。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"),
+                      require_live_confirmation=True)
+    broker = FakeBroker()
+    paper = FakePaper()
+    sup = RiskSupervisor(broker, cfg, paper_account=paper)
+    token = sup.safety.arm_live("alice")
+    assert sup.safety.confirm_arm(token, "alice") is True
+
+    monkeypatch.setattr(broker, "get_tick", lambda code: None)
+    monkeypatch.setattr(broker, "query_account", lambda: None)
+
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY,
+                             ai_score=70, agreement=1.0)
+    assert prop.status == "blocked"
+    lines = (tmp_path / "j.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert any(json.loads(l).get("event") == "risk_block" for l in lines)
+
+
+def test_signal_precheck_block_is_journaled(tmp_path):
+    """信号级预检（如 AI 评分不足）拦截时同样留 risk_block。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    broker = FakeBroker()
+    paper = FakePaper()
+    sup = RiskSupervisor(broker, cfg, paper_account=paper)
+    # 默认 min_ai_score_buy=55，评分 30 应被信号预检拦下
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY,
+                             ai_score=30, agreement=1.0)
+    assert prop.status == "blocked"
+    lines = (tmp_path / "j.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert any(json.loads(l).get("event") == "risk_block" for l in lines)
+
+
+# ======================================================================
+# 武装模式切换必须留痕（审计）
+# ----------------------------------------------------------------------
+# 曾出现 trading_guard_state.json 是 live_pending、但 journal 里查不到任何 arm
+# 记录的情况（违反「放宽风控须显式留痕」铁律）。根因：SafetyController 的
+# set_mode/arm_live/confirm_arm/disarm 全部只改状态文件、从不写 journal。
+# 下面把这些切换钉死。
+# ======================================================================
+
+def test_mode_transitions_are_journaled(tmp_path):
+    """武装/解除/切换模式必须写 journal（arm_request / arm_confirm / mode_change）。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    ctl = SafetyController(cfg)
+    token = ctl.arm_live("alice")
+    assert ctl.confirm_arm(token, "alice") is True
+    assert ctl.disarm("alice") is True
+
+    lines = (tmp_path / "j.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    events = [json.loads(l).get("event") for l in lines]
+    assert "arm_request" in events
+    assert "arm_confirm" in events
+    assert "mode_change" in events
+
+
+def test_disarm_records_audit_reason(tmp_path):
+    """disarm 回 PAPER 时，mode_change 必须带操作者与原因，便于事后追溯。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    ctl = SafetyController(cfg)
+    token = ctl.arm_live("bob")
+    ctl.confirm_arm(token, "bob")
+    ctl.disarm("bob", reason="audit-cleanup: 无 arm 留痕，回安全默认")
+    lines = (tmp_path / "j.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    rec = json.loads(lines[-1])
+    assert rec["event"] == "mode_change"
+    assert rec["data"]["to"] == "paper"
+    assert rec["data"]["operator"] == "bob"
+    assert "audit-cleanup" in rec["data"]["reason"]
+

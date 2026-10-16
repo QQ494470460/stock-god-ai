@@ -482,6 +482,45 @@ def test_settle_writes_report(monkeypatch, tmp_path, force_trading_time):
     assert "结算" in rep.note
 
 
+def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, monkeypatch):
+    """结算报告 stats 必须反映「一整天」的拦截/意图，而非结算那一刻的 0。
+
+    回归背景：旧实现把 report.n_stops/intents/executed/blocked 直接写进报告，
+    而 report 是「结算 tick」新建的，盘中发生的拦截全都不见了 —— 报告里永远
+    是「风平浪静」的 0/0/0/0，与当天实际「意图 N/拦截 N」对不上。
+    """
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, notify=False))
+    # 目标评分 40 < 风控下限 55 → 每次调仓都会被 guard 拦截（盘中持续发生）
+    loop.plan = mk_plan([("600519", 40, 0.30)])
+
+    n_ticks = 3
+    for _ in range(n_ticks):
+        loop.tick()
+
+    # 当日累计应已累加：每个 tick 1 个意图 + 1 次拦截
+    assert loop._day_stats["intents"] == n_ticks, loop._day_stats
+    assert loop._day_stats["blocked"] == n_ticks, loop._day_stats
+
+    loop._settled_dates.clear()
+    monkeypatch.setattr(loop, "_should_settle", lambda now: True)
+    loop.tick()                                  # 触发结算
+
+    files = list((tmp_path / "loop_reports").glob("loop_report_*.json"))
+    assert files, "结算报告未生成"
+    import json
+    snap = json.loads(files[0].read_text(encoding="utf-8"))
+    assert snap["stats"]["intents"] == n_ticks, snap["stats"]
+    assert snap["stats"]["blocked"] == n_ticks, snap["stats"]
+    # 结算后当日累计已清零
+    assert loop._day_stats["blocked"] == 0, loop._day_stats
+
+
 # ======================================================================
 # 线程生命周期
 # ======================================================================

@@ -208,6 +208,14 @@ class TradingLoop:
         self._day_start_equity: Dict[str, float] = {}
         self._day_trades: Dict[str, List[dict]] = {}
 
+        # 日内累计记账：结算报告的 stats 必须反映「一整天」的止损/意图/成交/拦截，
+        # 而不是「结算那一刻」的单 tick。每 tick 的计数在盘中累加，结算时一并落盘，
+        # 然后清零（跨日也自动重置，见 tick() 顶部的日期切换判断）。
+        self._day_stats_key: str = ""
+        self._day_stats: Dict[str, int] = {
+            "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
+        }
+
         # 事件回调接到 guard，让中枢事件也能透传到 UI
         if self._on_event:
             try:
@@ -541,10 +549,12 @@ class TradingLoop:
             ],
             "trades": trades[-100:],
             "stats": {
-                "stops": report.n_stops,
-                "intents": report.n_intents,
-                "executed": report.n_executed,
-                "blocked": report.n_blocked,
+                # 用「当日累计」而非「结算那一刻」的 tick 计数，
+                # 否则盘中发生的止损/拦截/调仓意图全都不会出现在报告里。
+                "stops": self._day_stats.get("stops", 0),
+                "intents": self._day_stats.get("intents", 0),
+                "executed": self._day_stats.get("executed", 0),
+                "blocked": self._day_stats.get("blocked", 0),
             },
         }
 
@@ -563,6 +573,11 @@ class TradingLoop:
             logger.warning(f"结算报告写入失败: {e}")
 
         self._settled_dates.add(_today())
+        # 结算报告已落盘，当日累计清零（键保持为今天，避免同一天反复重置）
+        self._day_stats = {
+            "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
+        }
+        self._day_stats_key = today
         report.note = (f"✅ 已收盘结算：当日盈亏 ¥{day_pnl:,.2f} "
                        f"({snapshot['day_pnl_pct']:+.2f}%)")
 
@@ -619,6 +634,14 @@ class TradingLoop:
                 at=now.strftime("%H:%M:%S"),
                 state=self._state.value,
             )
+
+            # 跨日 → 日内累计清零（避免把昨天的拦截/成交带进今天的结算报告）
+            today_s = now.date().strftime("%Y-%m-%d")
+            if today_s != self._day_stats_key:
+                self._day_stats = {
+                    "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
+                }
+                self._day_stats_key = today_s
 
             # --- 市场阶段 ---
             phase, trading_ok, why = self._phase(now)
@@ -694,6 +717,13 @@ class TradingLoop:
             # --- ⑧ 目标组合调仓 ---
             if self.config.enable_rebalance and account:
                 self._run_rebalance(positions, account, prices, report)
+
+            # 日内累计：把本 tick 的止损/意图/成交/拦截并入「当日」计数器，
+            # 供收盘结算报告使用（否则只记结算那一刻，盘中拦截全丢）。
+            self._day_stats["stops"] += report.n_stops
+            self._day_stats["intents"] += report.n_intents
+            self._day_stats["executed"] += report.n_executed
+            self._day_stats["blocked"] += report.n_blocked
 
             # --- ⑨ 事件沉淀 ---
             if report.n_executed:

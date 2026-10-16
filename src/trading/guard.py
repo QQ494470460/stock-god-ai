@@ -241,10 +241,16 @@ class SafetyController:
             if mode in (TradingMode.LIVE, TradingMode.LIVE_PENDING):
                 logger.warning("⛔ 不允许直接 set_mode 进入实盘，请使用 arm_live()")
                 return False
+            old = self._state.mode
             self._state.mode = mode.value
             self._state.armed_by = operator
             self._state.armed_at = datetime.now().isoformat()
             self._save()
+            if old != mode.value:
+                self._journal_event("mode_change", {
+                    "from": old, "to": mode.value, "operator": operator,
+                    "reason": "set_mode",
+                })
             logger.info(f"🛡️ 模式切换 → {mode.value} (by {operator})")
             return True
 
@@ -264,6 +270,9 @@ class SafetyController:
             self._state.pending_token = token
             self._state.pending_operator = operator
             self._save()
+            self._journal_event("arm_request", {
+                "operator": operator, "target": target.value, "token": token,
+            })
             logger.warning(
                 f"⚠️ 收到武装实盘请求 → {target.value} (by {operator})\n"
                 f"   请人工核对后执行 confirm_arm(token='{token}') 完成切换"
@@ -287,6 +296,9 @@ class SafetyController:
             self._state.pending_token = ""
             self._state.pending_operator = ""
             self._save()
+            self._journal_event("arm_confirm", {
+                "operator": operator, "token": token, "mode": self._state.mode,
+            })
             logger.warning(
                 f"🔴 已武装实盘(LIVE_PENDING) by {operator}，"
                 f"此后每笔委托需人工确认"
@@ -299,14 +311,24 @@ class SafetyController:
         # 提示调用方需 confirm_arm；此处不自动确认，保持显式
         return bool(token)
 
-    def disarm(self, operator: str = "system") -> bool:
-        """解除实盘武装，回到纸交易（安全方向，无需令牌）"""
+    def disarm(self, operator: str = "system", reason: str = "") -> bool:
+        """解除实盘武装，回到纸交易（安全方向，无需令牌）
+
+        任何从 LIVE/LIVE_PENDING 退回 PAPER 的动作都写入 journal（mode_change），
+        确保「收紧风控」也能被审计追溯 —— 不能只改状态文件而留不下痕迹。
+        """
         with self._lock:
             if self._state.mode in (TradingMode.LIVE.value, TradingMode.LIVE_PENDING.value):
+                old = self._state.mode
                 self._state.mode = TradingMode.PAPER.value
                 self._state.armed_by = operator
                 self._state.armed_at = datetime.now().isoformat()
                 self._save()
+                self._journal_event("mode_change", {
+                    "from": old, "to": TradingMode.PAPER.value,
+                    "operator": operator,
+                    "reason": reason or "disarm→PAPER (security default)",
+                })
                 logger.warning(f"🟢 已解除实盘武装 → PAPER (by {operator})")
                 return True
             return True
@@ -813,6 +835,7 @@ class RiskSupervisor:
                 strategy_tag=strategy_tag, risk_exit=risk_exit,
             )
             self.gate.mark_blocked(prop, reason)
+            self._emit("risk_block", {"code": code, "reason": reason})
             return prop
 
         price = tick.last_price
@@ -869,6 +892,10 @@ class RiskSupervisor:
                 strategy_tag=strategy_tag, risk_exit=risk_exit,
             )
             self.gate.mark_blocked(prop, f"计算下单量不足1手 ({qty}股)")
+            self._emit("risk_block", {
+                "code": code, "side": side.value,
+                "reason": f"计算下单量不足1手 ({qty}股)",
+            })
             return prop
 
         prop = self.gate.create(
@@ -1027,6 +1054,10 @@ class RiskSupervisor:
                 risk_exit=prop.risk_exit)
             if not ok_sig:
                 self.gate.mark_blocked(prop, why_sig)
+                self._emit("risk_block", {
+                    "code": code, "side": side.value, "reason": why_sig,
+                    "phase": "execute_precheck",
+                })
                 return False, why_sig, None
             # 纸交易：走纸账户
             if side == OrderSide.BUY:
