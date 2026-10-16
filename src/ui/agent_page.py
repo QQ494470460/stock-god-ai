@@ -27,12 +27,11 @@ def render_agent_page():
         )
         return
 
-    # 处理待确认动作的「确认/取消」（在渲染消息前先处理，内部会 st.rerun）
-    if st.session_state.get("_agent_pending_decision"):
-        _handle_pending_decision()
-        return
-
     # ---- 会话状态 ----
+    # 注意：这里**不再**有「顶部决策守卫」。旧实现把决策写进 session_state
+    # 却不在点击处 st.rerun()，于是「点击产生的那次重跑」里，顶部守卫早就以
+    # 空值判定过了 —— 决策被存下来却永远没人处理，按钮点了没反应。
+    # 现在改为在按钮点击处**就地处理**（见 _apply_decision），不依赖下一次重跑。
     if "agent_messages" not in st.session_state:
         st.session_state.agent_messages = []
 
@@ -103,6 +102,22 @@ def _render_assistant_inline(result):
     _render_result(container, result, result.final_text)
 
 
+def _pending_widget_key(pa: dict, kind: str) -> str:
+    """为「确认/取消」这对按钮生成**跨重跑稳定**的 widget key。
+
+    ⚠️ 不能用 ``id(pa)``：那个值随每次重跑重建的对象而变（实测同一次点击
+    前后是 confirm_2072315531840 → Confirm_2072315532000），key 一变，
+    「这次点击」就对不上「这次渲染的按钮」，点击会被丢进已消失的旧 widget 里，
+    于是按钮**点了没反应**——这正是本页那个 bug 的成因之一。
+    改用提案内容（tool+参数）做 key：同一次待确认里它恒定不变。
+    """
+    key = f"{pa.get('tool', '')}|{json.dumps(pa.get('args', {}), sort_keys=True, ensure_ascii=False)}"
+    h = 0
+    for ch in key:
+        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+    return f"pa_{kind}_{h}"
+
+
 def _render_result(container, result, content: str):
     # 待确认动作：渲染确认框；用户决策后由 _handle_pending_decision 就地改写该消息
     if result is not None and getattr(result, "pending_action", None):
@@ -112,12 +127,17 @@ def _render_result(container, result, content: str):
             container.markdown(f"**影响**：{pa.get('impact', '')}")
             container.markdown(f"**风险等级**：{pa.get('risk', '低')}")
             c1, c2 = container.columns(2)
-            if c1.button("✅ 确认执行", key=f"confirm_{id(pa)}", type="primary"):
+            # 关键：点击处**就地处理**再 st.rerun()。
+            # st.session_state 在同一轮内写入后读得到，所以这里能直接把决策落地，
+            # 不必等下一次重跑（旧实现正是败在这一步：只写标记不处理、也不重跑）。
+            if c1.button("✅ 确认执行", key=_pending_widget_key(pa, "confirm"), type="primary"):
                 st.session_state["_agent_pending_action"] = pa
                 st.session_state["_agent_pending_decision"] = "confirm"
-            if c2.button("❌ 取消", key=f"cancel_{id(pa)}"):
+                _handle_pending_decision()
+            if c2.button("❌ 取消", key=_pending_widget_key(pa, "cancel")):
                 st.session_state["_agent_pending_action"] = pa
                 st.session_state["_agent_pending_decision"] = "cancel"
+                _handle_pending_decision()
         return
 
     # 逐步展示工具调用（若有）
@@ -175,8 +195,14 @@ def _handle_pending_decision():
         return
 
     # 确认执行：用 approve=True 重新调用同一工具真正落盘/改文件/模拟下单
+    args = dict(spec.get("args") or {})
+    # 防御：无条件置 approve=True。提案里的 args 本就带 True（四个变更工具都在
+    # 预览分支里写死），但如果哪天工具改了签名、或提案被别处拼出来少了这个键，
+    # 这次调用只会再产出一次预览 —— 表现为「点了确认却什么都没发生」，
+    # 正是本项目最忌的静默失效。宁可多设一次，也不能让确认变成空转。
+    args["approve"] = True
     try:
-        out = call_tool(spec["tool"], spec["args"])
+        out = call_tool(spec["tool"], args)
     except Exception as e:  # noqa: BLE001
         out = f"⚠️ 执行失败：{type(e).__name__}: {e}"
     if last is not None and last.get("pending"):
