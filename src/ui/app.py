@@ -78,17 +78,24 @@ from loguru import logger
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
 from src.models.quantitative import quant_engine, risk_parity, MeanReversionStrategy
-from src.models.tracker import save_predictions, get_accuracy_summary
+# 追踪器统一走 tracker_v2：旧 tracker.py 用「今天减 N 天」反推日期、基准代码解析错、
+# 回撤恒为 0、且 T+5 与 T+10 互相覆盖，已废弃。反馈层（src/evolution/feedback.py）
+# 早就在读 v2 的格式，看板若继续用旧版写入，两边 schema 会分叉。
+from src.models.tracker_v2 import save_predictions, get_accuracy_summary
 from src.models.llm import deepseek
 from src.models.evolution import evolution
 from config.settings import config as app_config
+from config.settings import save_scheduler_state, save_ml_state, save_agent_state
+from src.scheduler.auto_scheduler import start_scheduler, is_running
 from src.ui.trading_ui import render_autotrade_page
+from src.ui.agent_page import render_agent_page
 from src.ui.common import (
     UP_COLOR, DOWN_COLOR, FLAT_COLOR, WARN_COLOR, INFO_COLOR,
     chg_color, chg_arrow, fmt_pct, fmt_num, fmt_yi,
     parse_codes, is_valid_code, build_name_map, lookup_name,
     calc_rsi, calc_macd, calc_kdj, calc_boll, calc_ma, boll_position,
     score_color, score_label, empty_state, require, signal_tag, tag_css,
+    metric_card, html_metric,
 )
 
 # ========== 缓存层 ==========
@@ -117,8 +124,16 @@ def _cached_market_overview():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _cached_daily_kline(code: str, start: str, end: str):
-    """缓存日线数据（10分钟）"""
-    return fetcher.get_daily_kline(code, start_date=start, end_date=end)
+    """缓存日线数据（10分钟）
+
+    注意：start/end 传空串表示"不限"，必须在这里归一化成真实区间再交给 fetcher。
+    直接把 "" 传下去会让日期过滤得到空表（max() → NaT → 日期减法 TypeError）。
+    """
+    return fetcher.get_daily_kline(
+        code,
+        start_date=(start or "").strip() or "2015-01-01",
+        end_date=(end or "").strip() or None,
+    )
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -488,7 +503,7 @@ with st.sidebar:
     if "page" not in st.session_state:
         st.session_state.page = "🏠 概览"
 
-    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "💹 自动交易", "📐 量化模型", "⚙️ 设置"]
+    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📐 量化模型", "⚙️ 设置"]
 
     page = st.radio(
         "导航",
@@ -498,6 +513,18 @@ with st.sidebar:
         index=page_options.index(st.session_state.page)
     )
     st.session_state.page = page
+
+    # ---- 看板启动时自动拉起「收盘后自动化调度」（若已启用）----
+    # 让「启用」开关跨看板重启真正生效：重启后只要 enabled 仍为 True，调度器
+    # 就在首屏加载时自动拉起，无需再手动点「启动调度」，实现无人值守。
+    # st.session_state 保证每次浏览器会话只尝试一次；start_scheduler 本身幂等。
+    try:
+        if "scheduler_autostart_done" not in st.session_state:
+            st.session_state.scheduler_autostart_done = True
+            if app_config.scheduler.enabled and not is_running():
+                start_scheduler()
+    except Exception as e:  # noqa: BLE001  非 Streamlit 上下文或导入失败时静默跳过
+        logger.debug(f"调度自动拉起跳过: {e}")
 
     st.markdown("---")
     ready = predictor.is_ready
@@ -803,7 +830,10 @@ elif page == "🔍 AI选股":
                 top_n = st.slider("推荐数量", 5, 50, 20, 5)
             with rc2:
                 # 量程按单模型化后的实际评分区间（约 38~60）收窄，步长 1 便于微调
-                min_score = st.slider("最低评分", 35.0, 65.0, 50.0, 1.0)
+                min_score = st.slider(
+                    "最低评分（手动模式）", 35.0, 65.0, 50.0, 1.0,
+                    help="仅当「设置→自我进化引擎→自动阈值调整」关闭时作为阈值；开启时采用自动进化的有效阈值，此滑块不参与筛选。",
+                )
                 scan_max = st.select_slider("扫描上限", options=[50, 100, 150, 200, 300, "全"], value=100, help="更大的扫描范围 = 更全面的覆盖，但耗时更长。选'全'=不限制")
             with rc3:
                 trend_filter = st.radio("技术形态", ["全部", "多头排列", "金叉信号", "超卖反弹"], index=0, horizontal=False)
@@ -833,16 +863,20 @@ elif page == "🔍 AI选股":
                 if summary["n_verified"] == 0:
                     st.info("暂无已验证的预测记录。运行 5-10 天后这里会显示回测准确率。")
                 else:
+                    # tracker_v2 的汇总键与旧版不同：accuracy / avg_excess，
+                    # 且无数据时返回 None（旧版返回 0）。
+                    _acc = summary.get("accuracy") or 0.0
+                    _exc = summary.get("avg_excess") or 0.0
                     m1, m2, m3 = st.columns(3)
                     m1.metric("已验证批次", f"{summary['n_verified']} 次")
-                    m2.metric("平均准确率", f"{summary['avg_accuracy']*100:.1f}%",
-                              delta=f"{summary['avg_accuracy']-0.5:.1%}" if summary['avg_accuracy'] else None)
-                    m3.metric("超额收益", f"{summary['avg_excess_return']*100:.2f}%",
-                              delta=f"{summary['avg_excess_return']*100:.2f}%" if summary['avg_excess_return'] else None)
+                    m2.metric("平均准确率", f"{_acc*100:.1f}%",
+                              delta=f"{_acc-0.5:.1%}" if _acc else None)
+                    m3.metric("超额收益", f"{_exc*100:.2f}%",
+                              delta=f"{_exc*100:.2f}%" if _exc else None)
 
                     if st.button("🔄 运行回测验证", help="拉取 5/10 天前推荐的实际表现，并触发自我进化"):
                         with st.spinner("拉取历史数据并验证…"):
-                            from src.models.tracker import verify_all_pending
+                            from src.models.tracker_v2 import verify_all_pending
                             results = verify_all_pending()
                             if results:
                                 st.success(f"✅ 验证完成: {len(results)} 个批次")
@@ -851,12 +885,15 @@ elif page == "🔍 AI选股":
                                 for r in results:
                                     evo_actions.extend(evolution.evolve_from_verification(r))
                                 for r in results[-3:]:
+                                    # v2 的键是 base_date / hold_days（旧版是 scan_date / lookback_days）
+                                    _day = r.get("base_date") or r.get("scan_date")
+                                    _h = r.get("hold_days") or r.get("lookback_days")
                                     st.write(
-                                        f"📅 **{r['scan_date']} +{r['lookback_days']}天**: "
-                                        f"准确率={r['accuracy']*100:.1f}% "
-                                        f"平均收益={r['avg_return']*100:+.2f}% "
-                                        f"超额={r['excess_return']*100:+.2f}% "
-                                        f"胜率={r['win_rate']*100:.1f}%"
+                                        f"📅 **{_day} +{_h}天**: "
+                                        f"准确率={(r.get('accuracy') or 0)*100:.1f}% "
+                                        f"平均收益={(r.get('avg_return') or 0)*100:+.2f}% "
+                                        f"超额={(r.get('excess_return') or 0)*100:+.2f}% "
+                                        f"胜率={(r.get('win_rate') or 0)*100:.1f}%"
                                     )
                                 if evo_actions:
                                     st.markdown('<div class="section-title">🧬 本次自我进化</div>', unsafe_allow_html=True)
@@ -881,32 +918,32 @@ elif page == "🔍 AI选股":
                     st.dataframe(hist_df, width="stretch", hide_index=True)
 
             with st.spinner(f"AI 正在扫描 {pool} 股票池 (上限{display_max}只)…"):
-                # ★ 自我进化：检测市场状态 + 应用进化后的阈值
+                # ★ 自我进化：检测市场状态 + 应用完全自动的进化阈值（忽略用户滑块，使用固定基线）
                 regime, effective_min_score = None, min_score
-                raw_effective_min_score = min_score
+                bd = evolution.get_effective_breakdown()
                 auto_adj = app_config.ml.auto_threshold_adjust
                 try:
                     # 指数必须走 get_benchmark_kline，不能用 get_daily_kline
                     bench_df = fetcher.get_benchmark_kline("000300.SH", start_date="2024-01-01")
                     regime = evolution.detect_regime(bench_df)
                     if auto_adj:
-                        effective_min_score = evolution.get_effective_min_score(min_score)
-                        raw_effective_min_score = evolution.last_effective_min_score_raw
+                        # 完全自动：固定基线 + 进化调整 + 市场状态调整，滑块不参与
+                        effective_min_score = evolution.get_effective_min_score()
+                        bd = evolution.get_effective_breakdown()
                     else:
                         # 自动阈值调整已关闭：有效阈值恒等于用户设定，不被市场状态静默改写
                         effective_min_score = min_score
-                        raw_effective_min_score = min_score
                 except Exception as e:
-                    logger.warning(f"市场状态检测失败: {e}")
+                    logger.warning(f"市场状态检测失败，回退到用户设定阈值: {e}")
 
                 if regime:
                     regime_name = {"bull": "🐂 牛市", "bear": "🐻 熊市", "sideways": "⚖️ 震荡市"}.get(regime, regime)
                     if auto_adj:
-                        raw_note = (
-                            f" · clamp 前 {raw_effective_min_score:.1f}"
-                            if raw_effective_min_score != effective_min_score else ""
+                        clamp_note = " · 已截断至阈值上限" if bd["clamped"] else ""
+                        st.caption(
+                            f"🧬 市场状态: {regime_name} · 自动有效阈值 {effective_min_score:.1f} "
+                            f"= 基线{bd['base']:.0f} + 进化{bd['evolution_adj']:+.1f} + 市场{bd['regime_adj']:+.1f}{clamp_note}"
                         )
-                        st.caption(f"🧬 市场状态: {regime_name} · 进化后有效阈值 {effective_min_score:.1f} (用户设定 {min_score:.1f}){raw_note}")
                     else:
                         st.caption(f"🧬 市场状态: {regime_name} · 自动阈值调整已关闭（有效阈值=用户设定 {min_score:.1f}）")
 
@@ -1049,7 +1086,18 @@ elif page == "🔍 AI选股":
                             "prob_up": float(row["上涨概率"]) / 100,
                             "prob_down": float(row["下跌概率"]) / 100,
                         })
-                    save_predictions(pred_records)
+                    # 顺手快照预测日收盘价：v2 验证时直接用快照，不必事后用复权价反推
+                    # （前复权数据会被未来的除权事件改写，反推出来的「当时价格」并非当时可见价）。
+                    # 价格取自内存里已有的 stock_data，不额外打行情接口。
+                    price_snapshot = {}
+                    for _code, _df in stock_data.items():
+                        try:
+                            _close = float(_df["close"].iloc[-1])
+                            if _close > 0:
+                                price_snapshot[_code] = round(_close, 3)
+                        except Exception:
+                            continue
+                    save_predictions(pred_records, price_snapshot=price_snapshot)
                 except Exception:
                     pass
 
@@ -1125,14 +1173,17 @@ elif page == "🔍 AI选股":
                     height=min(len(result_df) * 35 + 38, 600)
                 )
 
-                # ====== 🤖 DeepSeek 组合推荐理由 ======
-                st.markdown('<div class="section-title">🤖 DeepSeek 组合解读</div>', unsafe_allow_html=True)
+                # ====== 🤖 AI 组合推荐理由 ======
+                # 文案按 provider 动态渲染：接了本地模型就别再显示「DeepSeek」，
+                # 否则用户会以为还在调云端（而云端可能没余额）。
+                _llm_name = "本地大模型" if getattr(deepseek, "is_local", False) else "DeepSeek"
+                st.markdown(f'<div class="section-title">🤖 {_llm_name} 组合解读</div>', unsafe_allow_html=True)
                 if not deepseek.is_ready:
-                    st.info("💡 配置 DeepSeek API Key（⚙️ 设置页）后，可生成组合推荐理由。")
+                    st.info(f"💡 配置{_llm_name}（⚙️ 设置页）后，可生成组合推荐理由。")
                 else:
                     ds_combo_btn = st.button("✨ 生成组合推荐理由", type="primary", key="ds_combo_btn")
                     if ds_combo_btn:
-                        with st.spinner("🤖 DeepSeek 正在解读组合…"):
+                        with st.spinner(f"🤖 {_llm_name} 正在解读组合…"):
                             try:
                                 top_stocks = result_df.head(10)[["代码", "名称", "评分", "上涨概率", "下跌概率", "推荐理由"]].to_dict("records")
                                 combo_rationale = deepseek.explain_recommendations(top_stocks)
@@ -1612,14 +1663,16 @@ elif page == "📊 个股分析":
                                    margin=dict(l=10, r=50, t=10, b=10))
                 st.plotly_chart(fig4, use_container_width=True)
 
-            # ====== 🤖 DeepSeek AI 分析报告 ======
-            st.markdown('<div class="section-title">🤖 DeepSeek AI 分析报告</div>', unsafe_allow_html=True)
+            # ====== 🤖 AI 分析报告 ======
+            # 同上：模型来源动态显示，避免本地模式下仍写「DeepSeek」造成误解。
+            _llm_name = "本地大模型" if getattr(deepseek, "is_local", False) else "DeepSeek"
+            st.markdown(f'<div class="section-title">🤖 {_llm_name} AI 分析报告</div>', unsafe_allow_html=True)
             if not deepseek.is_ready:
-                st.info("💡 未配置 DeepSeek API Key，请到「⚙️ 设置」页填写后即可生成 AI 分析报告。")
+                st.info(f"💡 未配置{_llm_name}，请到「⚙️ 设置」页配置后即可生成 AI 分析报告。")
             else:
-                ds_btn = st.button("✨ 生成 DeepSeek 分析报告", type="primary", key=f"ds_report_{stock_code}")
+                ds_btn = st.button(f"✨ 生成 {_llm_name} 分析报告", type="primary", key=f"ds_report_{stock_code}")
                 if ds_btn:
-                    with st.spinner("🤖 DeepSeek 正在分析…"):
+                    with st.spinner(f"🤖 {_llm_name} 正在分析…"):
                         try:
                             # 组装指标快照
                             ds_metrics = {
@@ -2259,6 +2312,10 @@ elif page == "📡 实时监控":
             time.sleep(0.5)
             st.rerun()
 
+# ========== 🤖 AI 助手页 ==========
+elif page == "🤖 AI 助手":
+    render_agent_page()
+
 # ========== 💹 自动交易页 ==========
 elif page == "💹 自动交易":
     render_autotrade_page()
@@ -2527,46 +2584,344 @@ elif page == "📐 量化模型":
 
 
 # ========== ⚙️ 设置页 ==========
-elif page == "⚙️ 设置":
+# ========== 🛡️ 交易安全 / 模型 / 调度 控制面板 ==========
+def render_safety_panel():
+    """设置页内的「交易安全中枢 + 模型注册中心 + 自动化调度」控制面板。
+
+    注意：本面板只做状态展示与显式人工操作（武装/熔断/调度启停），
+    绝不自行下单；下单仍由交易安全中枢 guard 在扫描主循环里裁决。
+    """
+    # 经 src/ui/paths 解析，避免「看板进程早于源码改动启动」时的 ImportError。
+    # 旧进程只重跑 app.py、不重载已导入模块，直连 config.settings 会撞上缓存。
+    from src.ui.paths import CONFIG_DIR, STALE_PROCESS
+    if STALE_PROCESS:
+        st.warning(
+            "⚠️ 当前看板进程运行的是**旧版代码**（内存里的 `config.settings` 已过时）。\n\n"
+            "本页已按当前磁盘代码自行兼容，但其它新功能仍需重启才能生效 —— "
+            "**请关闭看板并重新启动**。Streamlit 只重跑脚本、不会重载已导入的模块，"
+            "所以改完源码后必须重启进程。"
+        )
+    try:
+        from src.trading.guard import SafetyController, GuardConfig, TradingMode
+        from src.models.model_registry import scan_models, best_loadable, best_overall
+        from src.scheduler.auto_scheduler import (
+            is_running, start_scheduler, stop_scheduler, run_all_once,
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(f"安全面板依赖加载失败: {e}")
+        return
+
+    # ---------- 交易安全中枢 ----------
+    st.markdown('<div class="section-title">🛡️ 交易安全中枢 (Safety Controller)</div>', unsafe_allow_html=True)
+    st.info("默认 PAPER（纸交易）。进入实盘需两步令牌武装；KILL SWITCH 一键熔断并持久化，重启仍保持。")
+    try:
+        _gpath = Path(CONFIG_DIR) / "trading_guard.yaml"
+        cfg = GuardConfig.from_yaml(str(_gpath)) if _gpath.exists() else GuardConfig()
+    except Exception:
+        cfg = GuardConfig()
+    safety = SafetyController(cfg)
+
+    mode = safety.mode
+    halted = safety.halted
+    mode_color = {
+        "off": "#64748b", "paper": "#16a34a",
+        "live_pending": "#f59e0b", "live": "#dc2626",
+    }.get(mode.value, "#64748b")
+    st.markdown(
+        f"当前模式：<span style='background:{mode_color};color:#fff;padding:2px 10px;"
+        f"border-radius:6px;'>{mode.value.upper()}</span> ｜ "
+        f"KILL SWITCH：{'🛑 已熔断' if halted else '🟢 正常'}",
+        unsafe_allow_html=True,
+    )
+    snap = safety.snapshot()
+    if snap.get("armed_by"):
+        st.caption(f"武装人: {snap['armed_by']} @ {snap.get('armed_at', '')}")
+        if snap.get("halt_reason"):
+            st.caption(f"熔断原因: {snap['halt_reason']}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("🟢 解除实盘武装→PAPER", key="sec_disarm", use_container_width=True):
+            safety.disarm("dashboard")
+            st.success("已解除实盘武装，回到纸交易"); st.rerun()
+    with c2:
+        if st.button("🔴 武装实盘(LIVE_PENDING)", key="sec_arm", use_container_width=True):
+            tok = safety.arm_live("dashboard")
+            st.session_state["_arm_token"] = tok
+            st.rerun()
+    with c3:
+        if st.button("🛑 KILL SWITCH", key="sec_kill", use_container_width=True):
+            safety.halt("手动触发（看板）", "dashboard")
+            st.error("🛑 已触发全局熔断，所有下单冻结"); st.rerun()
+
+    # 武装确认（两步令牌）
+    if st.session_state.get("_arm_token"):
+        st.warning(f"⚠️ 请核对确认令牌（授权人回填完成武装）：`{st.session_state['_arm_token']}`")
+        tok_in = st.text_input("输入确认令牌", key="sec_arm_input")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅ 确认武装", key="sec_confirm"):
+                if safety.confirm_arm(tok_in.strip(), "dashboard"):
+                    st.session_state["_arm_token"] = ""
+                    st.success("🔴 已武装 LIVE_PENDING，每笔委托需人工确认"); st.rerun()
+                else:
+                    st.error("令牌不匹配")
+        with b2:
+            if st.button("❌ 取消", key="sec_cancel"):
+                st.session_state["_arm_token"] = ""
+                st.rerun()
+
+    if halted:
+        if st.button("🟢 解除熔断 (resume)", key="sec_resume", use_container_width=True):
+            safety.resume("dashboard")
+            st.success("已解除熔断（若曾实盘则强制回 PAPER）"); st.rerun()
+
+    # ---------- 模型注册中心 ----------
+    st.markdown('<div class="section-title">📦 模型注册中心 (Model Registry)</div>', unsafe_allow_html=True)
+    try:
+        infos = scan_models()
+        rows = []
+        for m in infos:
+            ric = f"{m.rank_ic:+.4f}" if m.rank_ic == m.rank_ic else "n/a"
+            rows.append({
+                "模型": m.display_name,
+                "RankIC": ric,
+                "可部署": "✅" if m.loadable else "⚠️",
+                "胜率": f"{m.win_rate:.1%}" if m.win_rate == m.win_rate else "-",
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        bl = best_loadable(); bo = best_overall()
+        note = ""
+        if bo and not bo.loadable:
+            note = (f"⚠️ 全局最优 **{bo.display_name}**（RankIC {bo.rank_ic:+.4f}）"
+                    "仅是 walk-forward 实验日志，未生成可部署 .pkl；"
+                    "需运行 alpha 训练脚本（alpha_set=industry/lhb/margin/northbound）后才会被自动选用。")
+        st.caption(
+            f"当前可部署最优：{(bl.display_name if bl else '-')} "
+            f"(RankIC {bl.rank_ic:+.4f})。" + note
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(f"模型扫描失败: {e}")
+
+    # ---------- 超级集成 ----------
+    st.markdown('<div class="section-title">🧩 超级集成 (XGBoost + Alpha + LSTM)</div>', unsafe_allow_html=True)
+    try:
+        from src.models.predictor import predictor as _pred
+        st.code(_pred.ensemble_report(), language="text")
+        st.caption(
+            "由 `config.ml.use_ensemble` 控制（默认取值见该配置项）。"
+            "任一腿文件缺失或推理失败会自动剔除并重新归一化权重，不影响主模型。")
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"集成状态不可用: {e}")
+
+    # ---------- 严谨回测 ----------
+    st.markdown('<div class="section-title">📊 严谨回测 (成本 + 多宇宙 + Walk-Forward)</div>', unsafe_allow_html=True)
+    st.caption("对给定宇宙与 AI 打分做 TopN 等权组合回测：佣金/印花税/滑点建模，"
+               "输出 RankIC / 夏普 / 索提诺 / 最大回撤。")
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        bt_pool = st.selectbox("回测宇宙", ["zz500", "hs300", "zz1000", "all"], key="bt_pool")
+    with bc2:
+        bt_topn = st.number_input("TopN", 5, 50, 20, 5, key="bt_topn")
+    with bc3:
+        bt_rb = st.number_input("调仓天数", 1, 20, 5, 1, key="bt_rb")
+    if st.button("📈 运行严谨回测", key="bt_run", use_container_width=True):
+        with st.spinner(f"回测 {bt_pool} 池（TopN={bt_topn}, 调仓{bt_rb}日）…"):
+            try:
+                from src.core.backtest import WalkForwardBacktester, BacktestConfig
+                from src.data.fetcher import fetcher as _fet
+                from src.models.predictor import predictor as _pred
+                codes = _fet.get_stock_pool(bt_pool)[:80]     # 控制回测量
+                raw = _fet.get_batch_daily_kline(codes, max_workers=8)
+                stock_data = {c: df for c, df in raw.items() if df is not None and len(df) >= 120}
+                if not stock_data:
+                    st.warning("无可用行情数据")
+                else:
+                    bt = WalkForwardBacktester(BacktestConfig(top_n=int(bt_topn),
+                                                              rebalance_days=int(bt_rb)))
+                    res = bt.backtest_predictor_rolling(_pred, stock_data,
+                                                        rebalance_days=int(bt_rb))
+                    st.code(res.report(), language="text")
+                    if res.equity is not None and len(res.equity):
+                        st.line_chart(res.equity)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"回测失败: {e}")
+
+    # ---------- 自动化调度 ----------
+    st.markdown('<div class="section-title">⏰ 收盘后自动化调度 (APScheduler)</div>', unsafe_allow_html=True)
+    sc = app_config.scheduler
+    st.caption(
+        f"数据更新 {sc.data_update_cron} ｜ 每日推荐 {sc.daily_pick_cron} ｜ "
+        f"进化验证 {sc.evolution_cron}（{sc.timezone}）"
+    )
+    st.info("调度仅做数据/推荐/进化验证，绝不下单。勾选启用后点击「启动调度」即可拉起后台定时器；"
+            "开关会持久化，重启看板后仍记得上次状态。")
+
+    # 启用开关（持久化到 config/scheduler_state.json，跨重启保留）
+    _enabled = st.checkbox(
+        "启用收盘后自动化调度",
+        value=app_config.scheduler.enabled,
+        key="sch_enabled",
+        help="勾选后，点击「启动调度」才会真正拉起 APScheduler 后台定时器。",
+    )
+    if _enabled != app_config.scheduler.enabled:
+        app_config.scheduler.enabled = _enabled
+        save_scheduler_state(_enabled)
+        # 勾选即启、取消即停：让开关成为调度的唯一真相来源，避免「已勾选却未运行」
+        if _enabled:
+            if not is_running():
+                start_scheduler()
+        else:
+            if is_running():
+                stop_scheduler()
+        st.rerun()
+
+    if not app_config.scheduler.enabled:
+        st.warning("⚠️ 调度总开关未启用：勾选上方「启用收盘后自动化调度」后再点「启动调度」。")
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        if st.button("▶️ 启动调度", key="sch_start", use_container_width=True):
+            # 兜底启用：即使用户没勾选，点启动也应真的跑起来，而不是静默失败
+            if not app_config.scheduler.enabled:
+                app_config.scheduler.enabled = True
+                save_scheduler_state(True)
+            r = start_scheduler()
+            if r:
+                st.success("✅ 已启动（工作日 18:30 更新数据 / 18:45 生成推荐 / 19:00 进化验证）")
+            else:
+                st.error("❌ 启动失败：APScheduler 未安装，或 cron 表达式无效。查看日志了解详情。")
+                st.info("安装依赖：pip install apscheduler")
+            st.rerun()
+    with s2:
+        if st.button("⏹️ 停止调度", key="sch_stop", use_container_width=True):
+            stop_scheduler(); st.success("🛑 已停止"); st.rerun()
+    with s3:
+        if st.button("🚀 立即跑一轮", key="sch_run", use_container_width=True):
+            out = run_all_once(dry_run=True)
+            st.json({k: (v.get("status") if isinstance(v, dict) else v)
+                     for k, v in out.items() if k != "ran_at"})
+    st.caption(f"调度状态：{'🟢 运行中' if is_running() else '⚪ 未运行'}")
+
+
+if page == "⚙️ 设置":
     st.markdown('<p class="main-header">⚙️ 系统设置</p>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title">🤖 DeepSeek AI 配置</div>', unsafe_allow_html=True)
-    st.info("💡 DeepSeek 用于生成个股分析报告和选股组合推荐理由。API Key 申请地址：https://platform.deepseek.com")
+    st.markdown('<div class="section-title">🤖 AI 大模型配置</div>', unsafe_allow_html=True)
+    st.info("💡 用于生成个股分析报告和选股组合推荐理由。可接云端 DeepSeek，也可接本机推理服务。")
 
-    ds_col1, ds_col2, ds_col3 = st.columns([3, 2, 1])
-    with ds_col1:
-        ds_key = st.text_input(
-            "DeepSeek API Key",
-            value="",
-            type="password",
-            key="ds_api_key_input",
-            placeholder="sk-..." if not deepseek.config.api_key else "已配置（重新输入可覆盖）",
-            help="留空则保持现有配置",
-        )
-    with ds_col2:
-        ds_model = st.selectbox(
-            "模型",
-            ["deepseek-chat", "deepseek-reasoner"],
-            index=0 if deepseek.config.model != "deepseek-reasoner" else 1,
-            key="ds_model_input",
-        )
-    with ds_col3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        ds_save_btn = st.button("💾 保存", use_container_width=True, key="ds_save_btn")
+    # provider 选择 —— 云端需要 key 且有余额；本地不需要 key、不联网、不花钱。
+    # 此前 llm.py 里 base_url 是个死开关（chat() 用的是硬编码常量），
+    # 所以这里以前填什么都不会生效。现在配置真能改到请求地址。
+    _is_local_now = bool(getattr(deepseek, "is_local", False))
+    ds_provider = st.radio(
+        "模型来源",
+        ["☁️ 云端 DeepSeek", "🖥️ 本地服务（Ollama / LM Studio / vLLM）"],
+        index=1 if _is_local_now else 0,
+        horizontal=True,
+        key="ds_provider_radio",
+        help="本地服务走 OpenAI 兼容接口，无需 API Key，也不产生费用。",
+    )
+    _want_local = str(ds_provider).startswith("🖥️")
 
-    if ds_save_btn:
-        if ds_key.strip():
-            deepseek.set_api_key(ds_key)
-            deepseek.config.model = ds_model
-            deepseek.save()
-            st.success("✅ DeepSeek 配置已保存")
-        else:
-            deepseek.config.model = ds_model
-            deepseek.save()
-            st.info("✅ 模型已更新（API Key 未变更）")
+    if _want_local:
+        st.caption(
+            "💡 本地模式：不联网、不花钱、无需 Key。需先启动服务并拉好模型，"
+            "例如 Ollama → `ollama serve` + `ollama pull qwen2.5:7b`。"
+            "RTX 4050 Laptop（6GB）建议 7B Q4 或 3B，7B 未量化会爆显存。")
+        # 切到本地时，若 base_url 还停在云端地址（如 api.deepseek.com），
+        # 预填本机地址而不是把云端地址当默认值显示给用户——否则极易被误导
+        # 以为「那个值就是本地的」而忘记改，结果请求仍打到云端拿 402。
+        _base_default = (
+            "http://localhost:11434/v1"
+            if not deepseek._is_loopback(deepseek.config.base_url)
+            else deepseek.config.base_url or "http://localhost:11434/v1"
+        )
+        _r1c1, _r1c2 = st.columns([3, 2])
+        with _r1c1:
+            ds_base = st.text_input(
+                "服务地址（OpenAI 兼容）",
+                value=_base_default,
+                key="ds_base_url_input",
+                placeholder="http://localhost:11434/v1",
+                help="必须填你电脑上的服务地址，不是 api.deepseek.com！"
+                     "Ollama 默认 11434，LM Studio 默认 1234，vLLM 默认 8000。",
+            )
+        with _r1c2:
+            # 探测到就给下拉，没探测到退回手填 —— 本地模型名又长又带 tag
+            _found = st.session_state.get("ds_local_models") or []
+            if _found:
+                _mi = _found.index(deepseek.config.model) \
+                    if deepseek.config.model in _found else 0
+                ds_model = st.selectbox("模型", _found, index=_mi,
+                                       key="ds_model_sel")
+            else:
+                ds_model = st.text_input(
+                    "模型名", value=deepseek.config.model or "qwen2.5:7b",
+                    key="ds_model_txt", placeholder="qwen2.5:7b")
+        _r2c1, _r2c2, _r2c3 = st.columns([1, 1, 4])
+        with _r2c1:
+            ds_probe_btn = st.button("🔍 探测", use_container_width=True,
+                                     key="ds_probe_btn")
+        with _r2c2:
+            ds_save_btn = st.button("💾 保存", use_container_width=True,
+                                    key="ds_save_btn")
+
+        if ds_probe_btn:
+            with st.spinner("探测中…"):
+                names = deepseek.list_models(base_url=ds_base)
+            st.session_state["ds_local_models"] = names
+            if names:
+                st.success(f"✅ 发现 {len(names)} 个模型：" + "、".join(names[:6])
+                           + ("…" if len(names) > 6 else ""))
+            else:
+                st.warning("⚠️ 没取到模型列表 —— 地址填对了吗？服务启动了吗？")
+
+        if ds_save_btn:
+            if not deepseek._is_loopback(ds_base):
+                st.error(
+                    "⚠️ 本地模式的「服务地址」必须指向你本机"
+                    "（localhost / 127.0.0.1），不能是 api.deepseek.com。"
+                    "请改成 http://localhost:11434/v1，并确保 Ollama 已启动"
+                    "（`ollama serve` + `ollama pull qwen2.5:7b`）。")
+            else:
+                deepseek.configure(provider="local", base_url=ds_base,
+                                   model=ds_model)
+                st.success(f"✅ 已保存：{deepseek.describe()}")
+    else:
+        ds_col1, ds_col2, ds_col3 = st.columns([3, 2, 1])
+        with ds_col1:
+            ds_key = st.text_input(
+                "DeepSeek API Key",
+                value="",
+                type="password",
+                key="ds_api_key_input",
+                placeholder="sk-..." if not deepseek.config.api_key else "已配置（重新输入可覆盖）",
+                help="留空则保持现有配置。申请地址：https://platform.deepseek.com",
+            )
+        with ds_col2:
+            ds_model = st.selectbox(
+                "模型",
+                ["deepseek-chat", "deepseek-reasoner"],
+                index=0 if deepseek.config.model != "deepseek-reasoner" else 1,
+                key="ds_model_input",
+            )
+        with ds_col3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            ds_save_btn = st.button("💾 保存", use_container_width=True, key="ds_save_btn")
+
+        if ds_save_btn:
+            if ds_key.strip():
+                deepseek.configure(provider="deepseek", api_key=ds_key,
+                                   model=ds_model,
+                                   base_url="https://api.deepseek.com")
+                st.success("✅ DeepSeek 配置已保存")
+            else:
+                deepseek.configure(provider="deepseek", model=ds_model)
+                st.info("✅ 模型已更新（API Key 未变更）")
 
     if deepseek.is_ready:
-        st.success(f"🟢 DeepSeek 已配置 · 模型 {deepseek.config.model}")
+        st.success(f"🟢 {deepseek.describe()}")
         if st.button("🔌 测试连接", key="ds_test_btn"):
             with st.spinner("测试中…"):
                 try:
@@ -2575,17 +2930,51 @@ elif page == "⚙️ 设置":
                 except Exception as e:
                     st.error(f"❌ {e}")
     else:
-        st.warning("🟡 尚未配置 DeepSeek API Key")
+        if _want_local:
+            st.warning("🟡 请填写本地服务地址（如 http://localhost:11434/v1）")
+        else:
+            st.warning("🟡 尚未配置 DeepSeek API Key")
 
     st.markdown('<div class="section-title">🧠 模型配置</div>', unsafe_allow_html=True)
 
     st.markdown("""
     <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:1rem;">
-        <h4 style="color:#ef4444; margin:0 0 0.5rem 0;">XGBoost（唯一模型）</h4>
+        <h4 style="color:#ef4444; margin:0 0 0.5rem 0;">XGBoost（主模型）</h4>
     </div>
     """, unsafe_allow_html=True)
     st.json({"n_estimators": 300, "max_depth": 6, "learning_rate": 0.05, "subsample": 0.8})
-    st.caption("ℹ️ 项目已统一为单模型：全部训练与预测只使用 XGBoost，模型文件 `models/xgboost_model.pkl`。")
+    # 文案如实反映 config.ml.use_ensemble 的当前取值 —— 之前这里写死了
+    # 「项目已统一为单模型」，而配置里 use_ensemble 默认为 True，
+    # 于是看板一边宣称单模型、一边在后台把 alpha 与 LSTM 两条腿加权融合。
+    # 一句写死的话，比不写更糟：它让人据此做出错误判断。
+    if getattr(app_config.ml, "use_ensemble", False):
+        st.caption(
+            "ℹ️ 当前**启用超级集成**：以 XGBoost 为主模型（`models/xgboost_model.pkl`），"
+            "并与 Alpha / LSTM 两条腿加权融合。任一腿缺失会自动降级，不影响主模型。")
+    else:
+        st.caption(
+            "ℹ️ 当前**为单模型**：全部训练与预测只使用 XGBoost，"
+            "模型文件 `models/xgboost_model.pkl`。")
+
+    # 超级集成开关：之前只能改 config/settings.py 源码，看板上「看得见、摸不着」。
+    # 注意这不只是显示口径——开启后 predict_batch 会把 Alpha/LSTM 两条腿
+    # 加权融合进评分，**真实改变选股结果**，所以默认沿用你之前拍板的单模型(True/False)。
+    _ens_on = st.checkbox(
+        "🧩 启用超级集成（XGBoost + Alpha + LSTM 加权融合）",
+        value=app_config.ml.use_ensemble,
+        key="ml_use_ensemble",
+        help="开启后预测 = XGBoost 主模型 + Alpha(权重1.0) + LSTM(权重0.8) 融合；"
+             "任一腿缺失会自动降级，不影响主模型。关闭则为纯 XGBoost 单模型。",
+    )
+    if _ens_on != app_config.ml.use_ensemble:
+        app_config.ml.use_ensemble = _ens_on
+        save_ml_state(_ens_on)
+        st.rerun()
+    if _ens_on:
+        st.caption("✅ 已启用：选股评分将融合 Alpha 与 LSTM 两条腿。")
+
+    # ====== 🛡️ 交易安全 / 模型 / 调度 控制面板 ======
+    render_safety_panel()
 
     st.markdown('<div class="section-title">📡 数据 & 缓存</div>', unsafe_allow_html=True)
     st.info("🔌 数据源: **AKShare** (新浪财经) · 免费沪深A股行情")
@@ -2593,6 +2982,24 @@ elif page == "⚙️ 设置":
     if st.button("🗑️ 清除数据缓存", use_container_width=True):
         fetcher.clear_cache()
         st.success("✅ 缓存已清除! 下次获取将重新下载数据。")
+
+    # ====== 🤖 AI 助手：筛选并发数（避免并行拉行情炸进程，同时支持真机提速）======
+    st.markdown('<div class="section-title">🤖 AI 助手 · 筛选并发</div>', unsafe_allow_html=True)
+    _cur_sw = int((getattr(app_config, "agent", None) and app_config.agent.screen_fetch_workers) or 1)
+    _cur_sw = max(1, min(16, _cur_sw))
+    _new_sw = st.number_input(
+        "🔢 AI 助手「智能筛选 / 研报」拉行情的并发数",
+        min_value=1, max_value=16, step=1, value=_cur_sw,
+        key="agent_screen_workers",
+        help="智能筛选与可下载研报在拉取全池行情时的并发线程数。默认 1（串行，最稳）。"
+             "若你的环境并行拉取稳定（进程不崩），可调大以显著加速；"
+             "部分环境并行会触发原生崩溃，请勿在该环境调高。改动即时对下次筛选生效。",
+    )
+    if int(_new_sw) != _cur_sw:
+        app_config.agent.screen_fetch_workers = int(_new_sw)
+        save_agent_state(int(_new_sw))
+        st.success(f"✅ 已保存：筛选并发数 = {int(_new_sw)}（下次筛选即时生效）")
+        st.rerun()
 
     st.markdown('<div class="section-title">🚀 一键训练优化</div>', unsafe_allow_html=True)
     st.info("💡 Optuna TPE（智能贝叶斯搜索）+ SHAP 自动筛选最有价值的特征 Top 60 + SMOTE 过采样。"
@@ -2895,12 +3302,17 @@ elif page == "⚙️ 设置":
 
     evo_summary = evolution.get_summary()
 
+    _ens_on = getattr(app_config.ml, "use_ensemble", False)
     e1, e2, e3 = st.columns(3)
     with e1:
         st.metric(
             "当前模型",
-            "XGBoost（单模型）",
-            help="项目已统一为单模型，不再做多模型加权",
+            "XGBoost + 集成" if _ens_on else "XGBoost（单模型）",
+            help=("主模型固定为 XGBoost（models/xgboost_model.pkl）。"
+                  + ("当前另有 alpha / LSTM 两条腿参与加权融合，"
+                     "可由 config.ml.use_ensemble 关闭。"
+                     if _ens_on else
+                     "config.ml.use_ensemble 已关闭，不做多模型加权。")),
         )
     with e2:
         st.metric(

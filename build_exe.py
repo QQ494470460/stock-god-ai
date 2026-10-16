@@ -100,6 +100,13 @@ HIDDEN_PKGS = [
 EXCLUDE_PKGS = {
     "torch", "tensorflow", "notebook", "IPython",
     "pytest", "hypothesis", "dask", "langchain",
+    # xtquant：券商 miniQMT 的原生交易库（34MB wheel，自带 .pyd/DLL）。
+    # 收进 PyInstaller 包会在 find_binary_dependencies 的隔离子进程里触发
+    # 访问冲突（0xC0000005）导致打包失败；且它本就依赖本机 QMT 客户端，
+    # 打包进 exe 意义不大。改为「外挂加载」：
+    #   把 xtquant 文件夹放到 exe 同级 libs/ 下即可启用实盘
+    #   （由 config/settings.py 的 _extend_sys_path_for_external_libs 注入 sys.path）
+    "xtquant",
 }
 
 
@@ -171,6 +178,41 @@ def make_icon() -> Path | None:
     return None
 
 
+# 打包后 CONFIG_DIR = <exe 同级>/config/，与源码 config/ 是**两套独立目录**。
+# settings.py / trading_guard.yaml / watchlist.json 已在包内
+# （后两者由 settings._seed_external_config 在首启时播种到外挂目录）。
+# 但下面这些「用户数据」不在包里，必须由构建脚本搬过去：
+#   .salt                 密钥盐 —— 没有它 broker_accounts.enc 解不开
+#   broker_accounts.enc   券商账号（密文）
+#   deepseek.yaml         LLM 接口配置（含 api_key）
+#   broker.yaml.template  券商配置模板
+# 不搬的话，用户切到 exe 后会发现「账号没了 / AI 功能没了」——曾真实踩坑。
+#
+# 安全边界：只拷到 exe 同级的**外挂**目录（本机文件），**绝不**打进 exe。
+# 并且只补缺失项，永不覆盖用户在 exe 里改过的版本。
+# ⚠️ 刻意排除 settings.py：外挂 config/ 若也放一份，可能遮蔽包内模块。
+RUNTIME_CFG_FILES = (".salt", "broker_accounts.enc", "deepseek.yaml",
+                     "broker.yaml.template")
+
+
+def _sync_runtime_config(target: Path) -> list[str]:
+    """把源码 config/ 里的运行期用户配置补到 <target>/config/。
+
+    返回本次实际拷贝的文件名列表（已存在的不动）。
+    """
+    cfg_src = ROOT / "config"
+    cfg_dst = target / "config"
+    cfg_dst.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for name in RUNTIME_CFG_FILES:
+        src = cfg_src / name
+        dst = cfg_dst / name
+        if src.is_file() and not dst.exists():
+            shutil.copy2(src, dst)
+            copied.append(name)
+    return copied
+
+
 def build(with_data: bool, clean: bool) -> int:
     # 不做任何 rmtree：dist/ 里有 8335 个外挂数据文件、build/ 里有上次产物，
     # 批量删除会被守卫拦截导致打包失败。构建一律走"新暂存目录 + 增量同步"。
@@ -191,6 +233,9 @@ def build(with_data: bool, clean: bool) -> int:
         "--add-data", f"{ROOT / 'src'};src",
         "--add-data", f"{ROOT / 'config' / 'settings.py'};config",
         "--add-data", f"{ROOT / 'config' / 'watchlist.json'};config",
+        # 风控配置模板：打进包后由 settings.py 在首次运行时拷到「exe 同级 config/」，
+        # 用户改风控参数（回撤线/单票上限/下单频率等）无需重新打包。
+        "--add-data", f"{ROOT / 'config' / 'trading_guard.yaml'};config",
         "--add-data", f"{ROOT / 'scripts'};scripts",
         # 依赖库动态资源：下方按导入闭包自动收集（--collect-all / --collect-data /
         # --add-data），不再在此硬编码。
@@ -549,7 +594,14 @@ def build(with_data: bool, clean: bool) -> int:
         d_mb = sum(f.stat().st_size for f in data_dst.rglob("*") if f.is_file()) / 1024 / 1024
         log(f"✅ data 已就位 ({d_mb:.0f} MB, {time.time() - t1:.0f}s)")
     else:
-        log("ℹ️  未拷贝 data/（用户选择不含数据），首次使用会自动联网下载")
+        log("ℹ️  未拷贝 data/（用户选择不含数据），首次使用会自动下载")
+
+    # ---- 同步「运行期配置」到外挂 config/ ----------------------------------
+    copied_cfg = _sync_runtime_config(target)
+    if copied_cfg:
+        log(f"✅ 运行期配置已同步到 config/: {', '.join(copied_cfg)}")
+    else:
+        log("ℹ️  config/ 运行期配置已是最新（跳过，不覆盖用户改动）")
 
     # 快捷启动方式说明
     (target / "使用说明.txt").write_text(
@@ -572,9 +624,28 @@ def build(with_data: bool, clean: bool) -> int:
 
 目录说明
 --------
-  data/    历史行情数据（首次使用会自动下载）
+  data/    历史行情数据、交易计划、闭环日报、风控状态（首次使用会自动下载）
   models/  AI 模型文件（请勿删除）
+  config/  外挂配置（改完即生效，重建 exe 不会丢）
+             trading_guard.yaml   风控参数
+             broker_accounts.enc  券商账号（密文）
+             .salt                密钥盐 —— 与上者配对，删了就解不开账号
+             deepseek.yaml        AI 对话接口配置
+  libs/    外挂第三方库（可选，默认不存在）
+           —— 想用【实盘自动交易】需把 xtquant 文件夹放到这里：
+              libs/xtquant/...
+              获取方式：pip download xtquant，解压出 xtquant 目录即可
   logs/    运行日志
+
+风控参数怎么调
+--------------
+  编辑 config/trading_guard.yaml，可改：
+    max_portfolio_drawdown_pct  组合回撤熔断线(%)
+    max_daily_loss_pct          单日最大亏损比例(%)
+    max_single_position_pct     单票最大仓位占比
+    max_positions               最大持仓只数
+    max_orders_per_minute       每分钟最大委托数
+  改完保存即可，无需重启系统。
 
 数据说明
 --------

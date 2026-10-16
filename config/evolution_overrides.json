@@ -1,0 +1,7 @@
+{
+  "_comment": "由「自我进化」自动维护。删除本文件即恢复全部默认参数。",
+  "_updated_at": "2026-10-14T16:47:44",
+  "overrides": {
+    "ml.active_version": "production_metrics"
+  }
+}

@@ -32,6 +32,18 @@ except Exception:  # noqa: BLE001
     LLMFeatureProvider = None
     LLMFeatureConfig = None
 
+# 模型注册中心：只读扫描 + 「该用哪个」的裁决（受人工批准名单约束）
+try:
+    from src.models.model_registry import (
+        scan_models, best_loadable, best_overall, active_status, resolve_active_path,
+    )
+except Exception:  # noqa: BLE001
+    scan_models = None
+    best_loadable = None
+    best_overall = None
+    active_status = None
+    resolve_active_path = None
+
 
 @dataclass
 class StockPrediction:
@@ -95,6 +107,9 @@ class Predictor:
         # 覆盖层对 predict_batch 产出的 score 做纯加性微调，绝不重训 xgboost。
         self.llm_provider = None
 
+        # 超级集成（懒加载；use_ensemble 开启且有可用子模型时才生效）
+        self._ensemble = None
+
     @property
     def trainer(self):
         """按需实例化 MLTrainer（首次访问才会 import sklearn）"""
@@ -147,6 +162,32 @@ class Predictor:
             self._load_models()
             self._models_loaded = True
 
+    def _log_model_resolution(self):
+        """把「注册表裁决」与「实际加载的文件」并排记一条日志。
+
+        为什么要专门记这件事：加载路径目前是**硬编码**的 ——
+        ``trainer.load_model("xgboost")`` 把名字拼成 ``xgboost_model.pkl``。
+        于是注册表里那个「可部署最优」，以及 ``ml.active_version`` 那个「钉子」，
+        都**不影响**实际加载哪个文件：它们是展示层与审计层，不是加载层。
+
+        不把这句话写进日志，用户会看着「可部署最优：alpha RankIC=+0.1204」
+        而以为系统跑的是 0.1204 的模型，实际跑的是 0.0747 的那个。
+        宁可日志里明说「裁决与加载不一致」，也不要让人对着一行漂亮的指标
+        做出错误的判断。
+        """
+        try:
+            from src.models.model_registry import active_status, resolve_active_path
+
+            logger.info(f"📦 模型裁决：{active_status()}")
+            resolved = Path(resolve_active_path())
+            default = MODEL_DIR / "xgboost_model.pkl"
+            if resolved != default:
+                logger.warning(
+                    f"⚠️ 裁决指向 {resolved.name}，但当前加载路径仍是硬编码的 "
+                    f"{default.name} —— 版本切换尚未接通，实际不会被加载")
+        except Exception as e:  # noqa: BLE001 - 只是日志，绝不能影响加载
+            logger.debug(f"模型裁决日志跳过: {e}")
+
     def _load_models(self):
         """加载已训练模型（当前只有 xgboost）。
 
@@ -155,6 +196,7 @@ class Predictor:
         申请同一把锁。普通 Lock 不可重入，会直接死锁。
         """
         try:
+            self._log_model_resolution()
             self._xgb_model = self.trainer.load_model("xgboost")
             if self._xgb_model is not None:
                 logger.info("✅ XGBoost模型已加载")
@@ -195,7 +237,95 @@ class Predictor:
             logger.info("✅ 模型热重载完成")
         else:
             logger.warning("⚠️ 模型热重载失败，可能训练尚未完成")
+
+    # ---------- 模型注册中心集成 ----------
+
+    def active_model_info(self):
+        """返回当前运行模型在注册中心里的登记信息（含样本外 RankIC）"""
+        if scan_models is None:
+            return None
+        try:
+            infos = scan_models(self.model_dir)
+            # 主流 predictor 管线加载的就是 xgboost 主模型
+            for m in infos:
+                if m.key == "xgboost":
+                    return m
+            return infos[0] if infos else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"active_model_info 失败: {e}")
+            return None
+
+    def model_report(self) -> str:
+        """输出「当前模型 + 全局最优 + 可部署最优」的对比报告"""
+        if scan_models is None:
+            return "（模型注册中心不可用）"
+        lines = ["📦 模型概览（样本外 RankIC）", ""]
+        active = self.active_model_info()
+        if active:
+            ric = f"{active.rank_ic:+.4f}" if active.rank_ic == active.rank_ic else "n/a"
+            lines.append(f"当前运行：{active.display_name} — RankIC={ric}")
+        bl = best_loadable(self.model_dir)
+        if bl and (not active or bl.key != active.key):
+            lines.append(f"可部署最优：{bl.display_name} — RankIC={bl.rank_ic:+.4f}")
+        bo = best_overall(self.model_dir)
+        if bo:
+            lines.append(f"全局最优（含实验）：{bo.display_name} — RankIC={bo.rank_ic:+.4f}")
+            if not bo.loadable:
+                lines.append(f"  ⚠️ {bo.note}")
+        if active_status is not None:
+            lines.append("")
+            lines.append(f"裁决：{active_status(self.model_dir)}")
+        lines.append("")
+        lines.append("⚠️ 注意：注册表的排序与裁决目前**不改变**实际加载的文件 —— "
+                     "加载路径硬编码为 models/xgboost_model.pkl。"
+                     "上面的「可部署最优」只能说明「如果接通了，会选谁」。")
+        return "\n".join(lines)
+
+    def reload_best(self):
+        """重载「可部署最优」模型（当前等于主 xgboost 模型，未来训练出更优模型后自动切换）"""
+        if best_loadable is not None:
+            try:
+                best = best_loadable(self.model_dir)
+                if best and best.model_path and best.model_path.exists():
+                    logger.info(f"🏆 注册中心选出可部署最优模型: {best.display_name} (RankIC={best.rank_ic:+.4f})")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"reload_best 选优失败，回退默认: {e}")
+        # 实际加载逻辑仍由 trainer.load_model 完成（当前即 xgboost_model.pkl）
+        self.reload()
     
+    # ---------- 超级集成 ----------
+
+    def _get_ensemble(self):
+        """懒构建超级集成（XGBoost + Alpha + LSTM）；未启用/无可用子模型则返回 None。
+
+        只在 ml.use_ensemble 为真时构建；任一子模型缺失由 EnsemblePredictor
+        的 available 机制自动降级，绝不会因某一腿缺失而影响主模型。
+        """
+        if not getattr(app_config.ml, "use_ensemble", False):
+            return None
+        if self._ensemble is None:
+            try:
+                from src.models.ensemble import (
+                    EnsemblePredictor, AlphaSubPredictor, LSTMSubPredictor,
+                )
+                w = getattr(app_config.ml, "ensemble_weights", {}) or {}
+                ep = EnsemblePredictor(self)
+                ep.add_sub(AlphaSubPredictor(), weight=w.get("alpha_xgboost", 1.0))
+                ep.add_sub(LSTMSubPredictor(), weight=w.get("lstm", 0.8))
+                self._ensemble = ep
+                logger.info("🧩 超级集成已构建")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"超级集成构建失败，回退单模型: {e}")
+                self._ensemble = None
+        return self._ensemble
+
+    def ensemble_report(self) -> str:
+        """返回超级集成各腿可用性与权重的可读报告。"""
+        ep = self._get_ensemble()
+        if ep is None:
+            return "🧩 超级集成：未启用（ml.use_ensemble=False）"
+        return ep.summary()
+
     def _enable_llm(self, mock: bool = False) -> None:
         """按需启用 LLM 定性叠加覆盖层（纯加性 score 微调，绝不重训 xgboost）。
 
@@ -445,18 +575,26 @@ class Predictor:
         stock_data: Dict[str, pd.DataFrame],
         stock_names: Dict[str, str] = None
     ) -> List[StockPrediction]:
-        """批量预测多只股票"""
-        predictions = []
-        
-        for code, df in stock_data.items():
-            if len(df) < 60:  # 至少需要60条数据
-                continue
-            try:
-                name = stock_names.get(code, code) if stock_names else code
-                pred = self.predict_single(df, code, name)
-                predictions.append(pred)
-            except Exception as e:
-                logger.warning(f"预测 {code} 失败: {e}")
+        """批量预测多只股票（默认走超级集成；无可用子模型时回退单模型）"""
+        # 过滤数据不足的股票
+        valid = {c: df for c, df in stock_data.items() if len(df) >= 60}
+
+        predictions: List[StockPrediction] = []
+        ep = self._get_ensemble()
+        if ep is not None and ep._available_subs():
+            blended = ep.predict_batch(valid)
+            predictions = list(blended.values())
+            for p in predictions:
+                p.name = stock_names.get(p.code, p.code) if stock_names else p.code
+            logger.info(f"🧩 超级集成预测完成: {len(predictions)} 只")
+        else:
+            for code, df in valid.items():
+                try:
+                    name = stock_names.get(code, code) if stock_names else code
+                    pred = self.predict_single(df, code, name)
+                    predictions.append(pred)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"预测 {code} 失败: {e}")
         
         # LLM 定性叠加覆盖层（默认 self.llm_provider is None → 完全不动 score）
         if self.llm_provider is not None:

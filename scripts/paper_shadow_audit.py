@@ -636,12 +636,38 @@ def cmd_live_ic(args) -> int:
         print("⚠️ 无可用行情数据，跳过 live-ic")
         return 0
 
-    d = min(last_dates.values())  # 共同可评分日
-    # 该评分日的后 5 个交易日（用交易日历推进）
     from src.trading.calendar import next_trading_day
+    horizon = int((args.horizon if hasattr(args, "horizon") else 5))
+
+    # 评分日取「最新可评分日」：需满足其后 horizon 个交易日的前向收益已可实现。
+    # 缓存最新日的前向窗口往往落在未来，若直接取最新日则永远算不出 RankIC；
+    # 这里回看，使 d 与 d+horizon 都落在已缓存行情内，从而能用已实现前向收益计算 RankIC。
+    def _latest_score_date(ser):
+        idx = set(ser.index)
+        dates = list(ser.index)
+        for i in range(len(dates) - 1, -1, -1):
+            t = dates[i]
+            t5 = t
+            ok = True
+            for _ in range(horizon):
+                t5 = pd.Timestamp(next_trading_day(t5, include_today=False))
+                if t5 not in idx:
+                    ok = False
+                    break
+            if ok:
+                return t
+        return None
+
+    latest = {c: _latest_score_date(ser) for c, ser in closes.items()}
+    latest = {c: d0 for c, d0 in latest.items() if d0 is not None}
+    if not latest:
+        print("⚠️ 无可用评分日（数据不足以覆盖前向窗口），跳过 live-ic")
+        return 0
+    # 取所有股票均可评分的最近日期（个别不含该日的股票会在后续循环被跳过）
+    d = min(latest.values())
     d5 = d
-    for _ in range(int((args.horizon if hasattr(args, "horizon") else 5))):
-        d5 = next_trading_day(d5, include_today=False)
+    for _ in range(horizon):
+        d5 = pd.Timestamp(next_trading_day(d5, include_today=False))
 
     scores, fwd = [], []
     for code in codes:

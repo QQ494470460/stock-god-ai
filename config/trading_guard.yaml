@@ -1,0 +1,39 @@
+# =============================================================================
+# 选股神AI · 交易安全与风控中枢配置 (Trading Guard)
+# -----------------------------------------------------------------------------
+# 设计原则：默认安全。系统重启后默认回到 PAPER（纸交易），
+# 进入实盘(LIVE/LIVE_PENDING) 必须人工两步确认（arm_live → confirm_arm）。
+# 修改本文件后无需重打包源码即可生效（运行时读取）。
+# =============================================================================
+
+# ---- 武装模式 ----
+default_mode: paper                 # 默认纸交易，绝不默认实盘
+require_live_confirmation: true     # 进入实盘必须两步确认令牌
+
+# ---- 组合级风控（熔断）----
+max_portfolio_drawdown_pct: 8.0     # 峰谷最大回撤熔断线(%) —— 触及即全局停手
+max_daily_loss_pct: 3.0             # 单日最大亏损比例(%)
+max_daily_loss_abs: 5000.0          # 单日最大亏损金额(元)
+
+# ---- 持仓约束 ----
+max_positions: 20                   # 最大持仓只数
+max_single_position_pct: 0.30       # 单票最大仓位(占总资产比例)
+max_sector_pct: 0.50                # 单一行业最大集中度(占总资产比例)
+
+# ---- 下单频率 ----
+min_order_interval_sec: 2.0          # 两笔委托最小间隔(秒)
+max_orders_per_minute: 10           # 每分钟最大委托数
+
+# ---- 仓位规模 ----
+# 可选: fixed_fractional | volatility_target | kelly
+sizing_method: fixed_fractional
+base_risk_fraction: 0.02            # 每笔风险敞口占净值比例(固定比例法)
+volatility_target_pct: 0.15          # 年化波动率目标(波动率目标法)
+kelly_cap: 0.10                      # Kelly 仓位上限(半 Kelly 后再封顶)
+
+# ---- 人工确认 ----
+confirm_timeout_sec: 300.0          # 待确认委托超时(秒)，超时自动撤销
+
+# ---- 持久化路径（留空则用 data/ 下默认文件名）----
+state_file: ""                       # 武装状态(默认 data/trading_guard_state.json)
+journal_file: ""                     # 成交日志(默认 data/trading_journal.jsonl)

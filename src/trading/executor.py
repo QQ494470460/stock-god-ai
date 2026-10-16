@@ -93,22 +93,35 @@ class TradeExecutor:
     
     # ========== 止盈止损检查 ==========
     
-    def check_stop_conditions(self) -> List[dict]:
+    def check_stop_conditions(
+        self,
+        positions: Optional[List[Position]] = None,
+        prices: Optional[Dict[str, float]] = None,
+    ) -> List[dict]:
         """检查所有持仓是否需要止损/止盈/移动止损
+        
+        Args:
+            positions: 注入持仓列表（None 则向券商查询）。闭环引擎传入
+                已同步的持仓 + 行情，使纸交易/离线环境也能跑同一套止损逻辑。
+            prices: 注入 code → 最新价（None 则逐只向券商取 tick）。
         
         Returns:
             [{code, reason, action, pnl_pct}, ...]
         """
         alerts = []
-        positions = self.broker.query_positions()
+        if positions is None:
+            positions = self.broker.query_positions()
         
         for pos in positions:
             if pos.quantity <= 0:
                 continue
             
-            # 获取实时行情
-            tick = self.broker.get_tick(pos.code)
-            current_price = tick.last_price if tick and tick.last_price > 0 else pos.current_price
+            # 获取实时行情（优先用注入价，避免重复请求）
+            if prices is not None:
+                current_price = float(prices.get(pos.code) or 0) or pos.current_price
+            else:
+                tick = self.broker.get_tick(pos.code)
+                current_price = tick.last_price if tick and tick.last_price > 0 else pos.current_price
             
             # 计算盈亏比
             pnl_pct = (current_price / pos.avg_cost - 1) * 100 if pos.avg_cost > 0 else 0
@@ -195,6 +208,7 @@ class TradeExecutor:
         agreement: float,
         side: OrderSide,
         max_amount: Optional[float] = None,
+        risk_exit: bool = False,
     ) -> Tuple[bool, str, Optional[Order]]:
         """基于AI信号执行交易
         
@@ -205,6 +219,8 @@ class TradeExecutor:
             agreement: XGB/LGB一致性 (0-1)
             side: 买卖方向
             max_amount: 最大买入金额（元），None则自动计算
+            risk_exit: 风控性离场（止盈止损/调仓清仓）。为 True 时卖出不受
+                「AI评分仍高不卖」约束，让止损纪律优先于模型观点。
         
         Returns:
             (success, message, order)
@@ -220,7 +236,7 @@ class TradeExecutor:
         # 3. AI信号过滤
         if side == OrderSide.BUY and ai_score < self.config.min_ai_score_buy:
             return False, f"📉 AI评分不足: {ai_score:.0f} < {self.config.min_ai_score_buy}", None
-        if side == OrderSide.SELL and ai_score > self.config.max_ai_score_sell:
+        if side == OrderSide.SELL and not risk_exit and ai_score > self.config.max_ai_score_sell:
             return False, f"📈 AI评分仍高: {ai_score:.0f} > {self.config.max_ai_score_sell}，暂不建议卖出", None
         
         # 4. 模型一致性检查

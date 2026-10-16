@@ -16,7 +16,6 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 
 # 性能优化：akshare 顶层 import 约 1.9 秒，而本模块的主数据源是同花顺 HTTP，
@@ -261,10 +260,13 @@ class DataFetcher:
         adjust: str = "qfq"  # 前复权
     ) -> pd.DataFrame:
         """获取单只股票日K线数据"""
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
-        
-        # 统一日期格式
+        # 统一日期格式：空串/None 一律视为"不限"，否则与 datetime 列比较会得到全 False 空表
+        # （空表再取 .max() 就是 NaT，后续做日期减法会 TypeError —— 曾让 AI 实时监控整页崩掉）
+        if end_date is None or not str(end_date).strip():
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None or not str(start_date).strip():
+            start_date = "2015-01-01"
+
         start = start_date.replace("-", "")
         end = end_date.replace("-", "")
         cache_key = f"{code}_{adjust}_{start}_{end}"
@@ -284,14 +286,19 @@ class DataFetcher:
                 # 交易日判断：如果今天是工作日，且缓存最新日期 < 今天，需要刷新
                 today_dt = datetime.now()
                 today_date = today_dt.date()
-                latest_ts = cached["date"].max()
+                latest_ts = cached["date"].max() if len(cached) > 0 else pd.NaT
                 latest_date = latest_ts.date() if hasattr(latest_ts, 'date') else latest_ts
-                # 超过 1 个自然日就算过期（确保每天自动刷新）
-                is_stale = (today_date - latest_date).days > 1
+                # 区间内无数据 或 最新日期为 NaT：无法判新鲜度，按过期处理去重新拉取
+                if len(cached) == 0 or pd.isna(latest_ts) or pd.isna(latest_date):
+                    is_stale = True
+                else:
+                    # 超过 1 个自然日就算过期（确保每天自动刷新）
+                    is_stale = (today_date - latest_date).days > 1
                 # 同时判断：如果今天是交易日(周一至周五) + 最新数据不是今天 + 当前已过收盘时间(15:00)，立即刷新
                 is_trading_day = today_dt.weekday() < 5
                 is_after_close = today_dt.hour >= 15
-                if is_trading_day and is_after_close and latest_date < today_date:
+                latest_ok = not (pd.isna(latest_ts) or pd.isna(latest_date))
+                if is_trading_day and is_after_close and latest_ok and latest_date < today_date:
                     is_stale = True
                     logger.info(f"{code} 交易日收盘后缓存过期 (最新: {latest_date} 今天: {today_date})，重新拉取…")
                 if len(cached) > 50 and not is_stale:
@@ -485,39 +492,55 @@ class DataFetcher:
         max_workers: int = 8,
         progress_callback=None,
     ) -> Dict[str, pd.DataFrame]:
-        """批量获取日线数据（多线程）
+        """批量获取日线数据（进程池并发，规避 V8 多线程崩溃）
 
         ``progress_callback(done, total, ok)`` 可用于向前端回传进度。
+
+        ⚠️ 为什么用进程池而不是线程池：
+        akshare 的部分接口（如新浪日线 stock_zh_a_daily）内部走 py_mini_racer / V8
+        做 JS 解密，而 V8 的 PartitionAlloc 内存池初始化不是线程安全的。
+        多线程并发调用会在某些环境触发原生 abort
+        （``Check failed: !IsConfigurablePoolInitialized``），直接杀死整个进程、
+        连带拖垮看板，且不可被 try/except 捕获。
+        改用 spawn 进程池后，每个 worker 进程各自持有一个 V8 isolate、
+        单线程内串行调用，不再有并发初始化竞争 —— 彻底规避该崩溃，
+        同时保留真正的并发提速。
         """
+        if not codes:
+            return {}
+        ed = end_date or datetime.now().strftime("%Y-%m-%d")
+        if int(max_workers) <= 1:
+            # 串行兜底（最稳，沙箱默认）
+            return self._batch_serial(codes, start_date, ed, progress_callback, min_rows=1)
+        try:
+            return _mp_batch_fetch(
+                codes, start_date, ed, max_workers, progress_callback, min_rows=1
+            )
+        except Exception as e:  # noqa: 进程池起不来时回退串行，保证可用
+            logger.error(f"进程池批量拉取失败，回退串行: {e}")
+            return self._batch_serial(codes, start_date, ed, progress_callback, min_rows=1)
+
+    def _batch_serial(self, codes, start_date, end_date, progress_callback, min_rows=1):
+        """串行兜底：单线程依次拉取，绝对不会触发 V8 并发崩溃。"""
         results: Dict[str, pd.DataFrame] = {}
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.get_daily_kline, code, start_date, end_date): code
-                for code in codes
-            }
-
-            total = len(futures)
-            completed = 0
-            for future in as_completed(futures):
-                code = futures[future]
-                completed += 1
+        total = len(codes)
+        completed = 0
+        for code in codes:
+            try:
+                df = self.get_daily_kline(code, start_date, end_date)
+                if df is not None and len(df) >= min_rows:
+                    results[code] = df
+            except Exception as e:
+                logger.error(f"获取 {code} 失败: {e}")
+            completed += 1
+            if completed % 50 == 0:
+                logger.info(f"进度: {completed}/{total}")
+            if progress_callback and (completed % 5 == 0 or completed == total):
                 try:
-                    df = future.result()
-                    if len(df) > 0:
-                        results[code] = df
-                except Exception as e:
-                    logger.error(f"获取 {code} 失败: {e}")
-
-                if completed % 50 == 0:
-                    logger.info(f"进度: {completed}/{total}")
-                if progress_callback and (completed % 5 == 0 or completed == total):
-                    try:
-                        progress_callback(completed, total, len(results))
-                    except Exception:
-                        pass  # 回调异常不影响主流程
-
-        logger.info(f"批量获取完成: {len(results)}/{total} 只有效")
+                    progress_callback(completed, total, len(results))
+                except Exception:
+                    pass  # 回调异常不影响主流程
+        logger.info(f"串行批量获取完成: {len(results)}/{total} 只有效")
         return results
     
     # ========== 基本面数据 ==========
@@ -1037,27 +1060,17 @@ class DataFetcher:
 
     def batch_get_daily(self, codes: List[str], start_date: str = "2018-01-01",
                          end_date: Optional[str] = None, max_workers: int = 8) -> Dict[str, pd.DataFrame]:
-        """并行批量获取日线数据，8线程并发"""
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
-        
-        results = {}
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        logger.info(f"并行获取 {len(codes)} 只股票日线 (max_workers={max_workers})…")
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(self.get_daily_kline, c, start_date, end_date): c for c in codes}
-            for f in as_completed(futures):
-                code = futures[f]
-                try:
-                    df = f.result()
-                    if df is not None and len(df) >= 60:
-                        results[code] = df
-                except Exception as e:
-                    logger.warning(f"{code} 获取失败: {e}")
-        
-        logger.info(f"并行获取完成: {len(results)}/{len(codes)} 只有效")
-        return results
+        """批量获取日线数据（进程池并发，规避 V8 多线程崩溃；要求 >=60 行）"""
+        if not codes:
+            return {}
+        ed = end_date or datetime.now().strftime("%Y%m%d")
+        if int(max_workers) <= 1:
+            return self._batch_serial(codes, start_date, ed, None, min_rows=60)
+        try:
+            return _mp_batch_fetch(codes, start_date, ed, max_workers, None, min_rows=60)
+        except Exception as e:  # noqa
+            logger.error(f"batch_get_daily 进程池失败，回退串行: {e}")
+            return self._batch_serial(codes, start_date, ed, None, min_rows=60)
     
     def clear_cache(self):
         """清理缓存"""
@@ -1065,6 +1078,66 @@ class DataFetcher:
         self._daily_cache = {}
         self._fail_codes.clear()  # 同时清负缓存，允许重试曾失败的代码
         logger.info("缓存已清理")
+
+
+# ============================================================================
+# 进程池批量拉取（模块级，规避 py_mini_racer / V8 多线程原生崩溃）
+# ----------------------------------------------------------------------------
+# 根因：akshare 部分接口（如新浪日线 stock_zh_a_daily）内部用 V8(py_mini_racer)
+#       做 JS 解密，V8 的 PartitionAlloc 内存池初始化不是线程安全的。
+#       多线程并发 -> 原生 abort (Check failed: !IsConfigurablePoolInitialized)
+#       -> 杀死整个进程、连带拖垮看板，且不可 try/except 捕获。
+# 解法：spawn 进程池，每个 worker 进程各自持有一个 V8 isolate、单线程串行调用，
+#       不存在并发初始化竞争；同时保留真正的并发提速。
+# 内存上限：akshare 单进程很吃内存，最多 8 个 worker 进程，避免 OOM。
+# ============================================================================
+_MP_MAX_PROC = 8
+_MP_FETCHER = None
+
+
+def _mp_get_fetcher() -> "DataFetcher":
+    """每个 worker 进程内懒加载一个 DataFetcher 单例（复用缓存目录与负缓存）。"""
+    global _MP_FETCHER
+    if _MP_FETCHER is None:
+        _MP_FETCHER = DataFetcher()
+    return _MP_FETCHER
+
+
+def _mp_fetch_one(task):
+    """进程池 worker：拉取单只股票日线，异常不影响整体。"""
+    code, start_date, end_date, adjust = task
+    try:
+        df = _mp_get_fetcher().get_daily_kline(code, start_date, end_date, adjust)
+        return code, (df if df is not None else pd.DataFrame())
+    except Exception as e:  # noqa
+        logger.error(f"[mp] {code} 拉取失败: {e}")
+        return code, pd.DataFrame()
+
+
+def _mp_batch_fetch(codes, start_date, end_date, max_workers, progress_callback=None, min_rows=1):
+    """用 spawn 进程池并发拉取，返回 {code: df}。"""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    n_proc = max(1, min(int(max_workers), _MP_MAX_PROC))
+    tasks = [(c, start_date, end_date, "qfq") for c in codes]
+
+    results: Dict[str, pd.DataFrame] = {}
+    total = len(tasks)
+    done = 0
+    with ctx.Pool(n_proc) as pool:
+        for code, df in pool.imap_unordered(_mp_fetch_one, tasks):
+            done += 1
+            if df is not None and len(df) >= min_rows:
+                results[code] = df
+            if progress_callback and (done % 5 == 0 or done == total):
+                try:
+                    progress_callback(done, total, len(results))
+                except Exception:
+                    pass  # 回调异常不影响主流程
+
+    logger.info(f"进程池批量获取完成: {len(results)}/{total} 只有效 (n_proc={n_proc})")
+    return results
 
 
 # 全局单例

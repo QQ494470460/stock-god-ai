@@ -1,0 +1,685 @@
+# -*- coding: utf-8 -*-
+"""
+闭环交易引擎（loop）单元测试
+============================
+覆盖：状态机推进、非交易时段待命、熔断冻结、预演无副作用、
+演练模式(dry_run)不下单、PAPER 模式真实记账、收盘结算写报告、
+未传 guard 时自动构建安全中枢（绝不裸奔下单）。
+零网络、零真实资金（纸账户落盘到 tmp）。
+"""
+import sys
+import copy
+from datetime import datetime, date, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+for p in (str(ROOT), str(ROOT / "src")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import pytest
+
+from src.trading.broker import (
+    BrokerAPI, Order, OrderSide, OrderType, OrderStatus,
+    Position, AccountInfo, TickData,
+)
+from src.trading.loop import TradingLoop, LoopConfig, LoopState, TickReport
+from src.trading.trade_plan import TradePlan, PlanTarget, save_trade_plan
+from src.trading.guard import build_supervisor, TradingMode
+
+DAY = "2026-10-15"
+
+
+# ======================================================================
+# Fake 依赖
+# ======================================================================
+
+class FakeBroker(BrokerAPI):
+    """内存券商：固定行情、记录下单"""
+
+    def __init__(self, total=1_000_000.0, cash=400_000.0, price=10.0):
+        super().__init__()
+        self._connected = True
+        self.total_asset = total
+        self.available_cash = cash
+        self.price = price
+        self.orders = []
+        self.positions = {}          # code -> (qty, cost)
+
+    def connect(self, **kw): self._connected = True; return True
+    def disconnect(self): self._connected = False
+
+    def query_account(self):
+        mv = sum(q * self.price for q, _ in self.positions.values())
+        return AccountInfo(
+            account_id="FAKE", total_asset=self.total_asset,
+            available_cash=self.available_cash, frozen_cash=0.0,
+            market_value=mv, total_pnl=0.0, today_pnl=0.0,
+        )
+
+    def query_positions(self):
+        return [Position(
+            code=c, name=c, quantity=q, available=q,
+            avg_cost=cost, current_price=self.price, market_value=q * self.price,
+            pnl=0.0, pnl_pct=0.0, today_quantity=0,
+        ) for c, (q, cost) in self.positions.items()]
+
+    def query_orders(self, status_filter="all"): return []
+
+    def place_order(self, code, side, order_type, price, quantity, strategy_tag=""):
+        o = Order(order_id=f"O{len(self.orders)+1}", code=code, side=side,
+                  order_type=order_type, price=price, quantity=quantity,
+                  filled_quantity=quantity, status=OrderStatus.FILLED,
+                  strategy_tag=strategy_tag)
+        self.orders.append(o)
+        return o
+
+    def cancel_order(self, order_id): return True
+    def cancel_all(self): return 0
+
+    def get_tick(self, code):
+        return TickData(code=code, name=code, last_price=self.price, open=self.price,
+                        high=self.price, low=self.price, pre_close=self.price,
+                        volume=100000, amount=1e6,
+                        bid1=self.price - 0.01, ask1=self.price + 0.01)
+
+    def get_broker_name(self): return "FakeBroker"
+    def is_trading_time(self): return True
+
+
+class FakePaper:
+    """极简纸账户：实现 guard PAPER 分支所需接口"""
+
+    def __init__(self, total=1_000_000.0):
+        self.cash = total
+        self.frozen_cash = 0.0
+        self.holdings = {}
+        self.today_pnl = 0.0
+        self._trades = []
+
+    def get_total_asset(self):
+        return self.cash + sum(h["qty"] * h["last"] for h in self.holdings.values())
+
+    def get_total_pnl(self): return 0.0
+
+    def get_positions(self):
+        return [{
+            "code": c, "name": c, "quantity": h["qty"], "available": h["qty"],
+            "today_quantity": 0, "avg_cost": h["cost"], "last_price": h["last"],
+            "market_value": h["qty"] * h["last"], "pnl": 0.0, "pnl_pct": 0.0,
+        } for c, h in self.holdings.items()]
+
+    def get_recent_trades(self, n=50):
+        return self._trades[-n:]
+
+    def mark_to_market(self, prices):
+        for c, p in prices.items():
+            if c in self.holdings:
+                self.holdings[c]["last"] = p
+
+    def buy(self, code, name, price, quantity, strategy="", ai_score=0.0):
+        cost = price * quantity
+        if self.cash < cost:
+            return False, "资金不足", None
+        self.cash -= cost
+        h = self.holdings.setdefault(code, {"qty": 0, "cost": 0.0, "last": price})
+        h["qty"] += quantity
+        h["cost"] = price
+        h["last"] = price
+        rec = _Rec()
+        self._trades.append(rec)
+        return True, "ok", rec
+
+    def sell(self, code, price, quantity, strategy="", ai_score=0.0):
+        h = self.holdings.get(code)
+        if not h or h["qty"] < quantity:
+            return False, "无持仓", None
+        self.cash += price * quantity
+        h["qty"] -= quantity
+        if h["qty"] <= 0:
+            del self.holdings[code]
+        rec = _Rec()
+        self._trades.append(rec)
+        return True, "ok", rec
+
+
+class _Rec:
+    trade_id = "T1"
+
+
+def mk_plan(targets, reserve=0.10):
+    return TradePlan(
+        plan_date=DAY,
+        targets=[PlanTarget(code=c, name=c, score=s, weight=w) for c, s, w in targets],
+        cash_reserve_pct=reserve,
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_production_persistence(monkeypatch, tmp_path):
+    """把本模块会碰到的**全部生产落盘目录**隔离到 tmp —— 绝不污染真实 data/。
+
+    已知两个落盘口，都必须掐掉：
+
+    1. **guard 状态/日志**：``GuardConfig`` 未显式指定 state_file/journal_file 时
+       落到 ``config.settings.DATA_DIR``（真实 data/），一旦触发熔断就会把
+       ``halted=True`` 写进用户真实的风控状态文件。
+    2. **loop 收盘结算报告**：``TradingLoop._settle()`` 往
+       ``Path(DATA_DIR)/"loop_reports"`` 写 ``loop_report_YYYYMMDD.json``。
+       曾踩过 —— 夹具只冻结日历没冻结时钟时，一组用例在收盘后跑到
+       ``tick()`` → ``_settle()``，把 ``FakeBroker`` 的虚拟权益（95 万）
+       当成真实结算写进 ``data/loop_reports/loop_report_20261014.json``，
+       一份看起来完全正常的伪造报告。``_doctor`` 会把它当成真实业绩读。
+
+    ``loop.py`` 里 ``DATA_DIR`` 只有 ``:509`` 一处在用，且是模块级名字查找
+    （不是默认参数绑定），所以改模块属性即可生效。
+    """
+    import src.trading.guard as guardmod
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(guardmod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def force_trading_time(monkeypatch):
+    """把日历**和时钟**都强制为「可下单的交易时段」。
+
+    只改日历是不够的：``_should_settle`` 比的是墙上时钟是否已过 15:00，
+    于是同一份用例在 14:00 跑是通过、在 16:00 跑就必然被判 SETTLED ——
+    这组用例曾整组在收盘后变红，看起来像代码坏了，其实只是天晚了。
+    把时钟一起冻结到 10:00，用例才真正与运行时刻无关。
+    """
+    import src.trading.calendar as cal
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(cal, "market_status", lambda now=None: "早盘交易中")
+    monkeypatch.setattr(cal, "order_allowed", lambda now=None: (True, "早盘交易中"))
+    monkeypatch.setattr(cal, "is_trading_day", lambda d=None: True)
+    monkeypatch.setattr(loopmod, "_now", lambda: datetime(2026, 10, 14, 10, 0, 0))
+    return cal
+
+
+@pytest.fixture
+def force_closed(monkeypatch):
+    """把日历强制为「休市」，时钟冻结在**盘中**时刻。
+
+    时钟刻意停在盘中：这样「不下单」只可能来自休市判定本身，
+    而不是因为恰好跑到收盘之后 —— 否则这个用例就从「验证休市」
+    悄悄退化成「验证现在几点了」。
+    """
+    import src.trading.calendar as cal
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(cal, "market_status", lambda now=None: "休市（非交易日）")
+    monkeypatch.setattr(cal, "order_allowed", lambda now=None: (False, "非交易日"))
+    monkeypatch.setattr(cal, "is_trading_day", lambda d=None: False)
+    monkeypatch.setattr(loopmod, "_now", lambda: datetime(2026, 10, 14, 10, 0, 0))
+    return cal
+
+
+def mk_loop(broker=None, paper=None, cfg=None, guard=None):
+    b = broker or FakeBroker()
+    p = paper if paper is not None else FakePaper()
+    g = guard or build_supervisor(b, paper_account=p)
+    return TradingLoop(b, guard=g, paper_account=p, config=cfg)
+
+
+# ======================================================================
+# 安全默认
+# ======================================================================
+
+def test_auto_builds_paper_guard_when_none_given():
+    """未传 guard 时自动构建，且默认是 PAPER 纸交易 —— 绝不裸奔下单。"""
+    b = FakeBroker()
+    loop = TradingLoop(b, guard=None, paper_account=FakePaper())
+    assert loop.guard is not None
+    assert loop.guard.safety.mode == TradingMode.PAPER
+    assert not loop.guard.safety.is_live()
+
+
+def test_config_defaults_are_conservative():
+    cfg = LoopConfig()
+    assert cfg.enable_rebalance is True
+    assert cfg.enable_stop_orders is True
+    assert cfg.cash_reserve_pct == 0.10
+    assert cfg.weight_cap == 0.30
+    assert cfg.dry_run is False
+
+
+# ======================================================================
+# 状态机 / 时段
+# ======================================================================
+
+def test_initial_state_stopped():
+    loop = mk_loop()
+    assert loop.state == LoopState.STOPPED
+    assert not loop.is_running
+
+
+def test_closed_market_goes_idle_and_does_not_trade(force_closed):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    rep = loop.tick()
+    assert rep.state in (LoopState.IDLE.value, LoopState.PREOPEN.value)
+    assert rep.n_executed == 0
+    assert rep.n_intents == 0
+
+
+def test_trading_time_goes_running(force_trading_time):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    rep = loop.tick()
+    assert rep.state == LoopState.RUNNING.value
+
+
+def test_halted_freezes_everything(force_trading_time):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.guard.kill_switch("测试熔断")
+    rep = loop.tick()
+    assert rep.state == LoopState.HALTED.value
+    assert rep.n_executed == 0
+    assert "熔断" in rep.note
+
+
+# ======================================================================
+# dry_run 演练
+# ======================================================================
+
+def test_dry_run_places_no_order(force_trading_time):
+    b = FakeBroker()
+    loop = mk_loop(broker=b, cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    rep = loop.tick()
+    assert b.orders == []                       # 一张单都没发
+    assert rep.n_intents >= 1                   # 但确实算出了意图
+    assert rep.n_executed >= 1                  # 记为「演练成交」
+
+
+def test_dry_run_does_not_touch_paper_account(force_trading_time):
+    paper = FakePaper()
+    loop = mk_loop(paper=paper, cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.tick()
+    assert paper.holdings == {}                 # 纸账户未被改动
+    assert paper.cash == 1_000_000.0
+
+
+# ======================================================================
+# PAPER 真实记账
+# ======================================================================
+
+def test_paper_mode_actually_buys(force_trading_time):
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    rep = loop.tick()
+    assert rep.n_executed >= 1
+    assert "600519" in paper.holdings            # 纸账户真的持仓了
+    assert paper.cash < 1_000_000.0
+    assert b.orders == []                        # PAPER 模式不打真券商单
+
+
+def test_paper_mode_respects_cash_reserve(force_trading_time):
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.tick()
+    # 纸账户现金不得低于 总资产(约100万) × 10%
+    assert paper.cash >= paper.get_total_asset() * 0.10 - 1000
+
+
+def test_paper_mode_sells_dropped_position(force_trading_time):
+    paper = FakePaper(total=1_000_000.0)
+    paper.cash = 700_000.0
+    paper.holdings["600000"] = {"qty": 30000, "cost": 10.0, "last": 10.0}
+    b = FakeBroker(total=1_000_000.0, cash=700_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])   # 600000 不在计划里
+    loop.tick()
+    assert "600000" not in paper.holdings         # 已清仓
+
+
+# ======================================================================
+# 止盈止损（risk_exit 不被评分过滤拦住）
+# ======================================================================
+
+def test_stop_loss_sells_even_when_score_high(force_trading_time):
+    """止损是纪律性离场：AI 评分再高也必须卖。"""
+    paper = FakePaper(total=1_000_000.0)
+    paper.cash = 900_000.0
+    # 成本 20，现价 10 → 亏 50%，远超 -5% 止损线
+    paper.holdings["600000"] = {"qty": 5000, "cost": 20.0, "last": 10.0}
+    b = FakeBroker(total=1_000_000.0, cash=900_000.0, price=10.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, enable_rebalance=False,
+                                  dry_run=False))
+    loop.plan = mk_plan([])
+    rep = loop.tick()
+    assert rep.n_stops >= 1
+    assert "600000" not in paper.holdings          # 止损已执行
+
+
+def test_stop_orders_can_be_disabled(force_trading_time):
+    paper = FakePaper(total=1_000_000.0)
+    paper.cash = 900_000.0
+    paper.holdings["600000"] = {"qty": 5000, "cost": 20.0, "last": 10.0}
+    b = FakeBroker(total=1_000_000.0, cash=900_000.0, price=10.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, enable_rebalance=False,
+                                  enable_stop_orders=False, dry_run=False))
+    loop.plan = mk_plan([])
+    rep = loop.tick()
+    assert rep.n_stops == 0
+    assert "600000" in paper.holdings
+
+
+# ======================================================================
+# 预演
+# ======================================================================
+
+def test_preview_has_no_side_effects(force_trading_time):
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper, cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    before = copy.deepcopy(paper.holdings)
+    pv = loop.preview()
+    assert paper.holdings == before
+    assert b.orders == []
+    assert pv["plan_summary"]
+    assert pv["guard_mode"] == "paper"
+    assert pv["intent_summary"]
+
+
+# ======================================================================
+# 收盘结算
+# ======================================================================
+
+def test_should_settle_after_close_time(force_trading_time):
+    loop = mk_loop(cfg=LoopConfig(settle_hour=15, settle_minute=5))
+    assert loop._should_settle(datetime(2026, 10, 15, 15, 10)) is True
+    assert loop._should_settle(datetime(2026, 10, 15, 14, 0)) is False
+
+
+def test_should_settle_once_per_day(force_trading_time):
+    loop = mk_loop(cfg=LoopConfig(settle_hour=15, settle_minute=5))
+    assert loop._should_settle(datetime(2026, 10, 15, 15, 10)) is True
+    loop._settled_dates.add(date(2026, 10, 15))
+    assert loop._should_settle(datetime(2026, 10, 15, 15, 20)) is False
+
+
+def test_settle_writes_report(monkeypatch, tmp_path, force_trading_time):
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, notify=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.tick()                                  # 先建仓
+
+    loop._settled_dates.clear()
+    monkeypatch.setattr(loop, "_should_settle", lambda now: True)
+    rep = loop.tick()
+
+    out = tmp_path / "loop_reports"
+    files = list(out.glob("loop_report_*.json"))
+    assert files, "结算报告未生成"
+    import json
+    snap = json.loads(files[0].read_text(encoding="utf-8"))
+    assert snap["equity"] > 0
+    assert "positions" in snap and "trades" in snap
+    assert loop.state == LoopState.SETTLED
+    assert "结算" in rep.note
+
+
+# ======================================================================
+# 线程生命周期
+# ======================================================================
+
+def test_start_stop_thread(force_closed):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, scan_interval_sec=0.05))
+    loop.start(interval_seconds=0.05)
+    assert loop.is_running
+    loop.stop()
+    assert not loop.is_running
+    assert loop.state == LoopState.STOPPED
+
+
+def test_start_twice_is_safe(force_closed):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, scan_interval_sec=0.05))
+    loop.start(0.05)
+    loop.start(0.05)                             # 第二次应被忽略
+    try:
+        assert loop.is_running
+    finally:
+        loop.stop()
+
+
+# ======================================================================
+# 状态快照
+# ======================================================================
+
+def test_get_status_shape(force_closed):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    st = loop.get_status()
+    assert st["state"] == LoopState.STOPPED.value
+    assert st["plan_date"] == DAY
+    assert st["plan_targets"] == 1
+    assert st["guard"]["mode"] == "paper"
+
+
+def test_tick_report_summary_readable(force_closed):
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    rep = loop.tick()
+    txt = rep.summary()
+    assert "状态=" in txt and "净值" in txt
+
+
+# ======================================================================
+# 时钟接缝（回归：这组用例曾整组在收盘后变红）
+# ======================================================================
+
+def test_force_trading_time_also_freezes_the_clock(force_trading_time):
+    """夹具必须把**时钟**也冻住，只改日历是不够的。
+
+    回归背景：``_should_settle`` 比的是墙上时钟是否已过 15:00。
+    夹具原先只改 `calendar`，于是同一份用例 14:00 跑通过、16:00 跑必红 ——
+    看起来像代码坏了，实际只是天晚了。这条断言把「时钟已冻结」钉住，
+    以后谁把这段 monkeypatch 删掉，这里会立刻报出来。
+    """
+    import src.trading.loop as loopmod
+
+    assert loopmod._now() == datetime(2026, 10, 14, 10, 0, 0), \
+        "force_trading_time 没有冻结时钟 —— 这组用例又开始依赖运行时刻了"
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    assert loop._should_settle(loopmod._now()) is False
+
+
+def test_loop_time_source_is_injectable(monkeypatch):
+    """闭环的时间来源必须是可注入的 ``_now()``，而不是散落的 ``datetime.now()``。
+
+    交易闭环是安全关键路径：能给出一个确定的时钟，才有可能把某天的行情
+    原样重放一遍；否则「重放」这件事在结构上就做不到。
+    """
+    import src.trading.loop as loopmod
+
+    monkeypatch.setattr(loopmod, "_now", lambda: datetime(2026, 3, 2, 9, 45, 0))
+    assert loopmod._today() == date(2026, 3, 2)
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    rep = loop.tick()
+    assert rep.at == "09:45:00", "tick 报告的时刻没有走可注入时钟"
+
+
+def test_settle_cannot_write_into_real_data_dir(force_trading_time, tmp_path):
+    """**端到端**验证：一次真实结算 tick 不会在真实 data/loop_reports 留下任何东西。
+
+    这条断言有两半，缺一不可：
+
+    * 前半 —— 结算**确实发生了**（临时目录里生成了报告）。
+      没有这一半，「真实目录没变」可能只是因为结算分支压根没跑，
+      断言变成永真的空话。
+    * 后半 —— 真实 ``data/loop_reports`` 逐字节没变。
+
+    回归背景见 ``isolate_production_persistence`` 夹具的 docstring：
+    曾有一份伪造的 ``loop_report_20261014.json`` 就这样落进了真实目录，
+    还被 ``--doctor`` 当成真实业绩读。
+    """
+    import src.trading.loop as loopmod
+    from config.settings import DATA_DIR as real_data_dir
+
+    real_out = Path(real_data_dir) / "loop_reports"
+    before = sorted(p.name for p in real_out.glob("loop_report_*")) if real_out.exists() else []
+
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, notify=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.tick()                                   # 建仓
+    loop._settled_dates.clear()
+    # 恒真：强制走结算分支，使这条用例与运行时刻彻底解耦
+    # （直接给实例属性赋值，随对象销毁自然还原，不动模块）。
+    loop._should_settle = lambda now: True
+    loop.tick()
+
+    # 前半：结算真的发生了，只是落在了被隔离的临时目录
+    assert list((Path(tmp_path) / "loop_reports").glob("loop_report_*.json")), \
+        "结算分支没跑 —— 这条断言的后半就变成空话了"
+
+    # 后半：真实目录纹丝不动
+    after = sorted(p.name for p in real_out.glob("loop_report_*")) if real_out.exists() else []
+    assert after == before, (
+        "结算报告落进了真实 data/loop_reports —— 隔离夹具失效了。"
+        f"新增 {sorted(set(after) - set(before))}"
+    )
+    assert Path(loopmod.DATA_DIR).resolve() != Path(real_data_dir).resolve()
+
+
+# ======================================================================
+# 计划的时点语义（跨日不串台）
+# ======================================================================
+
+def _plan_for(day, targets=(("600519", 90, 0.30),)):
+    """构造一份指定 plan_date 的计划。"""
+    return TradePlan(
+        plan_date=day,
+        targets=[PlanTarget(code=c, name=c, score=s, weight=w)
+                 for c, s, w in targets],
+        cash_reserve_pct=0.10,
+    )
+
+
+def _counting_build(loop, monkeypatch):
+    """把 ``_build_plan`` 换成计数器，用来断言「有没有重建」。"""
+    box = {"n": 0}
+
+    def _fake():
+        box["n"] += 1
+        return None
+
+    monkeypatch.setattr(loop, "_build_plan", _fake)
+    return box
+
+
+def test_expired_in_memory_plan_is_reloaded_from_disk_before_rebuild(monkeypatch):
+    """内存里是过期计划、磁盘上有「今天的」→ 必须用磁盘那份，不重建。
+
+    回归背景（实跑发现）：常驻进程跨日时内存里的 D 计划失效，旧代码**直接**
+    ``_build_plan()``。而 ``build_trade_plan()`` 按 ``resolve_target_date()``
+    生成的是 **D+2** 的计划 —— 结果「拿后天的计划交易今天」，
+    调度器昨晚为 D+1 写好的 ``trade_plan_D+1.json`` 从未被读过。
+    """
+    import src.trading.trade_plan as tp
+    import src.trading.loop as loopmod
+
+    today = loopmod._today()
+    yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_s = today.strftime("%Y-%m-%d")
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
+    loop.plan = _plan_for(yesterday)
+    fresh = _plan_for(today_s, targets=[("000001", 80, 0.20)])
+    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: fresh)
+
+    box = _counting_build(loop, monkeypatch)
+    loop._ensure_plan(TickReport())
+
+    assert box["n"] == 0, "磁盘上有今天的计划，却仍然重建了"
+    assert loop.plan is fresh
+    assert loop.plan.plan_date == today_s
+
+
+def test_pending_plan_for_next_session_is_kept_not_rebuilt(monkeypatch):
+    """今天是 D、手上是「为下一个交易日准备」的计划 → 保留。
+
+    计划本来就是收盘后为下一交易日生成的，``plan_date`` 必然大于今天。
+    旧代码把这种「待生效」当成「已过期」，于是每个 tick 都重建 + 重复写盘
+    （实跑日志：每周期都打印「交易计划已生成：2026-10-15」）。
+    """
+    import src.trading.trade_plan as tp
+    import src.trading.loop as loopmod
+
+    today = loopmod._today()
+    pending_day = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
+    loop.plan = _plan_for(pending_day)
+    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: None)
+
+    box = _counting_build(loop, monkeypatch)
+    rep = TickReport()
+    loop._ensure_plan(rep)
+
+    assert box["n"] == 0, "待生效计划被误判为过期并重建了"
+    assert rep.plan_built is False
+    assert loop.plan.plan_date == pending_day
+
+
+def test_plan_is_built_when_nothing_usable_exists(monkeypatch):
+    """确实没有任何可用计划时才重建 —— 这条保证上面那些「不重建」不是永真。"""
+    import src.trading.trade_plan as tp
+    import src.trading.loop as loopmod
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
+    loop.plan = None
+    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: None)
+
+    built = _plan_for(loopmod._today().strftime("%Y-%m-%d"))
+    monkeypatch.setattr(loop, "_build_plan", lambda: built)
+
+    rep = TickReport()
+    loop._ensure_plan(rep)
+
+    assert rep.plan_built is True
+    assert loop.plan is built
+
+
+def test_no_auto_build_never_rebuilds_and_skips_validity_check(monkeypatch):
+    """``auto_build_plan=False`` 时只读盘、绝不重建，也不做过期判定。
+
+    这是「人工管计划」的模式：运维把计划文件放好，进程照做，不该自作主张。
+    """
+    import src.trading.trade_plan as tp
+    import src.trading.loop as loopmod
+
+    stale = _plan_for((loopmod._today() - timedelta(days=30)).strftime("%Y-%m-%d"))
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = None
+    monkeypatch.setattr(tp, "load_latest_plan", lambda *a, **k: stale)
+
+    box = _counting_build(loop, monkeypatch)
+    loop._ensure_plan(TickReport())
+
+    assert box["n"] == 0
+    assert loop.plan is stale, "auto_build_plan=False 时不该替换手放的计划"
+

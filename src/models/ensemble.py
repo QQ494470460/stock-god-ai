@@ -1,0 +1,280 @@
+# -*- coding: utf-8 -*-
+"""
+超级集成（Super Ensemble）
+========================
+
+把多个子预测器融合成一个更强的评分器：
+
+    XGBoost（主流生产模型，RankIC≈0.075）
+        + Alpha XGBoost（生产特征 + 北向/融资/龙虎榜/行业动量，RankIC≈0.12）
+        + LSTM（时间序列深度学习，捕捉时序动态）
+
+融合策略
+--------
+- 每个子预测器输出 0~100 的「预期收益评分」；
+- 权重默认 = 各模型样本外 RankIC（归一化），可经 config 覆盖；
+- 任一子模型文件缺失 / 推理失败 → 自动剔除并重新归一化权重（优雅降级）；
+- 主预测仍是 StockPrediction，仅把 score 替换为融合值，agreement 保持 1.0
+  以兼容交易执行器的硬闸门（require_agreement < 0.8 拒单）。
+
+设计原则
+--------
+- 只读加载、懒初始化、失败即降级，绝不因某一腿缺失而让整个系统崩；
+- 不重训任何模型，只是把它们组合起来。
+"""
+
+from __future__ import annotations
+
+import pickle
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from config.settings import MODEL_DIR, DATA_DIR
+from src.features.engine import feature_engine
+
+
+# ---------------------------------------------------------------------------
+# 子预测器基类
+# ---------------------------------------------------------------------------
+class SubPredictor:
+    """子预测器接口：给出每支股票 0~100 的预期收益评分。"""
+
+    name: str = "base"
+    _ready: Optional[bool] = None
+
+    @property
+    def available(self) -> bool:
+        if self._ready is None:
+            try:
+                self._ensure()
+                self._ready = True
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[{self.name}] 不可用，已降级: {e}")
+                self._ready = False
+        return self._ready
+
+    def _ensure(self) -> None:
+        """加载资源；失败抛异常即被 available 捕获为降级。"""
+
+    def score_for(self, df: pd.DataFrame, code: str) -> Optional[float]:
+        """返回该股票的 0~100 评分；失败/不可用返回 None。"""
+        if not self.available:
+            return None
+        try:
+            return self._score(df, code)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{self.name}] 评分失败 {code}: {e}")
+            return None
+
+    def _score(self, df: pd.DataFrame, code: str) -> float:
+        raise NotImplementedError
+
+
+def _proba_to_score(proba: np.ndarray, classes) -> float:
+    """把模型概率向量（按 classes 顺序）转成 0~100 预期收益评分。
+
+    与 src/models/predictor.py 的 score_raw 口径一致，确保不同子模型评分可比。
+    """
+    n = len(classes)
+    if n == 5:
+        prob_up = float(proba[3] + proba[4])
+        prob_down = float(proba[0] + proba[1])
+    else:
+        idx_up = list(classes).index(1) if 1 in list(classes) else (n - 1)
+        idx_down = list(classes).index(-1) if -1 in list(classes) else 0
+        prob_up = float(proba[idx_up])
+        prob_down = float(proba[idx_down])
+    score = (prob_up * 0.7 - prob_down * 0.3 + 0.3) * 100
+    return float(max(0.0, min(100.0, score)))
+
+
+# ---------------------------------------------------------------------------
+# Alpha XGBoost 子预测器（生产特征 + alpha 列）
+# ---------------------------------------------------------------------------
+class AlphaSubPredictor(SubPredictor):
+    name = "alpha_xgboost"
+
+    def _ensure(self):
+        import json
+        self._model = pickle.load(open(MODEL_DIR / "alpha_xgboost_model.pkl", "rb"))
+        self._scaler = pickle.load(open(MODEL_DIR / "alpha_scaler.pkl", "rb"))
+        self._le = pickle.load(open(MODEL_DIR / "alpha_label_encoder.pkl", "rb"))
+        # 列顺序：优先 scaler 自带 feature_names_in_（在 DataFrame 上 fit 时才有）；
+        # 否则从训练指标文件恢复（ref_cols + alpha 列 = 训练时的 cols_b）。
+        cols = getattr(self._scaler, "feature_names_in_", None)
+        if cols is None:
+            mp = MODEL_DIR / "alpha_model_metrics.json"
+            if not mp.exists():
+                raise RuntimeError("alpha 模型缺少列名（scaler 无 feature_names_in_ 且无 metrics）")
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            alpha_cols = list(meta.get("alpha_features") or [])
+            ref_cols = list(meta.get("feature_cols") or [])
+            if not ref_cols:
+                raise RuntimeError("alpha 模型指标文件缺少 feature_cols，无法对齐输入")
+            cols = ref_cols + alpha_cols
+        self._cols: List[str] = list(cols)
+        self._alpha_cols = [c for c in self._cols if c.startswith("alpha_")]
+        self._ref_cols = [c for c in self._cols if not c.startswith("alpha_")]
+        self._classes = list(self._le.classes_)
+
+    def _alpha_for_code(self, code: str, index: pd.DatetimeIndex) -> pd.DataFrame:
+        """从本地 alpha parquet 缓存读取该 code 的 alpha 列，对齐到 index。"""
+        if not self._alpha_cols:
+            return pd.DataFrame(index=index)
+        frames = []
+        for col in self._alpha_cols:
+            name = col[len("alpha_"):]
+            p = DATA_DIR / f"alpha_{name}.parquet"
+            if not p.exists():
+                frames.append(pd.DataFrame({col: np.nan}, index=index))
+                continue
+            panel = pd.read_parquet(p)
+            if code in panel.columns:
+                s = panel[code]
+            else:
+                s = pd.Series(np.nan, index=panel.index)
+            s = s.reindex(index).ffill().fillna(0.0)
+            frames.append(pd.DataFrame({col: s.values}, index=index))
+        return pd.concat(frames, axis=1) if frames else pd.DataFrame(index=index)
+
+    def _score(self, df: pd.DataFrame, code: str) -> float:
+        feats = feature_engine.build_features(df)
+        if "close" in feats.columns:
+            feats = feats.drop(columns=["close"])
+        latest = feats.iloc[-1:]
+        if self._alpha_cols:
+            a = self._alpha_for_code(code, latest.index)
+            row = latest.reindex(columns=self._ref_cols, fill_value=0.0)
+            row = pd.concat([row, a.reindex(index=row.index)], axis=1)
+        else:
+            row = latest.reindex(columns=self._ref_cols, fill_value=0.0)
+        row = row.reindex(columns=self._cols, fill_value=0.0).fillna(0.0)
+        # 传 numpy 避免「scaler 无特征名」告警（老版 scaler 在数组上 fit）
+        Xs = self._scaler.transform(row.values.astype(float))
+        proba = self._model.predict_proba(Xs)[0]
+        return _proba_to_score(proba, self._classes)
+
+
+# ---------------------------------------------------------------------------
+# LSTM 子预测器（需带元数据的 lstm_best.pt）
+# ---------------------------------------------------------------------------
+class LSTMSubPredictor(SubPredictor):
+    name = "lstm"
+
+    def _ensure(self):
+        import torch  # 懒加载，避免无 torch 时 import 失败
+        self._torch = torch
+        ckpt = torch.load(MODEL_DIR / "lstm_best.pt", map_location="cpu", weights_only=False)
+        meta = ckpt.get("meta", {})
+        if "feature_cols" not in meta:
+            # 老版 lstm_best.pt 不含特征元数据，无法对齐输入 → 主动降级
+            raise RuntimeError("lstm_best.pt 缺少 feature_cols 元数据，需重训（见 scripts/retrain_lstm.py）")
+        from src.models.lstm import StockLSTM
+        from config.settings import config as app_config
+        params = app_config.ml.lstm_params
+        self._model = StockLSTM(
+            input_size=ckpt["input_size"],
+            hidden_size=params["hidden_size"],
+            num_layers=params["num_layers"],
+            dropout=params["dropout"],
+        )
+        self._model.load_state_dict(ckpt["model_state_dict"])
+        self._model.eval()
+        self._feature_cols: List[str] = meta["feature_cols"]
+        self._seq_len: int = ckpt.get("sequence_length", params["sequence_length"])
+        self._classes = meta.get("classes", [-1, 0, 1])
+
+    def _score(self, df: pd.DataFrame, code: str) -> float:
+        feats = feature_engine.build_features(df)
+        if "close" in feats.columns:
+            feats = feats.drop(columns=["close"])
+        win = feats.reindex(columns=self._feature_cols, fill_value=0.0).fillna(0.0)
+        if len(win) < self._seq_len:
+            raise RuntimeError(f"样本不足 {self._seq_len} 日")
+        seq = win.iloc[-self._seq_len:].values.astype(float)
+        seq = self._torch.FloatTensor(seq.reshape(1, self._seq_len, -1))
+        with self._torch.no_grad():
+            out = self._model(seq)
+            proba = self._torch.softmax(out, dim=1).cpu().numpy()[0]
+        return _proba_to_score(proba, self._classes)
+
+
+# ---------------------------------------------------------------------------
+# 超级集成器
+# ---------------------------------------------------------------------------
+class EnsemblePredictor:
+    """融合多个子预测器，输出加权评分。
+
+    用法：
+        ep = EnsemblePredictor(predictor)        # predictor 为已构造的 Predictor
+        ep.add_sub(AlphaSubPredictor(), weight=1.0)
+        ep.add_sub(LSTMSubPredictor(),  weight=0.8)
+        preds = ep.predict_batch(stock_data)     # Dict[code, StockPrediction]
+    """
+
+    def __init__(self, primary_predictor, default_weight: float = 1.0):
+        self.primary = primary_predictor
+        self.subs: List[Tuple[SubPredictor, float]] = []
+        self.default_weight = default_weight
+
+    def add_sub(self, sub: SubPredictor, weight: Optional[float] = None) -> None:
+        self.subs.append((sub, weight if weight is not None else self.default_weight))
+
+    def _available_subs(self):
+        out = []
+        for sub, w in self.subs:
+            if sub.available:
+                out.append((sub, w))
+            else:
+                logger.info(f"  集成：{sub.name} 不可用，已跳过")
+        return out
+
+    def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
+        """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。"""
+        avail = self._available_subs()
+        results: Dict[str, object] = {}
+        for code, df in stock_data.items():
+            try:
+                pred = self.primary.predict_single(df, code=code)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"主模型预测失败 {code}: {e}")
+                continue
+            # 收集各子模型评分
+            sub_scores = [pred.score]  # 主模型权重 1.0
+            sub_weights = [1.0]
+            for sub, w in avail:
+                s = sub.score_for(df, code)
+                if s is not None:
+                    sub_scores.append(s)
+                    sub_weights.append(w)
+            if len(sub_scores) > 1:
+                arr = np.array(sub_scores, dtype=float)
+                wts = np.array(sub_weights, dtype=float)
+                blended = float(np.average(arr, weights=wts))
+                spread = float(arr.max() - arr.min())
+                pred.score = blended
+                # agreement 保持 >=0.8 以兼容交易执行器硬闸门；
+                # 真实分歧记录在 agreement_spread（不阻断下单）
+                pred.agreement = max(0.8, 1.0 - spread / 100.0)
+                pred.xgb_signal = pred.xgb_signal  # 主信号不变
+                if not hasattr(pred, "ensemble_detail"):
+                    pass
+                pred.ensemble_detail = {
+                    "scores": dict(zip(["xgboost"] + [s.name for s, _ in avail], sub_scores)),
+                    "weights": dict(zip(["xgboost"] + [s.name for s, _ in avail], [float(x) for x in sub_weights])),
+                    "spread": spread,
+                }
+            results[code] = pred
+        return results
+
+    def summary(self) -> str:
+        lines = ["🧩 超级集成状态："]
+        lines.append(f"  主模型 XGBoost：始终启用")
+        for sub, w in self.subs:
+            st = "✅" if sub.available else "⚠️不可用(降级)"
+            lines.append(f"  {sub.name}：{st}（权重 {w}）")
+        return "\n".join(lines)

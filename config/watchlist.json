@@ -1,0 +1,33 @@
+{
+  "_comment": "选股神AI - 自选股监控配置",
+  "watchlist": [
+    "000001",
+    "000002",
+    "000858",
+    "002594",
+    "300750",
+    "600519",
+    "600036",
+    "601318",
+    "002230",
+    "300059",
+    "002415",
+    "000725",
+    "300033",
+    "600585",
+    "601012"
+  ],
+  "alert": {
+    "min_ai_score": 50,
+    "alert_on_buy_signal": true,
+    "alert_on_sell_signal": true,
+    "alert_on_score_change": 15,
+    "price_move_threshold": 3.0,
+    "max_alerts_per_run": 5
+  },
+  "schedule": {
+    "enabled": true,
+    "interval_minutes": 5,
+    "trading_hours_only": true
+  }
+}
