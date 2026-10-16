@@ -189,6 +189,13 @@ def job_evolution() -> Dict:
         except Exception:
             pass
 
+        # 观测心跳：作业跑完即刷新 last_check_at（即使本批无可验证样本），
+        # 用于区分「链路断了」与「只是样本未到」。见 evolution.mark_checked 说明。
+        try:
+            evolution.mark_checked()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"mark_checked 失败（已忽略）: {e}")
+
         logger.info(
             f"🧬 进化任务完成：验证 {len(results)} 批，进化动作 {len(actions)} 条"
             + (f"，建议重训：{reason}" if info.get("should_retrain") else "")

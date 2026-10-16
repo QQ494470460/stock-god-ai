@@ -95,6 +95,10 @@ class EvolutionEngine:
             # 进化历史
             "evolution_log": [],
             "last_evolved_at": None,
+            # ★ 观测心跳：每次进化作业被调度并跑完（无论是否有可验证样本）都会刷新。
+            # 用于区分「作业没跑」与「跑了但还没有可验证样本」——否则 last_evolved_at
+            # 长期不动会让人误以为调度链路断了。
+            "last_check_at": None,
         }
 
     def _load(self) -> Dict:
@@ -125,6 +129,20 @@ class EvolutionEngine:
             json.dumps(self.state, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def mark_checked(self):
+        """观测心跳：记录「进化作业被调度并跑完」的时间戳。
+
+        与 ``last_evolved_at`` 的区别：后者只在真正发生进化回合时更新；
+        前者**每次作业跑完就更新**（即使当前没有可验证样本、进化动作为 0）。
+
+        用途：``last_evolved_at`` 长期不动无法区分「调度链路断了」还是
+        「只是还没积累到可验证样本」。监控时两者对照即可一眼判明——
+        ``last_check_at`` 在动而 ``last_evolved_at`` 不动 = 正常（样本未到）；
+        两者都停 = 作业真的没被调度。
+        """
+        self.state["last_check_at"] = datetime.now().isoformat()
+        self.save()
 
     def _log_evolution(self, action: str, detail: str):
         entry = {

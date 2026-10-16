@@ -239,6 +239,10 @@ def _auto_reload_model_if_updated() -> None:
 # 在任何页面路由 / 侧边栏渲染之前执行一次，保证切到任何页面都能感知新模型
 _auto_reload_model_if_updated()
 
+# 「收盘后自动化调度」随看板**进程启动**即拉起（不再等到首次有人打开看板再触发）。
+# 幂等：is_running() 短路，重跑零开销；受 config.scheduler.enabled 控制。
+_ensure_scheduler_running()
+
 
 # ========== 大盘涨跌条 ==========
 

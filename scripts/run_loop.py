@@ -257,6 +257,21 @@ def main() -> int:
     except (AttributeError, ValueError):  # pragma: no cover
         pass
 
+    # ---- 无头模式也拉起「收盘后自动化调度」（与看板同一套接线，幂等）----
+    # 之前调度只在看板首次被打开（浏览器连接）时才启动，导致无人值守的 run_loop
+    # 进程里 18:30 数据更新 / 18:45 选股 / 19:00 进化 三个 cron 永远不触发。
+    # 现在常驻进程里也自动拉起；仍受 config.scheduler.enabled 控制。
+    # 演练 / 预演（--dry-run / --preview）不启动，保持零副作用（与风控隔离纪律一致）。
+    if not (args.dry_run or args.preview):
+        try:
+            from src.scheduler.auto_scheduler import start_scheduler, is_running
+            if not is_running():
+                sched = start_scheduler()
+                if sched is not None:
+                    print("✅ 无头调度已拉起（数据更新 18:30 / 选股 18:45 / 进化 19:00，受 scheduler.enabled 控制）")
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 无头调度自动拉起失败（已忽略，闭环继续）: {e}", file=sys.stderr)
+
     try:
         if args.preview:
             _print_preview(loop)

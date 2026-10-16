@@ -54,6 +54,9 @@ class FakePredictor:
 
 
 class FakeEvolution:
+    def __init__(self):
+        self.checked = 0
+
     def get_effective_min_score(self, *a, **k):
         return 55.0
 
@@ -65,6 +68,10 @@ class FakeEvolution:
 
     def should_retrain(self):
         return False, ""
+
+    def mark_checked(self):
+        # 观测心跳：job_evolution 跑完必调一次（无论有无可验证样本）
+        self.checked += 1
 
 
 @pytest.fixture
@@ -139,6 +146,7 @@ def test_daily_pick_generates_report(patched, tmp_path, monkeypatch):
 
 
 def test_scheduler_jobs_run(patched, monkeypatch, tmp_path):
+    ff, fp, fe = patched
     # job_data_update
     info1 = auto_scheduler.job_data_update()
     assert info1["status"] == "ok"
@@ -150,6 +158,8 @@ def test_scheduler_jobs_run(patched, monkeypatch, tmp_path):
     # job_evolution 不崩溃（tracker 可能无数据，返回 dict 即可）
     info3 = auto_scheduler.job_evolution()
     assert isinstance(info3, dict) and info3["job"] == "evolution"
+    # 观测心跳必须被触发（即使 0 可验证样本，也要能看出「作业跑过」）
+    assert fe.checked == 1, "job_evolution 未调用 evolution.mark_checked()"
 
 
 def test_scheduler_disabled_by_default(patched):
@@ -184,6 +194,21 @@ def test_job_evolution_never_touches_real_prediction_history(patched, monkeypatc
 
     after = real.read_bytes() if real.exists() else None
     assert after == before, "job_evolution 污染了真实 prediction_history.json"
+
+
+def test_job_evolution_never_touches_real_evolution_state(patched):
+    """零污染：job_evolution 末尾的观测心跳不得改写真实 evolution_state.json。
+
+    新增 mark_checked() 写盘点后，若夹具没把 evolution 换成替身，每次跑测都会把
+    last_check_at 刷成「跑测当天」，污染生产进化状态。这里把该纪律钉死。
+    """
+    real = ROOT / "data" / "evolution_state.json"
+    before = real.read_bytes() if real.exists() else None
+
+    auto_scheduler.job_evolution()
+
+    after = real.read_bytes() if real.exists() else None
+    assert after == before, "job_evolution 污染了真实 evolution_state.json"
 
 
 def test_job_evolution_writes_into_tmp(patched, tmp_path):

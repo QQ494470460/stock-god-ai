@@ -85,7 +85,20 @@ class PaperAccount:
                 self.today_pnl = data.get("today_pnl", 0.0)
                 self.today_trades = data.get("today_trades", 0)
                 self._last_reset_date = data.get("last_reset_date", self._last_reset_date)
-                logger.info(f"📂 纸交易账户已恢复: 现金 ¥{self.cash:,.0f}, {len(self.holdings)} 只持仓")
+                # ★ 本金基线必须与「实际注入的权益」对齐，否则盈亏/收益率/回撤会被按
+                # 默认的 ¥100,000 误算（出现 4890% 这类幽灵收益 —— 即「双账户态不一致」）。
+                # 历史存档若未记录 initial_cash（账户被外部注入了资金/持仓），则以载入时的
+                # 总资产作为 0 基准，避免把注入资本算成盈利。
+                persisted = data.get("initial_cash", None)
+                if persisted is not None:
+                    self.initial_cash = float(persisted)
+                else:
+                    loaded_equity = self.cash + sum(
+                        float(h.get("market_value", 0.0)) for h in self.holdings.values()
+                    )
+                    self.initial_cash = loaded_equity
+                logger.info(f"📂 纸交易账户已恢复: 现金 ¥{self.cash:,.0f}, {len(self.holdings)} 只持仓"
+                            f" · 本金基线 ¥{self.initial_cash:,.0f}")
             else:
                 logger.info(f"💰 新建纸交易账户: 初始资金 ¥{self.initial_cash:,.0f}")
         except Exception as e:
@@ -104,6 +117,7 @@ class PaperAccount:
         try:
             data = {
                 "cash": self.cash,
+                "initial_cash": self.initial_cash,
                 "holdings": self.holdings,
                 "today_pnl": self.today_pnl,
                 "today_trades": self.today_trades,
