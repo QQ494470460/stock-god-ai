@@ -74,9 +74,12 @@ def acquire_single_instance(lock_path: Path) -> bool:
     existed = lock_path.exists()
     try:
         # 必须可写打开（POSIX 的 flock 同样要求可写句柄）。
-        # ⚠️ Windows 的语义在这里很关键：只要别的进程锁住了文件里的字节区间，
-        # 任何 *可写* 打开都会直接 Permission denied —— 连 open 都进不去。
-        # 所以「打不开」本身就是「已有实例在跑」的确凿信号，不能当成异常放行。
+        # ⚠️ 别把「打开失败」当成主要的占用判据：实测在 Windows 上
+        # ``os.open(O_RDWR)`` 在别人持锁时**照样成功** —— 字节区间锁只拦
+        # 对锁定区间的读写，不拦 open。真正挡住第二个实例的是下面的
+        # ``msvcrt.locking(LK_NBLCK)`` 抛 OSError。
+        # （``open(path, "a+")`` 走 C 运行时 fopen，共享模式不同，它才会报
+        #   PermissionError；两个 API 语义不一样，混用会得出错误结论。）
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     except PermissionError:
         print(f"⚠️  {lock_path} 正被另一个实例锁定（写打开被拒）", file=sys.stderr)
@@ -110,6 +113,18 @@ def acquire_single_instance(lock_path: Path) -> bool:
         pass
     _instance_lock_handle = f
     return True
+
+
+def release_single_instance() -> None:
+    """主动释放单实例锁（测试与优雅退出用；正常崩溃由 OS 释放）。"""
+    global _instance_lock_handle
+    f = _instance_lock_handle
+    _instance_lock_handle = None
+    if f is not None:
+        try:
+            f.close()
+        except OSError:
+            pass
 
 
 def _on_signal(signum, _frame):  # pragma: no cover - 信号路径

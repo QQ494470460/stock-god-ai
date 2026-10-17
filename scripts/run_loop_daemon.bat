@@ -1,36 +1,66 @@
 @echo off
 REM ===========================================================================
-REM 选股神AI · 闭环交易常驻启动器
+REM StockGodAI - resident closed-loop trading launcher
 REM
-REM 由「启动文件夹」快捷方式在用户登录时调用（无需管理员权限）。
+REM Invoked by the Startup-folder shortcut at user logon (no admin needed).
 REM
-REM 特性：
-REM   · 脚本自带单实例锁（data\.run_loop.lock）：重复拉起不会产生第二份实例，
-REM     也绝不会对同一份计划重复下单。
-REM   · 异常退出（非「已有实例」）自动重启，最多 5 次，避免无限空转。
-REM   · 退出码 3 = 已有实例在跑，直接放弃重启（此时另一个实例才是正主）。
-REM   · 用 pythonw.exe（无控制台窗口）+ stdout 重定向到日志文件；
-REM     run_loop.py 的 tick 行带 flush=True，重定向不会丢日志。
-REM   · 日志超过 10MB 自动轮转为 run_loop.log.1（只保留一份历史）。
+REM KEEP THIS FILE STRICTLY ASCII + CRLF.
+REM cmd.exe decodes batch files with the OEM code page (936/GBK on zh-CN) and
+REM its parser is line-ending sensitive: UTF-8 Chinese comments and LF-only
+REM line endings silently corrupt if-blocks and goto labels, so the launcher
+REM dies with "'M' is not recognized as an internal or external command".
+REM
+REM Two log files on purpose:
+REM   logs\launcher.log  - this launcher's own bookkeeping (rotated at 1MB)
+REM   logs\run_loop.log  - the resident loop's stdout/stderr
+REM They must NOT be the same file: the running loop holds run_loop.log open
+REM for its whole lifetime, so a second launch's ">> samefile" redirection
+REM fails BEFORE pythonw even runs, and a failed redirection does NOT set
+REM ERRORLEVEL (verified) - hence the python probe below.
+REM
+REM Duplicate-instance handling:
+REM   scripts\loop_lock_probe.py exits 1 when data\.run_loop.lock is held.
+REM   That mirrors run_loop.py's own check exactly (a writable open is refused
+REM   while another process holds the byte-range lock), and a *process exit
+REM   code* is the only reliable signal available to cmd.
+REM
+REM Auto-restart: abnormal exit restarts at most 5 times. run_loop.py itself
+REM exits 3 when it finds an existing instance, and we treat that as final.
 REM ===========================================================================
 setlocal enabledelayedexpansion
 
-set "ROOT=C:\Users\49447\.qclaw\workspace\stock-god-ai"
+REM Derive the project root from this script's own location (works in the dev
+REM tree and in a packaged copy alike). %~dp0 ends with a backslash.
+for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 set "PYW=C:\Users\49447\AppData\Local\Programs\Python\Python312\pythonw.exe"
 set "LOG=%ROOT%\logs\run_loop.log"
+set "LLOG=%ROOT%\logs\launcher.log"
 
 cd /d "%ROOT%" || exit 1
 if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
 
-REM 日志轮转：超过 10MB 就挪走，避免无限增长
+REM rotate the launcher log above 1MB
+if exist "%LLOG%" (
+    for %%A in ("%LLOG%") do if %%~zA GTR 1048576 (
+        move /y "%LLOG%" "%LLOG%.1" >nul 2>&1
+    )
+)
+
+REM rotate the loop log above 10MB (only reachable when no instance is alive)
 if exist "%LOG%" (
     for %%A in ("%LOG%") do if %%~zA GTR 10485760 (
         move /y "%LOG%" "%LOG%.1" >nul 2>&1
     )
 )
 
-echo. >> "%LOG%"
-echo ===== [!DATE! !TIME!] 启动器拉起闭环 ===== >> "%LOG%"
+echo ===== launcher start %DATE% %TIME% ===== >> "%LLOG%"
+
+REM Fail-closed duplicate probe (exit code, not ERRORLEVEL).
+"%PYW%" scripts\loop_lock_probe.py
+if errorlevel 1 (
+    echo ===== lock is held: a loop instance is alive, launcher exits ===== >> "%LLOG%"
+    exit /b 0
+)
 
 set /a tries=0
 :loop
@@ -38,16 +68,17 @@ set /a tries+=1
 "%PYW%" scripts\run_loop.py --no-notify >> "%LOG%" 2>&1
 set "rc=!ERRORLEVEL!"
 
-echo ===== [!DATE! !TIME!] 闭环退出 code=!rc!（第 !tries! 次）===== >> "%LOG%"
+echo ===== loop exited code=!rc! (try !tries!) ===== >> "%LLOG%"
 
 if "!rc!"=="3" (
-    echo ===== 已有闭环实例在运行，启动器退出（避免双实例）===== >> "%LOG%"
+    echo ===== another instance is running, launcher exits ===== >> "%LLOG%"
     exit /b 0
 )
 if !tries! GEQ 5 (
-    echo ===== 已连续重启 5 次，放弃。请检查日志。===== >> "%LOG%"
+    echo ===== 5 attempts failed, giving up. check the logs. ===== >> "%LLOG%"
     exit /b !rc!
 )
 
-timeout /t 30 /nobreak >nul
+REM ping instead of timeout: timeout aborts when stdin is redirected (headless).
+ping -n 31 127.0.0.1 >nul
 goto loop
