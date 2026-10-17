@@ -32,8 +32,20 @@ from src.trading.guard import (
 # Fake 对象
 # ======================================================================
 
+class _LiveBrokerStub:
+    """最小替身：只回答「券商是不是模拟盘」这一项。
+
+    arm_live 现在会 fail-closed 地校验券商真伪（缺 ``is_simulated`` 一律当模拟），
+    所以凡是要走武装流程的用例都必须显式给一个「真实盘」替身。
+    """
+    is_simulated = False
+
+
 class FakeBroker(BrokerAPI):
     """内存券商：记录下单、返回固定行情/账户"""
+
+    # 武装实盘要校验券商真伪：缺这个属性会被按「模拟盘」拒绝（fail-closed）
+    is_simulated = False
 
     def __init__(self, total_asset=1_000_000.0, last_price=10.0):
         super().__init__()
@@ -142,7 +154,7 @@ class FakePaper:
 
 def test_default_mode_is_paper(tmp_path):
     cfg = GuardConfig(state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     assert ctl.mode == TradingMode.PAPER
     assert ctl.can_trade() is True
     assert ctl.halted is False
@@ -150,7 +162,7 @@ def test_default_mode_is_paper(tmp_path):
 
 def test_set_mode_cannot_enter_live_directly(tmp_path):
     cfg = GuardConfig(state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     assert ctl.set_mode(TradingMode.LIVE) is False
     assert ctl.set_mode(TradingMode.LIVE_PENDING) is False
     assert ctl.mode == TradingMode.PAPER
@@ -158,7 +170,7 @@ def test_set_mode_cannot_enter_live_directly(tmp_path):
 
 def test_arm_flow_requires_two_step_token(tmp_path):
     cfg = GuardConfig(state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     token = ctl.arm_live("alice")
     assert ctl.mode == TradingMode.PAPER  # 第一步仍是 paper
     assert ctl.confirm_arm("wrong-token", "alice") is False
@@ -170,7 +182,7 @@ def test_arm_flow_requires_two_step_token(tmp_path):
 def test_kill_switch_persists_across_restart(tmp_path):
     state = str(tmp_path / "s.json")
     cfg = GuardConfig(state_file=state, journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     ctl.arm_live("alice")
     ctl.confirm_arm(ctl._state.pending_token, "alice")
     assert ctl.mode == TradingMode.LIVE_PENDING
@@ -564,7 +576,7 @@ def test_mode_transitions_are_journaled(tmp_path):
     """武装/解除/切换模式必须写 journal（arm_request / arm_confirm / mode_change）。"""
     cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
                       journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     token = ctl.arm_live("alice")
     assert ctl.confirm_arm(token, "alice") is True
     assert ctl.disarm("alice") is True
@@ -580,7 +592,7 @@ def test_disarm_records_audit_reason(tmp_path):
     """disarm 回 PAPER 时，mode_change 必须带操作者与原因，便于事后追溯。"""
     cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
                       journal_file=str(tmp_path / "j.jsonl"))
-    ctl = SafetyController(cfg)
+    ctl = SafetyController(cfg, broker=_LiveBrokerStub())
     token = ctl.arm_live("bob")
     ctl.confirm_arm(token, "bob")
     ctl.disarm("bob", reason="audit-cleanup: 无 arm 留痕，回安全默认")

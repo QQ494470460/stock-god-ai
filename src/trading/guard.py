@@ -168,8 +168,11 @@ class SafetyController:
       需重新武装才能再上实盘。
     """
 
-    def __init__(self, config: GuardConfig):
+    def __init__(self, config: GuardConfig, broker=None):
         self.config = config
+        # broker 只用于「武装实盘前确认券商真的是实盘连接」这一项校验。
+        # 传 None = 没有券商接入 → 按模拟处理（fail-closed），拒绝武装实盘。
+        self._broker = broker
         self._state_file = Path(config.state_file)
         self._lock = threading.RLock()
         self._state = GuardState()
@@ -254,6 +257,22 @@ class SafetyController:
             logger.info(f"🛡️ 模式切换 → {mode.value} (by {operator})")
             return True
 
+    def _broker_is_simulated(self) -> bool:
+        """券商连接是否为模拟（或无法确认）。
+
+        ⚠️ 这里修的是一个**静默失效**：武装 LIVE 之前从不校验券商到底连的
+        是实盘还是模拟。``is_simulated`` 一直只在看板上显示，guard / loop /
+        executor 谁都没看它。后果是「mode=live、界面写着实盘、单子却全进了
+        模拟通道」——用户以为在拿真钱跑，实际什么都没发生。
+
+        缺失 ``is_simulated`` 属性时按**模拟**处理（fail-closed）：宁可拒绝
+        武装、让人去查，也不能给一个「看起来在实盘」的假象。
+        """
+        try:
+            return bool(getattr(self._broker, "is_simulated", True))
+        except Exception:  # noqa: BLE001
+            return True
+
     def arm_live(self, operator: str, target: TradingMode = TradingMode.LIVE_PENDING) -> str:
         """第一步：请求武装实盘，返回需回传的确认令牌
 
@@ -262,9 +281,20 @@ class SafetyController:
             target:   目标模式，默认 LIVE_PENDING（逐单确认），最安全
         Returns:
             确认令牌字符串；调用 confirm_arm(token) 才能完成切换
+
+        Raises:
+            ValueError: 目标模式非法，或券商仍是模拟连接（拒绝武装实盘）
         """
         if target not in (TradingMode.LIVE, TradingMode.LIVE_PENDING):
             raise ValueError("arm_live 目标只能是 LIVE 或 LIVE_PENDING")
+        if self._broker_is_simulated():
+            reason = str(getattr(self._broker, "sim_reason", "") or "券商连接处于模拟模式，或无法确认")
+            logger.error(f"⛔ 拒绝武装实盘：{reason}")
+            raise ValueError(
+                f"拒绝武装实盘：{reason}。"
+                "武装前必须先用 live 模式连上真实券商（本机可用 "
+                "`python scripts/check_live_ready.py` 自检）。"
+            )
         with self._lock:
             token = secrets.token_hex(4)  # 8 位十六进制，足够人工核对
             self._state.pending_token = token
@@ -287,6 +317,14 @@ class SafetyController:
                 return False
             if token != self._state.pending_token:
                 logger.error("⛔ 确认令牌不匹配，武装被拒绝（保留令牌可重试）")
+                return False
+
+            # 二次校验：拿到令牌后券商可能被重新连成模拟（或断线降级）。
+            # 只校验第一步是不够的 —— 令牌有效期里连接状态会变。
+            if self._broker_is_simulated():
+                reason = str(getattr(self._broker, "sim_reason", "") or "券商连接已变为模拟，或无法确认")
+                logger.error(f"⛔ 武装被拒：{reason}")
+                self._journal_event("arm_reject", {"operator": operator, "reason": reason})
                 return False
 
             # 进入实盘前强制清空当日起始净值，确保单日亏损熔断从零点计
@@ -689,8 +727,8 @@ class RiskSupervisor:
         self.executor = TradeExecutor(broker, risk_config)
         self.risk_config = self.executor.config
 
-        # 安全层组件
-        self.safety = SafetyController(self.config)
+        # 安全层组件（把 broker 注入进去：武装实盘前要能确认它是真实盘通道）
+        self.safety = SafetyController(self.config, broker=broker)
         self.gate = OrderGate(self.config, self.safety)
         self.sizer = PositionSizer(self.config)
         self.journal = TradeJournal(self.config)

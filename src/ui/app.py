@@ -2631,7 +2631,9 @@ def render_safety_panel():
         cfg = GuardConfig.from_yaml(str(_gpath)) if _gpath.exists() else GuardConfig()
     except Exception:
         cfg = GuardConfig()
-    safety = SafetyController(cfg)
+    # 把当前会话里已连接券商带进来：武装实盘前要能确认它是真实盘通道。
+    # 没连接时传 None → SafetyController 按模拟处理并拒绝武装（fail-closed）。
+    safety = SafetyController(cfg, broker=st.session_state.get("trade_broker"))
 
     mode = safety.mode
     halted = safety.halted
@@ -2658,9 +2660,15 @@ def render_safety_panel():
             st.success("已解除实盘武装，回到纸交易"); st.rerun()
     with c2:
         if st.button("🔴 武装实盘(LIVE_PENDING)", key="sec_arm", use_container_width=True):
-            tok = safety.arm_live("dashboard")
-            st.session_state["_arm_token"] = tok
-            st.rerun()
+            # arm_live 现在会拒绝「券商还是模拟连接」的情况（fail-closed），
+            # 必须把拒绝理由原样显示出来，否则按钮点了没反应又不知道为什么。
+            try:
+                tok = safety.arm_live("dashboard")
+            except ValueError as e:
+                st.error(f"⛔ 无法武装实盘：{e}")
+            else:
+                st.session_state["_arm_token"] = tok
+                st.rerun()
     with c3:
         if st.button("🛑 KILL SWITCH", key="sec_kill", use_container_width=True):
             safety.halt("手动触发（看板）", "dashboard")
@@ -2677,7 +2685,10 @@ def render_safety_panel():
                     st.session_state["_arm_token"] = ""
                     st.success("🔴 已武装 LIVE_PENDING，每笔委托需人工确认"); st.rerun()
                 else:
-                    st.error("令牌不匹配")
+                    st.error(
+                        "确认失败：令牌不匹配，或券商当前不是实盘连接"
+                        "（可运行 `python scripts/check_live_ready.py` 自检）。"
+                    )
         with b2:
             if st.button("❌ 取消", key="sec_cancel"):
                 st.session_state["_arm_token"] = ""

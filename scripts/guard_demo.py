@@ -27,6 +27,10 @@ from src.trading.guard import RiskSupervisor, TradingMode
 
 # ---------------- 零风险 Fake 对象 ----------------
 class FakeBroker(BrokerAPI):
+    # 演示里这个替身扮演「真实盘通道」：arm_live 会校验券商真伪，
+    # 缺这个属性（或为 True）会被 fail-closed 拒绝武装。
+    is_simulated = False
+
     def __init__(self, total=1_000_000.0, last=10.0):
         super().__init__()
         self._connected = True
