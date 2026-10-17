@@ -852,8 +852,21 @@ class DataFetcher:
     
     # ========== 工具方法 ==========
     
+    _VALID_POOLS = frozenset({"all", "hs300", "zz500", "zz1000", "hs300_zz500"})
+
     def get_stock_pool(self, pool: str = "all") -> List[str]:
-        """获取指定股票池的代码列表（带内存缓存）"""
+        """获取指定股票池的代码列表（带内存缓存）。
+
+        合法池名：all / hs300 / zz500 / zz1000 / hs300_zz500。
+        ⚠️ 未知池名**不再静默退回全市场** —— 曾因池名写错触发一次约 5000 只的全市场
+        扫描（跑了 9 分钟没完）。现在直接抛 ValueError，逼调用方显式处理，
+        避免这种"看着正常、其实扫错宇宙"的静默失效。
+        """
+        pool = (pool or "all").strip().lower()
+        if pool not in self._VALID_POOLS:
+            raise ValueError(
+                f"未知股票池 {pool!r}；合法值: {sorted(self._VALID_POOLS)}"
+            )
         now = time.time()
         if pool in self._pool_cache:
             cached, ts = self._pool_cache[pool]

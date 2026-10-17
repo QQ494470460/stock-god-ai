@@ -60,3 +60,5 @@ config/.salt
 config/deepseek.yaml
 config/broker.yaml.template
 QClaw.lnk
+# WorkBuddy 自动化/会话产物（含根 .workbuddy/memory，自动化 68bba355 每天 16:00 写）
+.workbuddy/
