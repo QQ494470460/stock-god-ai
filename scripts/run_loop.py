@@ -71,11 +71,24 @@ def acquire_single_instance(lock_path: Path) -> bool:
     """
     global _instance_lock_handle
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    existed = lock_path.exists()
     try:
-        f = open(lock_path, "a+")
+        # 必须可写打开（POSIX 的 flock 同样要求可写句柄）。
+        # ⚠️ Windows 的语义在这里很关键：只要别的进程锁住了文件里的字节区间，
+        # 任何 *可写* 打开都会直接 Permission denied —— 连 open 都进不去。
+        # 所以「打不开」本身就是「已有实例在跑」的确凿信号，不能当成异常放行。
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except PermissionError:
+        print(f"⚠️  {lock_path} 正被另一个实例锁定（写打开被拒）", file=sys.stderr)
+        return False
     except OSError as e:
-        print(f"⚠️  无法创建单实例锁 {lock_path}: {e}", file=sys.stderr)
-        return True          # 锁不可用时不阻断运行（宁可能跑，不可不跑）
+        if existed:
+            print(f"⚠️  无法打开单实例锁 {lock_path}: {e}", file=sys.stderr)
+            return False
+        print(f"⚠️  无法创建单实例锁 {lock_path}: {e}（锁不可用，继续运行）",
+              file=sys.stderr)
+        return True          # 连锁文件都建不出来：宁可能跑，不可不跑
+    f = os.fdopen(fd, "r+", encoding="utf-8")
     try:
         f.seek(0)
         if os.name == "nt":

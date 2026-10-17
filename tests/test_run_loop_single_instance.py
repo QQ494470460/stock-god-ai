@@ -66,3 +66,43 @@ def test_missing_parent_dir_is_created(tmp_path):
     lock = tmp_path / "nested" / "deep" / ".run_loop.lock"
     assert run_loop.acquire_single_instance(lock) is True
     assert lock.exists()
+
+
+# ---------------------------------------------------------------------------
+# 跨进程路径：Windows 上「写打开被拒」= 别人正锁着 = 必须 fail-CLOSED
+# ---------------------------------------------------------------------------
+
+def test_write_open_denied_is_treated_as_locked(tmp_path, monkeypatch):
+    """回归：真机第二个实例拿到 Permission denied 后竟放行了，真跑了一轮 tick。
+
+    背景：``open(lock_path, "a+")`` 在另一个进程持锁时会在 **open 阶段**就抛
+    PermissionError（Windows 拒绝任何可写打开）。当时那段把它归到
+    「锁不可用 → fail-open」，于是第二个实例照常启动、照常 tick、还覆盖了心跳。
+    「写打开被拒」必须是 fail-CLOSED。
+    """
+    lock = tmp_path / ".run_loop.lock"
+    lock.write_text("pid=99999\n")          # 文件已存在 = 疑似别人在用
+
+    real_open = run_loop.os.open
+
+    def _denied(path, flags, *a, **k):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(run_loop.os, "open", _denied)
+    try:
+        assert run_loop.acquire_single_instance(lock) is False, \
+            "写打开被拒却放行了 —— 会造成双实例重复下单"
+    finally:
+        monkeypatch.setattr(run_loop.os, "open", real_open)
+
+
+def test_open_error_without_file_fails_open(tmp_path, monkeypatch):
+    """锁文件根本建不出来（如只读目录）时放行 —— 宁可能跑，不可不跑。"""
+    lock = tmp_path / "readonly" / ".run_loop.lock"
+    lock.parent.mkdir()
+
+    def _noent(path, flags, *a, **k):
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(run_loop.os, "open", _noent)
+    assert run_loop.acquire_single_instance(lock) is True
