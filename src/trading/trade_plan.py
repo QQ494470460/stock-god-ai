@@ -251,6 +251,32 @@ def _normalize_picks(picks: Any) -> List[dict]:
     return rows
 
 
+def _fetch_close_prices(codes: List[str]) -> Dict[str, float]:
+    """为计划目标补充参考收盘价（盘中重算前的锚点）。
+
+    daily_pick 本应在 report.picks 里透传 price，但实测某些行情源下该字段没接上
+    （stock_data 的 key 格式与 picks 里的代码对不上），导致计划 price 恒为 0.0、
+    「跳空不追」这类校验无从做起。这里在计划构建层做一次兜底：直接按代码拉日线，
+    取最后一根收盘价。失败一律返回空 dict —— 行情取不到绝不该中断计划生成。
+    """
+    codes = [str(c) for c in codes if c]
+    if not codes:
+        return {}
+    try:
+        from src.data.fetcher import fetcher
+
+        raw = fetcher.get_batch_daily_kline(codes, max_workers=4)
+        out: Dict[str, float] = {}
+        for c, df in raw.items():
+            try:
+                out[str(c)] = round(float(df["close"].iloc[-1]), 2)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # ----------------------------------------------------------------------------
 # 构建 / 持久化
 # ----------------------------------------------------------------------------
@@ -309,6 +335,10 @@ def build_trade_plan(
 
     rows = _normalize_picks(picks)
 
+    # 注意：price 只来自选股报告（daily_pick 的「最新价」）。报告没给价就保持 0.0，
+    # 这里**不**去行情兜底——「缺价=未知」本身就是有用信号，自动编造会让执行侧的
+    # 「跳空不追」校验误以为拿到了真实锚点。历史计划用 backfill_prices() 手动补。
+
     # 2. 目标只数收口（计划本身不得超限）
     limit = max_positions if top_n is None else min(top_n, max_positions)
     rows = rows[: max(0, limit)]
@@ -353,6 +383,30 @@ def save_trade_plan(plan: TradePlan, plan_dir: Optional[Path] = None) -> Path:
         encoding="utf-8",
     )
     return p
+
+
+def backfill_prices(plan_date: Optional[str] = None, plan_dir: Optional[Path] = None) -> Optional[TradePlan]:
+    """给已有计划补上参考价（不改动标的与权重）。返回更新后的计划，无计划返回 None。
+
+    场景：历史计划生成时 report 没透传价格，导致 10 只目标 price 全 0.0。
+    这里按现有标的代码拉收盘价回填，让「跳空不追」校验重新可用。
+    """
+    plan = load_trade_plan(plan_date, plan_dir)
+    if plan is None:
+        logger.warning("回填价格失败：找不到计划 %s", plan_date or "(最新)")
+        return None
+    closes = _fetch_close_prices([t.code for t in plan.targets])
+    n = 0
+    for t in plan.targets:
+        if float(t.price or 0) <= 0 and t.code in closes:
+            t.price = closes[t.code]
+            n += 1
+    if n:
+        save_trade_plan(plan, plan_dir=plan_dir)
+        logger.info(f"📌 计划 {plan.plan_date} 回填参考价 {n} 只")
+    else:
+        logger.info(f"计划 {plan.plan_date} 无需回填（{len(plan.targets)} 只均已有价格或取价失败）")
+    return plan
 
 
 def load_trade_plan(
@@ -423,5 +477,17 @@ def plan_diff(plan: TradePlan, held_codes: Sequence[str]) -> Dict[str, List[str]
 
 
 if __name__ == "__main__":  # 手动生成一次
-    p = build_trade_plan(write=True)
-    print(p.summary())
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backfill", nargs="?", const="", default=None,
+                   help="回填已有计划的参考价（默认最新，可指定 plan_date），不改动标的/权重")
+    ap.add_argument("--plan-date", dest="plan_date", default=None)
+    a = ap.parse_args()
+
+    if a.backfill is not None:
+        plan = backfill_prices(a.backfill or a.plan_date)
+        print(plan.summary() if plan else "未找到计划")
+    else:
+        p = build_trade_plan(write=True)
+        print(p.summary())

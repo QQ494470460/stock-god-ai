@@ -54,6 +54,11 @@ htmlcov/
 .coverage.*
 coverage.xml
 
+# Test artifacts
+.pytest_cache/
+.pt_tmp*/
+__pycache__/
+
 # Secrets (never commit)
 config/broker_accounts.enc
 config/.salt

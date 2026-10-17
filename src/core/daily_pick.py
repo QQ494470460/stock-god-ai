@@ -111,7 +111,15 @@ def generate_daily_picks(
                 col = "代码" if "代码" in df.columns else ("code" if "code" in df.columns else None)
                 if col is not None:
                     def _last_close(c):
-                        d = stock_data.get(str(c)) or stock_data.get(str(c).zfill(6))
+                        # ⚠️ 不能用 `df or fallback`：pandas DataFrame 的布尔值
+                        # 是「ambiguous」，直接 `bool(df)` 会抛异常（曾被外层
+                        # except 静默吞掉，导致最新价从未真正注入）。改用显式
+                        # None 判断。
+                        d = stock_data.get(str(c))
+                        if d is None:
+                            d = stock_data.get(str(c).zfill(6))
+                        if d is None or len(d) == 0:
+                            return 0.0
                         try:
                             return round(float(d["close"].iloc[-1]), 2)
                         except Exception:  # noqa: BLE001
