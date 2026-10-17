@@ -18,6 +18,12 @@ from src.core import daily_pick
 from src.scheduler import auto_scheduler
 
 
+@pytest.fixture(autouse=True)
+def _isolate_job_leases(tmp_path, monkeypatch):
+    """作业租约锁文件写到 tmp，绝不在生产 data/ 留 .job_*.lock。"""
+    monkeypatch.setattr(auto_scheduler, "LEASE_DIR", tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Fake 依赖
 # ---------------------------------------------------------------------------
@@ -261,3 +267,48 @@ def test_daily_pick_plan_dry_run_writes_nothing(patched, monkeypatch, tmp_path):
     info = auto_scheduler.job_daily_pick(dry_run=True)
     assert info["plan_date"] == "2026-10-15"        # 计划对象仍生成
     assert not (tmp_path / "trade_plans").exists()  # 但不落盘
+
+
+# ---------------------------------------------------------------------------
+# 跨进程作业租约（看板 + run_loop 两份调度器不得重复触发同一 cron）
+# ---------------------------------------------------------------------------
+
+def test_job_lease_prevents_double_run(tmp_path):
+    """锁被别的进程占着时，本次必须跳过且不碰真实作业；跑完必须解锁。"""
+    lock = tmp_path / ".job_evolution.lock"
+    lock.write_text("99999")          # 模拟另一个进程持锁
+
+    info = auto_scheduler.job_evolution()
+    assert info["status"] == "skipped"
+    assert "租约" in info["reason"]
+
+    lock.unlink()                     # 对方跑完释放
+    info2 = auto_scheduler.job_evolution()
+    assert info2.get("status") != "skipped"
+    assert not lock.exists(), "作业结束后必须释放租约"
+
+
+def test_stale_job_lease_is_taken_over(tmp_path):
+    """持锁进程崩了（锁超时）必须能被接管，否则作业会被永久卡死。"""
+    import os
+    import time
+    lock = tmp_path / ".job_evolution.lock"
+    lock.write_text("12345")
+    old = time.time() - 7200          # 2 小时前的锁，超过 1h TTL
+    os.utime(lock, (old, old))
+
+    info = auto_scheduler.job_evolution()
+    assert info.get("status") != "skipped", "陈旧锁应被接管"
+    assert not lock.exists()
+
+
+def test_job_lease_released_on_exception(tmp_path, monkeypatch):
+    """作业内部抛异常也必须释放租约，不能把后续调度全部堵死。"""
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(auto_scheduler, "_job_data_update_impl", _boom)
+    with pytest.raises(RuntimeError):
+        auto_scheduler.job_data_update()
+    assert not (tmp_path / ".job_data_update.lock").exists()

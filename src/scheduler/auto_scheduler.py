@@ -24,8 +24,11 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -41,6 +44,7 @@ except Exception:  # noqa: BLE001
     CronTrigger = None
     _HAS_APS = False
 
+from config.settings import DATA_DIR
 from config.settings import config as app_config
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
@@ -51,12 +55,73 @@ from src.core.daily_pick import generate_daily_picks
 _scheduler: Optional["BackgroundScheduler"] = None
 _lock = threading.Lock()
 
+# 作业租约锁文件目录（测试可 monkeypatch 到 tmp_path，避免在 data/ 留痕）
+LEASE_DIR: Path = Path(DATA_DIR)
+
+
+# ----------------------------------------------------------------------------
+# 跨进程作业租约（防止看板与 run_loop 两份调度器重复触发同一个 cron）
+# ----------------------------------------------------------------------------
+@contextmanager
+def _job_lease(job_id: str, ttl_sec: float = 1800.0):
+    """给一个作业加跨进程互斥锁，yield True 表示拿到租约。
+
+    背景：调度器会随「看板进程」和「常驻 run_loop 进程」各自拉起一份。
+    两个进程的 APScheduler 互不知情，18:45 的 daily_pick 会被跑两遍 ——
+    重复扫全池、重复写报告与交易计划，进化作业甚至可能重复应用同一批参数变更。
+
+    用 ``O_CREAT|O_EXCL`` 建一个锁文件做跨进程互斥；进程崩溃留下的陈旧锁
+    按 ``ttl_sec`` 接管（所以 ttl 必须大于单个作业的最长耗时）。
+    """
+    path = Path(LEASE_DIR) / f".job_{job_id}.lock"
+    acquired = False
+
+    def _try_acquire() -> bool:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+
+    if _try_acquire():
+        acquired = True
+    else:
+        # 已有进程持锁：判断是否陈旧
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age < ttl_sec:
+            logger.info(f"⏭️  作业 {job_id} 正由其他进程执行中（锁 {path.name}，{age:.0f}s），本次跳过")
+        else:
+            logger.warning(f"⚠️  作业 {job_id} 的锁已陈旧（{age:.0f}s），接管执行")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            acquired = _try_acquire()
+
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
 
 # ----------------------------------------------------------------------------
 # 单个任务（独立可测，不依赖 APScheduler）
 # ----------------------------------------------------------------------------
 
-def job_data_update() -> Dict:
+def _job_data_update_impl() -> Dict:
     """刷新本地行情缓存。无显式 update 方法时，退化为拉取当前池最新行情。"""
     info: Dict = {"job": "data_update", "at": datetime.now().isoformat(timespec="seconds"),
                   "status": "ok", "refreshed": 0, "error": None}
@@ -78,7 +143,7 @@ def job_data_update() -> Dict:
     return info
 
 
-def job_daily_pick(dry_run: bool = False) -> Dict:
+def _job_daily_pick_impl(dry_run: bool = False) -> Dict:
     """生成每日 AI 推荐并写报告；同步产出「交易计划」；可选推送到企微/Webhook。
 
     闭环关键一环：推荐只写报告的话，盘中交易拿不到标的。这里顺手把它转成
@@ -151,7 +216,7 @@ def job_daily_pick(dry_run: bool = False) -> Dict:
     return info
 
 
-def job_evolution() -> Dict:
+def _job_evolution_impl() -> Dict:
     """
     回测验证 + 触发自我进化（与看板「运行回测验证」完全一致的逻辑）。
     复用 src.models.tracker_v2.verify_all_pending()。
@@ -205,6 +270,40 @@ def job_evolution() -> Dict:
         info["error"] = str(e)
         logger.error(f"进化任务失败: {e}\n{traceback.format_exc()}")
     return info
+
+
+# ----------------------------------------------------------------------------
+# 对外入口：带跨进程租约的作业（看板与 run_loop 各自起一份调度器也不会重复跑）
+# ----------------------------------------------------------------------------
+
+def _skipped(job: str, ttl: float) -> Dict:
+    return {"job": job, "status": "skipped",
+            "reason": "另一个进程正在执行同一作业（租约被占用）",
+            "at": datetime.now().isoformat(timespec="seconds")}
+
+
+def job_data_update() -> Dict:
+    """数据更新（带跨进程租约）。"""
+    with _job_lease("data_update", ttl_sec=1800) as ok:
+        if not ok:
+            return _skipped("data_update", 1800)
+        return _job_data_update_impl()
+
+
+def job_daily_pick(dry_run: bool = False) -> Dict:
+    """每日推荐 + 交易计划（带跨进程租约）。dry_run 不写报告。"""
+    with _job_lease("daily_pick", ttl_sec=3600) as ok:
+        if not ok:
+            return _skipped("daily_pick", 3600)
+        return _job_daily_pick_impl(dry_run=dry_run)
+
+
+def job_evolution() -> Dict:
+    """回测验证 + 自我进化（带跨进程租约）。"""
+    with _job_lease("evolution", ttl_sec=3600) as ok:
+        if not ok:
+            return _skipped("evolution", 3600)
+        return _job_evolution_impl()
 
 
 # ----------------------------------------------------------------------------
