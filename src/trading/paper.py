@@ -87,7 +87,40 @@ class PaperAccount:
         self._load()
     
     # ========== 持久化 ==========
-    
+
+    def _normalize_holdings(self) -> None:
+        """让 ``market_value`` 恒等于 ``quantity × last_price``。
+
+        历史坑：买入时 ``market_value`` 按**成交价**写死，之后 ``last_price``
+        被 mark_to_market / 手工修正更新，但 ``market_value`` 没跟着走。实测
+        `data/paper_account.json` 出现过 quantity=300、last_price=1501.95、
+        market_value=450000（应为 450585）—— 总资产、今日盈亏、调仓的目标市值
+        三者同时偏低，而且看不出来。
+
+        统一在载入和落盘两个口子上归一，任何来源的漂移都会被拉正。
+        """
+        for h in self.holdings.values():
+            try:
+                qty = int(h.get("quantity", 0) or 0)
+            except Exception:  # noqa: BLE001
+                qty = 0
+            if qty <= 0:
+                continue
+            try:
+                px = float(h.get("last_price") or 0)
+            except Exception:  # noqa: BLE001
+                px = 0.0
+            if px <= 0:
+                # 没有最新价就退化成成本价，至少不留下 0 市值
+                try:
+                    px = float(h.get("avg_cost") or 0)
+                except Exception:  # noqa: BLE001
+                    px = 0.0
+                if px > 0:
+                    h["last_price"] = px
+            if px > 0:
+                h["market_value"] = round(qty * px, 2)
+
     def _load(self):
         """从磁盘恢复状态"""
         try:
@@ -95,6 +128,9 @@ class PaperAccount:
                 data = json.loads(self.account_file.read_text(encoding="utf-8"))
                 self.cash = data.get("cash", self.initial_cash)
                 self.holdings = data.get("holdings", {})
+                # 先把 market_value 拉回 quantity×last_price，再做下面的权益对账，
+                # 否则陈旧市值会连带把本金基线也算偏。
+                self._normalize_holdings()
                 # 兼容旧存档：补齐 T+1 相关字段，否则卖出时会 KeyError
                 for _h in self.holdings.values():
                     _h.setdefault("today_quantity", 0)
@@ -132,6 +168,7 @@ class PaperAccount:
     def _save(self):
         """持久化（后台异步写）"""
         try:
+            self._normalize_holdings()   # 落盘前再拉正一次，防止外部改 last_price
             data = {
                 "cash": self.cash,
                 "initial_cash": self.initial_cash,

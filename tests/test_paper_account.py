@@ -41,22 +41,29 @@ def _new_account(tmp_path, initial_cash: float = 100000.0, seed: dict = None):
 # ======================================================================
 def test_seeded_account_reconciles_initial_cash(tmp_path):
     """被外部注入资金的「历史存档」（无 initial_cash 字段）加载后，
-    本金基线必须等于载入时总资产，账户级盈亏接近 0。"""
+    本金基线必须等于载入时总资产，账户级盈亏接近 0。
+
+    注意：载入时会先把 market_value 拉回 quantity × last_price，
+    所以「载入时总资产」按现价算，不按存档里可能陈旧的 market_value 算。
+    """
     seed = {
         "cash": 4545223.775,
         "holdings": {
             "600519": {
                 "name": "贵州茅台", "quantity": 300, "available": 0,
                 "today_quantity": 300, "avg_cost": 1501.725,
+                # 故意留一个陈旧市值：归一化应把它拉回 300 × 1501.95
                 "market_value": 450000.0, "last_price": 1501.95,
             }
         },
         "today_pnl": -3883.29, "today_trades": 2, "last_reset_date": "2026-10-15",
     }
-    pa, _ = _new_account(tmp_path, seed=seed)
+    pa, acct = _new_account(tmp_path, seed=seed)
 
-    expected_equity = 4545223.775 + 450000.0
+    assert pa.holdings["600519"]["market_value"] == 300 * 1501.95
+    expected_equity = 4545223.775 + 300 * 1501.95
     assert abs(pa.initial_cash - expected_equity) < 0.01
+    assert abs(pa.get_total_asset() - expected_equity) < 0.01
     # 注入资本不算盈利：账户级盈亏应接近 0
     assert abs(pa.get_total_pnl()) < 1.0
     assert abs(pa.get_total_pnl_pct()) < 0.01

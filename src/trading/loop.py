@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -102,6 +103,7 @@ class LoopConfig:
     notify: bool = True                  # 是否推送事件/日报
     dry_run: bool = False                # True=只预演不下单
     price_fallback: bool = True          # 无 tick 时回退日线收盘价
+    heartbeat_file: str = ""             # tick 心跳落盘路径（空=data/loop_heartbeat.json）
 
     @classmethod
     def from_app_config(cls) -> "LoopConfig":
@@ -216,6 +218,12 @@ class TradingLoop:
             "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
         }
 
+        # 心跳：每次 tick 落盘一次，用于回答「今天到底有没有在跑」。
+        self.heartbeat_file: Path = (
+            Path(self.config.heartbeat_file) if self.config.heartbeat_file
+            else (Path(DATA_DIR) / "loop_heartbeat.json")
+        )
+
         # 事件回调接到 guard，让中枢事件也能透传到 UI
         if self._on_event:
             try:
@@ -252,6 +260,39 @@ class TradingLoop:
             self._on_event(event, data)
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------------
+    # 心跳（判断「没跑」还是「跑了但没成交」）
+    # ------------------------------------------------------------------
+    def _write_heartbeat(self, report: TickReport) -> None:
+        """把最近一次 tick 的摘要落盘。
+
+        为什么需要：闭环「①选股→②计划→③交易→④业绩→⑤进化」里，③交易这一步
+        没有任何定时任务驱动，全靠人工启动 `run_loop.py` 或点看板按钮。10-14~10-16
+        三天的结算报告都是 ``intents=0``，事后翻日志才分清到底是「根本没跑」还是
+        「跑了但没满足调仓条件」—— 这两种情况的处置方式完全不同。
+
+        心跳文件字段：时间戳、状态、市场阶段、计划日、权益、意图/成交/拦截计数、pid。
+        读取用模块级 :func:`read_heartbeat`。
+        """
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "state": report.state,
+            "market_status": report.market_status,
+            "plan_date": report.plan_date,
+            "n_positions": int(report.n_positions),
+            "equity": round(float(report.equity or 0), 2),
+            "n_intents": int(report.n_intents),
+            "n_executed": int(report.n_executed),
+            "n_blocked": int(report.n_blocked),
+            "dry_run": bool(self.config.dry_run),
+            "guard_mode": self.guard.safety.mode.value,
+        }
+        self.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+        self.heartbeat_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     # ------------------------------------------------------------------
     # 账户 / 持仓 / 行情（PAPER 与 LIVE 统一口径）
@@ -306,6 +347,37 @@ class TradingLoop:
             if p > 0:
                 out[c] = p
         return out
+
+    def _mark_paper_to_market(self, prices: Dict[str, float]) -> bool:
+        """把纸账户持仓按最新价 mark 一遍，返回是否真的动了。
+
+        为什么必须有：纸账户的 ``last_price`` 只在买入/卖出时更新，平时没有任何
+        人推它 —— 于是「持仓现价」可能停在上一次成交那一刻。实测 600519 停在
+        1501.95，而当日实际收盘 1329.00，同一屏上出现：
+
+          · 持仓卡片显示浮盈 +0.01%（用的是纸账户旧价）
+          · 风控止损判定 -11.5%（用的是实时取价）
+
+        两个数字互相矛盾，看到的人只会以为程序疯了。统一在拿到行情后 mark，
+        权益 / 盈亏 / 止损三个口径就对上了。
+
+        ⚠️ 只用 >0 的价，缺价不覆盖 —— 行情拿不到时保持上一次的估值，
+        绝不能把持仓市值打成 0。
+        """
+        pa = getattr(self.guard, "paper_account", None)
+        if pa is None:
+            return False
+        clean = {k: float(v) for k, v in (prices or {}).items() if v and float(v) > 0}
+        if not clean:
+            return False
+        try:
+            before = {c: h.get("last_price") for c, h in pa.holdings.items()}
+            pa.mark_to_market(clean)
+            return any(pa.holdings[c].get("last_price") != before.get(c)
+                       for c in pa.holdings)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"纸账户 mark_to_market 失败（已忽略）: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # 计划
@@ -626,6 +698,18 @@ class TradingLoop:
     # 主 tick
     # ------------------------------------------------------------------
     def tick(self) -> TickReport:
+        """执行一个完整的闭环周期，并落盘一次心跳。
+
+        心跳失败绝不影响交易主流程（写盘异常会被吞掉并记 debug）。
+        """
+        report = self._tick_impl()
+        try:
+            self._write_heartbeat(report)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"心跳写入失败（已忽略）: {e}")
+        return report
+
+    def _tick_impl(self) -> TickReport:
         """执行一个完整的闭环周期。线程安全（可重入保护）。"""
         with self._lock:
             self._price_cache.clear()
@@ -710,6 +794,18 @@ class TradingLoop:
                         ({t.code for t in self.plan.targets} if self.plan else set()))
             prices = self._prices_for(need)
 
+            # --- ⑥.5 纸账户按最新价 mark ---
+            # 必须在止损/调仓之前：否则「持仓浮盈」用旧价、「止损判定」用实时价，
+            # 同一份报告里两个口径互相矛盾（实测 +0.01% vs -11.5%）。
+            if self._mark_paper_to_market(prices):
+                positions = self._positions()
+                account = self._account()
+                report.n_positions = len(positions)
+                if account:
+                    report.equity = float(account.total_asset)
+                    report.cash = float(account.available_cash)
+                    report.market_value = float(account.market_value)
+
             # --- ⑦ 止盈止损（优先，纪律性离场） ---
             if self.config.enable_stop_orders:
                 self._run_exits(positions, prices, report)
@@ -788,7 +884,11 @@ class TradingLoop:
     # 预演 / 状态
     # ------------------------------------------------------------------
     def preview(self) -> dict:
-        """不产生任何副作用的「本该下什么单」预演。"""
+        """预演「本该下什么单」：不下单、不写盘（不产生任何持久化副作用）。
+
+        注意：会顺带把纸账户按最新价 mark 一遍（仅内存），
+        这样预演出来的盈亏/止损口径与真实 tick 一致。
+        """
         from src.trading.rebalance import summarize_intents, compute_rebalance_orders
 
         self._ensure_plan(TickReport())
@@ -798,6 +898,11 @@ class TradingLoop:
                     ({t.code for t in self.plan.targets} if self.plan else set()))
         self._price_cache.clear()
         prices = self._prices_for(need)
+
+        # 预演也要 mark：否则预览出来的持仓盈亏和止损判定同样会打架
+        if self._mark_paper_to_market(prices):
+            account = self._account()
+            positions = self._positions()
 
         intents = compute_rebalance_orders(
             self.plan, positions, account, prices,
@@ -846,7 +951,30 @@ class TradingLoop:
             "settled_today": _today() in self._settled_dates,
             "guard": g,
             "last_report": self._last_report.to_dict() if self._last_report else None,
+            "heartbeat": read_heartbeat(self.heartbeat_file),
         }
+
+
+def read_heartbeat(path: Optional[Path] = None) -> dict:
+    """读取 tick 心跳（缺失/损坏返回空 dict）。
+
+    附带 ``age_sec``（距现在多少秒），调用方据此判断「是否还活着」。
+    """
+    p = Path(path) if path else (Path(DATA_DIR) / "loop_heartbeat.json")
+    try:
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ts = data.get("ts")
+        if ts:
+            try:
+                data["age_sec"] = round(
+                    (datetime.now() - datetime.fromisoformat(ts)).total_seconds(), 1)
+            except Exception:  # noqa: BLE001
+                data["age_sec"] = None
+        return data
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 if __name__ == "__main__":  # 手动跑一个周期
