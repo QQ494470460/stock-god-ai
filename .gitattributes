@@ -1,1 +1,14 @@
 * text=auto eol=lf
+
+# ===========================================================================
+# Windows 原生脚本必须保持 CRLF（后出现的规则覆盖前面的 eol=lf）。
+#
+# 起因：run_loop_daemon.bat 曾被统一成 LF，cmd.exe 的批处理解析器对换行敏感，
+# if 块和 goto 标签会被切碎，启动器直接死于「'M' 不是内部或外部命令」，
+# 于是「登录即自启」这条链路一次都没跑通过，而且没有任何报错提醒。
+# tests/test_run_loop_launcher.py 会把「纯 ASCII + 全 CRLF」钉成硬约束。
+# ===========================================================================
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf

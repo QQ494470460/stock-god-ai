@@ -69,6 +69,17 @@ def test_daemon_bat_has_no_bom():
     assert not BAT.read_bytes().startswith(b"\xef\xbb\xbf"), "批处理不该有 UTF-8 BOM"
 
 
+def test_gitattributes_pins_bat_to_crlf():
+    """仓库存的是 LF、检出必须是 CRLF；这条规则被删掉，bug 就会在新克隆里复活。"""
+    import re
+
+    text = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert re.search(r"^\*\.bat\s+text\s+eol=crlf\s*$", text, re.M), (
+        ".gitattributes 缺少 `*.bat text eol=crlf`："
+        "全局的 eol=lf 会让批处理检出成裸 LF，cmd 解析器随即失效。"
+    )
+
+
 # --------------------------------------------------------------------------
 # 2) 启动器要真的用探针 + 尊重 rc=3
 # --------------------------------------------------------------------------
