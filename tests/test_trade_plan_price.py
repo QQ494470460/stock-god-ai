@@ -107,3 +107,72 @@ def test_backfill_prices_persists(tmp_path, fake_closes):
 def test_backfill_prices_no_plan_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(TP, "_fetch_close_prices", lambda codes: {})
     assert backfill_prices(plan_date="2099-01-01", plan_dir=tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# 市场状态（指数级 regime）自适应：熊市降权、牛市放开
+# ---------------------------------------------------------------------------
+
+def _make_picks(n: int, price: float = 9.0):
+    return [
+        {"代码": f"{600000 + i:06d}", "名称": f"标的{i}", "评分": 60.0 - i * 0.1,
+         "推荐理由": "个股顺风", "最新价": price}
+        for i in range(n)
+    ]
+
+
+def test_build_trade_plan_bear_deweights():
+    """熊市（指数级 regime）：未显式传参时自动收敛仓位 + 多留现金。"""
+    picks = _make_picks(8)
+    plan = build_trade_plan(
+        picks=picks, pool="zz500", min_score=55.0, regime="bear",
+        weighting="equal", write=False,
+    )
+    assert plan.regime == "bear"
+    assert plan.max_positions == 6          # 熊市上限 6
+    assert abs(plan.cash_reserve_pct - 0.20) < 1e-9   # 熊市现金 20%
+    assert len(plan.targets) == 6           # 8 只里只留 6 只
+    # 可投资 80%，6 等权 -> 各 ~13.33%
+    for t in plan.targets:
+        assert abs(t.weight - 0.80 / 6) < 1e-9
+        assert t.price == 9.0               # 参考价照常透传
+
+
+def test_build_trade_plan_bull_expands():
+    """牛市（指数级 regime）：未显式传参时略放开（更多标的、更少现金）。"""
+    picks = _make_picks(14)
+    plan = build_trade_plan(
+        picks=picks, pool="zz500", min_score=50.0, regime="bull",
+        weighting="equal", write=False,
+    )
+    assert plan.max_positions == 12
+    assert abs(plan.cash_reserve_pct - 0.05) < 1e-9
+    assert len(plan.targets) == 12
+    for t in plan.targets:
+        assert abs(t.weight - 0.95 / 12) < 1e-9
+
+
+def test_build_trade_plan_sideways_unchanged():
+    """震荡/未知：保持默认 10 只 / 现金 10%。"""
+    picks = _make_picks(12)
+    plan = build_trade_plan(
+        picks=picks, pool="zz500", min_score=50.0, regime="sideways",
+        weighting="equal", write=False,
+    )
+    assert plan.max_positions == 10
+    assert abs(plan.cash_reserve_pct - 0.10) < 1e-9
+    assert len(plan.targets) == 10
+
+
+def test_build_trade_plan_explicit_beats_regime():
+    """显式传参优先：即使 regime=bear，传了 max_positions/cash 也不被覆盖。"""
+    picks = _make_picks(10)
+    plan = build_trade_plan(
+        picks=picks, pool="zz500", min_score=55.0, regime="bear",
+        max_positions=10, cash_reserve_pct=0.10,
+        weighting="equal", write=False,
+    )
+    # 显式指定 -> 熊市覆盖被跳过
+    assert plan.max_positions == 10
+    assert abs(plan.cash_reserve_pct - 0.10) < 1e-9
+    assert len(plan.targets) == 10

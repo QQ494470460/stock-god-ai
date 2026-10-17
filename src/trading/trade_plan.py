@@ -42,6 +42,22 @@ from config.settings import DATA_DIR
 
 
 # ----------------------------------------------------------------------------
+# 市场状态 → 组合参数覆盖（指数级 regime 自适应）
+# ----------------------------------------------------------------------------
+# 仅在调用方「未显式指定」max_positions / cash_reserve_pct 时生效。
+# 设计：全市场走熊时收敛仓位（更少的标的 + 更多现金），走牛时略放开。
+# 约定：plan.regime 是**指数级**（000300.SH）口径，与 picks 里逐股的 reason
+# （个股口径）是两回事，二者可合法不一致。这里用指数级 regime 做组合层面的
+# 防御性调整（全市场走熊 → 少而精 + 多留现金），与个股判断互不干扰。
+# 显式传入的参数永远优先（手动/测试可覆盖）。
+REGIME_POSITION_OVERRIDES = {
+    "bear":    {"max_positions": 6,  "cash_reserve_pct": 0.20},
+    "bull":    {"max_positions": 12, "cash_reserve_pct": 0.05},
+    # sideways / 未知 / 空：不调整，沿用默认 10 只 / 现金 10%
+}
+
+
+# ----------------------------------------------------------------------------
 # 数据结构
 # ----------------------------------------------------------------------------
 
@@ -312,8 +328,8 @@ def build_trade_plan(
     min_score: float = 0.0,
     regime: str = "",
     top_n: Optional[int] = None,
-    max_positions: int = 10,
-    cash_reserve_pct: float = 0.10,
+    max_positions: Optional[int] = None,
+    cash_reserve_pct: Optional[float] = None,
     weighting: str = "equal",
     weight_cap: Optional[float] = None,
     write: bool = True,
@@ -324,6 +340,10 @@ def build_trade_plan(
     picks 为 None 时，自动读取最近一份 daily_reports 里的推荐（离线可用）。
     weight_cap 建议传风控 guard 的 max_single_position_pct（默认 0.30），
     使计划与风控口径一致。
+
+    市场状态自适应：当 ``regime`` 命中 ``REGIME_POSITION_OVERRIDES`` 且调用方
+    未显式传入 ``max_positions`` / ``cash_reserve_pct`` 时，自动套用该状态的
+    防御性组合参数（熊市→少而精+多现金，牛市→略放开）。显式传参优先。
     """
     # 1. 拿 picks
     if picks is None:
@@ -334,6 +354,21 @@ def build_trade_plan(
         source = source or meta.get("source", "daily_pick")
 
     rows = _normalize_picks(picks)
+
+    # ---- 市场状态（指数级）自适应：熊市更保守、牛市更激进 ----
+    # 仅当调用方未显式传入对应参数时才套用覆盖（REGIME_POSITION_OVERRIDES），
+    # 保证手动/测试显式指定的值永远优先、可复现。
+    if regime in REGIME_POSITION_OVERRIDES:
+        ov = REGIME_POSITION_OVERRIDES[regime]
+        if max_positions is None and "max_positions" in ov:
+            max_positions = int(ov["max_positions"])
+        if cash_reserve_pct is None and "cash_reserve_pct" in ov:
+            cash_reserve_pct = float(ov["cash_reserve_pct"])
+    # 兜底默认（调用方未传、且 regime 无覆盖时）
+    if max_positions is None:
+        max_positions = 10
+    if cash_reserve_pct is None:
+        cash_reserve_pct = 0.10
 
     # 注意：price 只来自选股报告（daily_pick 的「最新价」）。报告没给价就保持 0.0，
     # 这里**不**去行情兜底——「缺价=未知」本身就是有用信号，自动编造会让执行侧的

@@ -338,6 +338,15 @@ class WalkForwardBacktester:
         # 用 IC 与组合口径汇总
         metrics = {
             "rank_ic": float(ic_series.mean()) if len(ic_series) else float("nan"),
+            # ⚠️ 关于 ic_ir 的口径（复核结论见 tests/test_ic_ir_no_lookahead.py 与
+            # docs/IC_IR_复核结论.md）：
+            # 本函数这里的 ic_ir = mean(每日IC) / std(每日IC)，即 Grinold-Kahn 信息比率，
+            # 反映「日频排序能力的稳定性」。本模型实测约 0.3~1.5（偏低：单日 IC 的 std
+            # 约为均值的 3 倍，说明单日排序噪声大，靠组合层/多日累计才显效）。
+            # 注意：production_metrics.json 那个 ic_ir=14 是**另一种口径**——来自
+            # labeling.py 的 mean_rank_ic，分母是「标准误 SE = std/sqrt(n_days)」（t 统计量），
+            # 945 天样本把它放大约 sqrt(945)≈31 倍，所以看着像 14。两者都**不是前视/泄漏**：
+            # 负向对照（逐日打乱 score → IC 塌缩到 ~0）已证明指标只响应真实排序信号。
             "ic_ir": float(ic_series.mean() / ic_series.std(ddof=1)) if len(ic_series) > 1 and ic_series.std(ddof=1) > 0 else float("nan"),
             "ic_positive_rate": float((ic_series > 0).mean()) if len(ic_series) else float("nan"),
             "top_excess": float(np.mean(excess_list)) if excess_list else float("nan"),
