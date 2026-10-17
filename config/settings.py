@@ -237,6 +237,7 @@ class SchedulerConfig:
     data_update_cron: str = "30 18 * * mon-fri" # 收盘后更新数据（工作日 18:30）
     daily_pick_cron: str = "45 18 * * mon-fri"  # 生成每日推荐（工作日 18:45）
     evolution_cron: str = "0 19 * * mon-fri"    # 回测验证 + 触发进化（工作日 19:00）
+    rolling_ic_cron: str = "15 19 * * mon-fri"  # 每日 RankIC 回填（工作日 19:15，收盘后补当日点）
     timezone: str = "Asia/Shanghai"
     # 每日推荐产物
     report_dir: str = "data/daily_reports"

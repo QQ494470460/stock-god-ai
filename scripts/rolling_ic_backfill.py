@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""RankIC 历史回填 —— 把 rolling_ic_log.json 从「偶尔 1 点」补成「逐交易日序列」。
+"""RankIC 历史回填 CLI —— 薄壳，核心在 ``src/core/rolling_ic.py::run_backfill``。
 
 为什么需要它
 ------------
@@ -33,48 +33,14 @@ paper_shadow_audit.py --live-ic 只在「跑那一下」产出 1 个点，所以
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from datetime import datetime
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-IC_LOG = ROOT / "data" / "rolling_ic_log.json"
-
-
-def _load_json(path: Path):
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return None
-
-
-def _spearman(x, y) -> float:
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if len(x) < 3 or np.allclose(x, x[0]) or np.allclose(y, y[0]):
-        return float("nan")
-    rx = pd.Series(x).rank().values
-    ry = pd.Series(y).rank().values
-    if np.std(rx) == 0 or np.std(ry) == 0:
-        return float("nan")
-    return float(np.corrcoef(rx, ry)[0, 1])
-
-
-def _next_trading_day(d: pd.Timestamp, n: int) -> pd.Timestamp:
-    from src.trading.calendar import next_trading_day
-    cur = d
-    for _ in range(n):
-        cur = pd.Timestamp(next_trading_day(cur, include_today=False))
-    return cur
+from src.core.rolling_ic import IC_LOG, run_backfill
 
 
 def main() -> int:
@@ -88,131 +54,29 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只报告规模不跑模型")
     args = ap.parse_args()
 
-    from src.data.fetcher import fetcher
-    from src.models.predictor import predictor
+    res = run_backfill(
+        days=args.days, sample=args.sample, horizon=args.horizon,
+        min_stocks=args.min_stocks, pool=args.pool, out=args.out,
+        dry_run=args.dry_run,
+    )
 
-    print(f"📡 拉取股票池 {args.pool} ...")
-    codes = list(fetcher.get_stock_pool(args.pool))
-    if args.sample and args.sample < len(codes):
-        codes = codes[: args.sample]
-    print(f"   宇宙 {len(codes)} 只（截断自 {args.pool}）")
-
-    print("📥 拉取历史日线 ...")
-    raw = {}
-    for i, code in enumerate(codes, 1):
-        try:
-            df = fetcher.get_daily_kline(code)
-            if df is None or len(df) < 120:
-                continue
-            df = df.copy()
-            df.index = pd.to_datetime(df["date"])
-            df = df.sort_index()
-            raw[code] = df
-        except Exception as e:  # noqa: BLE001
-            print(f"   ⚠️ {code} 行情失败: {e}")
-        if i % 50 == 0:
-            print(f"   ...{i}/{len(codes)}")
-    if not raw:
-        print("❌ 无任何可用行情，退出")
+    status = res.get("status")
+    if status == "error":
+        print(f"❌ 回填失败: {res.get('error')}")
         return 1
-    print(f"   可用 {len(raw)} 只")
-
-    close = pd.DataFrame({c: df["close"] for c, df in raw.items()}).sort_index()
-    all_dates = list(close.index)
-    # 候选评分日：从末尾往前取 --days 个「足够靠后、且 d+horizon 仍在数据内」的交易日
-    candidates = []
-    i = len(all_dates) - 1
-    while i >= 0 and len(candidates) < args.days:
-        d = all_dates[i]
-        d_fwd = _next_trading_day(d, args.horizon)
-        if d_fwd in close.index:
-            candidates.append(d)
-        i -= 1
-    candidates = list(reversed(candidates))  # 升序
-
-    # 已存在日志的日期 -> 跳过（可重入）
-    log = _load_json(args.out) or []
-    done = {r.get("date") for r in log if isinstance(r, dict)}
-    todo = [d for d in candidates if d.strftime("%Y-%m-%d") not in done]
-    print(f"🗓️ 候选评分日 {len(candidates)} 个，待算 {len(todo)} 个"
-          f"（已存在 {len(candidates) - len(todo)} 个）")
-
-    if args.dry_run:
-        print("🛑 dry-run：不跑模型。")
+    if status == "dry_run":
+        print(f"🛑 dry-run：候选 {res.get('candidates')} 个评分日，待算 {res.get('todo')} 个（不跑模型）。")
         return 0
-    if not todo:
-        print("✅ 全部已存在，无需回填。")
+    if status == "noop":
+        print(f"✅ 全部已存在，无需回填（日志共 {res.get('total')} 点）。")
         return 0
 
-    score_rows = []  # (date, code, score)
-    fwd_rows = []    # (date, code, excess)
-    t0 = datetime.now()
-    for k, d in enumerate(todo, 1):
-        d_fwd = _next_trading_day(d, args.horizon)
-        sliced = {c: df.loc[df.index <= d] for c, df in raw.items() if df.index[0] <= d}
-        try:
-            preds = predictor.predict_batch(sliced)
-        except Exception as e:  # noqa: BLE001
-            print(f"   ⚠️ 打分失败 @{d.date()}: {e}")
-            preds = []
-        sc = {p.code: float(p.score) for p in preds}
-        c0 = close.loc[d]
-        c1 = close.loc[d_fwd]
-        valid = [c for c in raw if c in sc and c in c0 and c in c1
-                 and pd.notna(c0[c]) and pd.notna(c1[c]) and c0[c] > 0]
-        if len(valid) < args.min_stocks:
-            continue
-        rets = np.array([c1[c] / c0[c] - 1.0 for c in valid], dtype=float)
-        excess = rets - rets.mean()  # 相对等权宇宙的超额（与训练标签口径一致）
-        for c, s, e in zip(valid, [sc[c] for c in valid], excess):
-            score_rows.append({"date": d, "code": c, "score": s})
-            fwd_rows.append({"date": d, "code": c, "excess": e})
-        if k % 5 == 0 or k == len(todo):
-            print(f"   ...{k}/{len(todo)} 评分日，累计 {len(score_rows)} 条 "
-                  f"({ (datetime.now()-t0).total_seconds():.0f}s)")
-
-    if not score_rows:
-        print("❌ 未产出任何有效评分，退出")
-        return 1
-
-    sp = pd.DataFrame(score_rows).pivot(index="date", columns="code", values="score")
-    fr = pd.DataFrame(fwd_rows).pivot(index="date", columns="code", values="excess")
-
-    new_entries = []
-    for d in sp.index:
-        s = sp.loc[d]
-        r = fr.loc[d]
-        v = pd.DataFrame({"s": s, "r": r}).dropna()
-        if len(v) < args.min_stocks:
-            continue
-        ic = _spearman(v["s"].values, v["r"].values)
-        if ic == ic:
-            new_entries.append({"date": d.strftime("%Y-%m-%d"),
-                                "ic": round(float(ic), 4),
-                                "n": int(len(v)),
-                                "offline": False})
-
-    # 合并去重（按 date），保留最近 250
-    merged = {r.get("date"): r for r in log if isinstance(r, dict)}
-    for e in new_entries:
-        merged[e["date"]] = e
-    merged_list = sorted(merged.values(), key=lambda r: r.get("date", ""))
-    merged_list = merged_list[-250:]
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(merged_list, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    ics = [e["ic"] for e in merged_list]
-    m = float(np.mean(ics))
-    sd = float(np.std(ics, ddof=1)) if len(ics) > 1 else float("nan")
-    se = sd / (len(ics) ** 0.5) if len(ics) > 1 and sd == sd else float("nan")
-    ir = m / sd if sd and sd > 0 else float("nan")
-    tstat = m / se if se and se > 0 else float("nan")
-    print(f"\n✅ 回填完成：新增 {len(new_entries)} 个评分日，日志共 {len(merged_list)} 点")
-    print(f"   全样本 RankIC 均值   {m:+.4f}")
-    print(f"   日频 IR (mean/std)   {ir:.2f}   ← 真正反映「单日排序稳不稳」")
-    print(f"   t 统计量 (mean/SE)   {tstat:.2f}   ← production_metrics 里那个 'ic_ir=14' 就是这个口径")
-    print(f"   正 IC 占比           {sum(1 for v in ics if v > 0)/len(ics)*100:.0f}%")
+    print(f"\n✅ 回填完成：新增 {res['added']} 个评分日，日志共 {res['total']} 点")
+    print(f"   全样本 RankIC 均值    {res['mean_ic']:+.4f}")
+    print(f"   日频 IR (mean/std)    {res['ir_mean_std']:.2f}   ← 真正反映「单日排序稳不稳」")
+    print(f"   t 统计量 (mean/SE)    {res['t_stat']:.2f}   ← production_metrics 里那个 'ic_ir=14' 就是这个口径")
+    print(f"   正 IC 占比            {res['pos_rate']*100:.0f}%")
+    print(f"   末点日期              {res.get('last_date')}")
     print(f"   下一步：python scripts/rolling_ic_curve.py  # 画稳定性曲线")
     return 0
 

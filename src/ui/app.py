@@ -522,7 +522,7 @@ with st.sidebar:
     if "page" not in st.session_state:
         st.session_state.page = "🏠 概览"
 
-    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📐 量化模型", "⚙️ 设置"]
+    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📐 量化模型", "📈 模型稳定性", "⚙️ 设置"]
 
     page = st.radio(
         "导航",
@@ -2825,6 +2825,66 @@ def render_safety_panel():
             st.json({k: (v.get("status") if isinstance(v, dict) else v)
                      for k, v in out.items() if k != "ran_at"})
     st.caption(f"调度状态：{'🟢 运行中' if is_running() else '⚪ 未运行'}")
+
+
+
+# ========== 📈 模型稳定性页 ==========
+if page == "📈 模型稳定性":
+    st.markdown('<p class="main-header">📈 模型稳定性（RankIC 滚动监控）</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">逐日横截面 RankIC 稳定性曲线 · 由收盘后自动回填累积</p>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption("数据源：data/rolling_ic_log.json（收盘后每日自动补点，按评分日去重）")
+    with col2:
+        window = st.slider("滚动窗口", 5, 60, 20, 1, key="ric_window")
+
+    try:
+        from src.core.rolling_ic import render_curve
+        svg, stats = render_curve(window=window)
+    except Exception as e:  # noqa: BLE001
+        svg, stats = None, None
+        st.error(f"渲染曲线失败: {e}")
+
+    if svg:
+        st.markdown(svg, unsafe_allow_html=True)
+
+    if stats and stats.get("n_points"):
+        n = stats["n_points"]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("样本点数", n)
+        c2.metric("RankIC 均值", f"{stats['mean_ic']:+.4f}")
+        c3.metric("日频 IR (mean/std)", f"{stats['ir_mean_std']}")
+        c4.metric("t 统计量 (mean/SE)", f"{stats['t_stat']}")
+        c5.metric("正 IC 占比", f"{stats['pos_rate']*100:.0f}%")
+        st.caption(f"末点日期：{stats.get('last_date')} ｜ 口径说明：production_metrics 里那个 "
+                   f"『ic_ir≈14』是 mean/SE（t 统计量，随样本量 √n 放大），并非日频真实 IR。"
+                   f"此处日频 IR≈{stats['ir_mean_std']} 才是单日排序稳定性的真实度量。")
+    else:
+        st.info("暂无 RankIC 数据。点击右侧「立即回填」生成历史序列，或等待收盘后自动任务累积。")
+
+    # 手动回填入口
+    with st.expander("🔧 手动回填 RankIC 历史", expanded=False):
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            bf_days = st.number_input("回溯交易日数", 5, 120, 30, 5, key="ric_days")
+        with rc2:
+            bf_pool = st.selectbox("股票池", ["zz500", "hs300", "zz1000", "all"], key="ric_pool")
+        with rc3:
+            bf_sample = st.number_input("宇宙截断只数", 30, 500, 150, 10, key="ric_sample")
+        if st.button("🚀 立即回填", type="primary", key="ric_run"):
+            with st.spinner(f"回填中（{bf_days} 交易日 / {bf_pool} / 样本 {bf_sample}）…后台可能需数分钟"):
+                try:
+                    from src.core.rolling_ic import run_backfill
+                    res = run_backfill(days=int(bf_days), pool=bf_pool, sample=int(bf_sample))
+                    if res.get("status") == "error":
+                        st.error(f"失败: {res.get('error')}")
+                    else:
+                        st.success(f"新增 {res.get('added')} 点，日志共 {res.get('total')} 点；"
+                                   f"均值 {res.get('mean_ic'):+.4f}，t 统计量 {res.get('t_stat')}")
+                        st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"回填异常: {e}")
 
 
 if page == "⚙️ 设置":

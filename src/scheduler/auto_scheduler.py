@@ -306,6 +306,30 @@ def job_evolution() -> Dict:
         return _job_evolution_impl()
 
 
+def job_rolling_ic(days: int = 5, dry_run: bool = False) -> Dict:
+    """每日 RankIC 回填（带跨进程租约）。
+
+    默认只补最近 ``days`` 个交易日的缺失评分日（收盘后每天跑一次，只增量补当天
+    及最近遗漏的点），避免长时间回填阻塞调度；大批量历史补齐请走
+    ``scripts/rolling_ic_backfill.py --days 30``。
+    """
+    with _job_lease("rolling_ic", ttl_sec=3600) as ok:
+        if not ok:
+            return _skipped("rolling_ic", 3600)
+        return _job_rolling_ic_impl(days=days, dry_run=dry_run)
+
+
+def _job_rolling_ic_impl(days: int = 5, dry_run: bool = False) -> Dict:
+    try:
+        from src.core.rolling_ic import run_backfill
+        res = run_backfill(days=days, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("rolling_ic 回填失败")
+        return {"job": "rolling_ic", "status": "error", "error": str(e),
+                "at": datetime.now().isoformat(timespec="seconds")}
+    return {"job": "rolling_ic", **res, "at": datetime.now().isoformat(timespec="seconds")}
+
+
 # ----------------------------------------------------------------------------
 # 调度器控制
 # ----------------------------------------------------------------------------
@@ -340,6 +364,7 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
             ("data_update", app_config.scheduler.data_update_cron, job_data_update),
             ("daily_pick", app_config.scheduler.daily_pick_cron, job_daily_pick),
             ("evolution", app_config.scheduler.evolution_cron, job_evolution),
+            ("rolling_ic", app_config.scheduler.rolling_ic_cron, job_rolling_ic),
         ]
         for jid, cron, fn in jobs:
             trig = _make_trigger(cron)
@@ -383,6 +408,7 @@ def run_all_once(dry_run: bool = False) -> Dict:
         "data_update": job_data_update(),
         "daily_pick": job_daily_pick(dry_run=dry_run),
         "evolution": job_evolution(),
+        "rolling_ic": job_rolling_ic(dry_run=dry_run),
     }
     out["ran_at"] = datetime.now().isoformat(timespec="seconds")
     # 简要落盘（便于追溯）
