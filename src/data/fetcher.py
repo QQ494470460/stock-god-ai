@@ -1024,7 +1024,7 @@ class DataFetcher:
             code = code.split(".")[0]
         if not re.match(r'^\d{6}$', code):
             return None
-        
+
         # 判断市场前缀
         if code.startswith(("6", "9", "5")):
             sym = f"sh{code}"
@@ -1032,7 +1032,18 @@ class DataFetcher:
             sym = f"bj{code}"
         else:
             sym = f"sz{code}"
-        
+
+        return self._tencent_quote(sym)
+
+    def _tencent_quote(self, sym: str) -> Optional[Dict]:
+        """按腾讯代码（``sz000001`` / ``sh000001``）取一条快照。
+
+        ⚠️ 单独抽出来的原因：**指数的市场前缀不能按首位数字猜**。
+        ``000001`` 对个股是平安银行（``sz000001``），对上证指数是
+        ``sh000001`` —— 同一个数字，两个完全不同的标的。历史 bug 正是
+        助手问「大盘怎么样」时被解析成平安银行。所以指数必须由调用方
+        给出**已带市场前缀**的 symbol，绝不复用个股的前缀推断。
+        """
         try:
             r = requests.get(f"http://qt.gtimg.cn/q={sym}", timeout=5)
             r.encoding = "gbk"
@@ -1044,13 +1055,13 @@ class DataFetcher:
             parts = payload.split("~")
             if len(parts) < 40:
                 return None
-            
+
             def _f(v, default=0.0):
                 try:
                     return float(v)
                 except (ValueError, TypeError):
                     return default
-            
+
             return {
                 "代码": parts[2],
                 "名称": parts[1],
@@ -1068,8 +1079,12 @@ class DataFetcher:
                 "时间戳": parts[30],
             }
         except Exception as e:
-            logger.warning(f"腾讯实时行情获取失败 {code}: {e}")
+            logger.warning(f"腾讯实时行情获取失败 {sym}: {e}")
             return None
+
+    def get_index_realtime(self, index_code: str = "sh000001") -> Optional[Dict]:
+        """指数实时快照（上证/深证/创业板/沪深300/中证500/科创50 等）。"""
+        return self._tencent_quote(_normalize_index_symbol(index_code))
 
     def batch_get_daily(self, codes: List[str], start_date: str = "2018-01-01",
                          end_date: Optional[str] = None, max_workers: int = 8) -> Dict[str, pd.DataFrame]:

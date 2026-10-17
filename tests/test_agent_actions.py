@@ -66,12 +66,29 @@ def test_set_config_whitelist_rejects_unknown_key():
 
 
 def test_set_config_preview_does_not_write():
-    out = agent_tools.set_config({"key": "agent.screen_fetch_workers", "value": "8"})
+    # 用与当前值**不同**的值，否则会命中「空操作」分支（见下一条用例）
+    out = agent_tools.set_config({"key": "agent.screen_fetch_workers", "value": "5"})
     assert PENDING in out
     spec = _parse_pending(out)
     assert spec["tool"] == "set_config"
     assert spec["args"]["approve"] is True
     # 确认前不应落盘：临时目录里没有任何 state 文件
+    assert not (settings_mod._AGENT_STATE_FILE).exists()
+
+
+def test_set_config_noop_when_value_unchanged():
+    """值没变就不要弹提案。
+
+    回归背景：实测对助手说「把筛选并发改成 8」，而当前本来就是 8，它照样弹出
+    「从 8 改为 8」的确认框；用户点「确认」后什么都不会变 —— 这是「AI 助手
+    点了没用／啥也干不了」最直接的体感来源之一。
+    """
+    cur = agent_tools._read_config_current("agent.screen_fetch_workers")
+    out = agent_tools.set_config(
+        {"key": "agent.screen_fetch_workers", "value": str(cur)}
+    )
+    assert PENDING not in out, "值没变仍然弹了确认提案"
+    assert "无需修改" in out
     assert not (settings_mod._AGENT_STATE_FILE).exists()
 
 

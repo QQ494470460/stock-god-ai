@@ -10,7 +10,7 @@ import streamlit as st
 
 from src.models.llm import deepseek
 from src.agent.engine import run_agent
-from src.agent.tools import call_tool
+from src.agent.tools import call_tool, TOOL_FAILED_MARK
 
 
 def render_agent_page():
@@ -61,6 +61,10 @@ def render_agent_page():
         st.session_state.agent_prompt = ""
 
     submitted = st.button("🚀 发送", type="primary", use_container_width=True)
+    st.caption(
+        "⏱️ 个股行情 / 大盘指数：数秒；"
+        "「智能筛选 / 生成研报」要拉整个股票池的日线，约 1 分钟，请耐心等待（会显示进度）。"
+    )
 
     if submitted and prompt.strip():
         _handle_send(prompt.strip())
@@ -81,6 +85,12 @@ def _handle_send(prompt: str):
         for m in st.session_state.agent_messages[-12:-1]
     ]
     with st.chat_message("assistant"):
+        with st.spinner("🤖 唤醒本地模型…" if deepseek.is_local else "🤖 助手正在思考…"):
+            # 本地模型闲置 5 分钟会被 Ollama 卸载，下次提问要先重载 4.6GB 权重
+            # （实测冷启动 30~45s、热态 1~2s）。先预热并把 keep_alive 拉长，
+            # 顺便让 spinner 文案说明白「在唤醒模型」而不是干等。
+            if deepseek.is_local:
+                deepseek.warmup()
         with st.spinner("🤖 助手正在思考并调用工具…"):
             result = run_agent(prompt, history=history, max_steps=5)
         _render_assistant_inline(result)
@@ -143,15 +153,16 @@ def _render_result(container, result, content: str):
     # 逐步展示工具调用（若有）
     if result is not None and getattr(result, "steps", None):
         for i, step in enumerate(result.steps, 1):
-            with container.expander(f"🔧 步骤 {i}：{step.action}", expanded=False):
+            raw_obs = str(step.observation or "")
+            failed = raw_obs.startswith(TOOL_FAILED_MARK)
+            obs = raw_obs.replace(TOOL_FAILED_MARK, "")
+            icon = "❌" if failed else "🔧"
+            with container.expander(f"{icon} 步骤 {i}：{step.action}", expanded=failed):
                 container.markdown(
                     f"**参数**：`{json.dumps(step.action_input, ensure_ascii=False)}`"
                 )
-                container.markdown("**观测结果**：")
-                container.markdown(
-                    step.observation if step.observation else "（无返回）",
-                    unsafe_allow_html=False,
-                )
+                container.markdown("**失败原因**：" if failed else "**观测结果**：")
+                container.markdown(obs if obs else "（无返回）", unsafe_allow_html=False)
     # 工具产出的可下载文件（如筛选研报）
     if result is not None:
         arts = getattr(result, "artifacts", None) or []

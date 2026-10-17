@@ -85,6 +85,100 @@ def _resolve_code(raw: str) -> str:
 # 安全铁律：交易类一律仅 PAPER（纸账户）模拟，绝不自动实盘。
 PENDING_ACTION_PREFIX = "PENDING_ACTION:"
 
+# 「工具失败」机器标记。引擎据此判定该观测**不可作为结论依据**。
+#
+# 为什么非要机器标记：本地 7B 拿到一段明确的报错后，仍会把它当「查到了、结果是空」
+# 来用。实测「今天大盘怎么样」触发 `ValueError: 未知股票池 'shanghai'`，模型却答
+# 「大盘暂无评分 ≥ 55 的股票符合条件」——凭空捏造。靠提示词一句「别用失败结果」
+# 拦不住，必须有可判定的标记。
+TOOL_FAILED_MARK = "[[TOOL_FAILED]]"
+
+
+def _failed(msg: str, hint: str = "") -> str:
+    """构造一条「工具失败」观测（带机器标记 + 可选的自纠提示）。"""
+    out = f"{TOOL_FAILED_MARK}{msg}"
+    if hint:
+        out += f"\n💡 {hint}"
+    return out
+
+
+# ============================ 参数归一（防模型瞎填） ============================
+# 模型经常把「沪深300」写成 shanghai / csi300 / 300，把「大盘」当成一只股票。
+# 这里只做**已知别名**的归一；不认识的仍原样下传，由真实 fetcher 报错
+# （保持 fail-loud，也避免把注入的测试池名误判成非法）。
+
+_VALID_POOLS = ("all", "hs300", "zz500", "zz1000", "hs300_zz500")
+_POOL_ALIASES = {
+    "all": "all", "全市场": "all", "全部": "all", "所有": "all", "全a": "all",
+    "a股": "all", "沪深全市场": "all",
+    "hs300": "hs300", "沪深300": "hs300", "300": "hs300", "csi300": "hs300",
+    "沪深三百": "hs300", "sh300": "hs300", "hs": "hs300",
+    "zz500": "zz500", "中证500": "zz500", "500": "zz500", "csi500": "zz500",
+    "zz1000": "zz1000", "中证1000": "zz1000", "1000": "zz1000", "csi1000": "zz1000",
+    "hs300_zz500": "hs300_zz500", "沪深300中证500": "hs300_zz500",
+    "300500": "hs300_zz500", "hs300zz500": "hs300_zz500",
+}
+POOL_HINT = (
+    "合法池名：hs300（沪深300）、zz500（中证500）、zz1000（中证1000）、"
+    "hs300_zz500（两者合并）、all（全市场）"
+)
+
+
+def _pool_alias(raw) -> Optional[str]:
+    """已知别名 → 合法池名；不认识返回 None（原样下传，交给 fetcher 报错）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    key = s.lower()
+    for ch in (" ", "\t", "+", "、", "，", ",", "股票池", "池"):
+        key = key.replace(ch, "")
+    if key in _VALID_POOLS:
+        return key
+    return _POOL_ALIASES.get(key)
+
+
+def _resolve_pool(raw) -> str:
+    """工具入参的 pool：先归一，认不出就用原值（让 fetcher fail-loud）。"""
+    if raw in (None, ""):
+        return str(app_config.scheduler.pick_pool or "hs300")
+    return _pool_alias(raw) or str(raw).strip()
+
+
+# 指数别名：**只对含中文/英文的写法生效**，纯数字一律留给个股（000001 是平安银行）。
+# 历史上「大盘怎么样」被解析成 sz000001（平安银行），根因就是没有这层区分。
+_INDEX_ALIASES = {
+    "上证指数": "sh000001", "上证综指": "sh000001", "上证": "sh000001",
+    "大盘": "sh000001", "沪指": "sh000001", "沪市": "sh000001", "sh": "sh000001",
+    "深证成指": "sz399001", "深成指": "sz399001", "深证": "sz399001", "深市": "sz399001",
+    "创业板指": "sz399006", "创业板": "sz399006", "创指": "sz399006",
+    "沪深300": "sh000300", "csi300": "sh000300", "hs300指数": "sh000300",
+    "中证500": "sh000905", "csi500": "sh000905",
+    "中证1000": "sh000852", "csi1000": "sh000852",
+    "科创50": "sh000688", "科创板指": "sh000688",
+}
+INDEX_HINT = "可用指数：上证指数 / 深证成指 / 创业板指 / 沪深300 / 中证500 / 科创50"
+
+
+def _index_by_word(raw) -> Optional[str]:
+    """只认「文字型」指数别名；纯数字返回 None（纯数字是股票代码）。"""
+    s = str(raw or "").strip().lower().replace(" ", "")
+    if not s or s.isdigit():
+        return None
+    return _INDEX_ALIASES.get(s)
+
+
+def _normalize_index(raw) -> tuple:
+    """指数入参 → (symbol, err)。纯数字按指数代码处理（000300 → sh000300）。"""
+    s = str(raw or "").strip().lower().replace(" ", "")
+    if not s:
+        return "sh000001", ""
+    if s in _INDEX_ALIASES:
+        return _INDEX_ALIASES[s], ""
+    if s.isdigit() and len(s) == 6:
+        from src.data.fetcher import _normalize_index_symbol
+        return _normalize_index_symbol(s), ""
+    return "", f"无法识别的指数 {raw!r}。{INDEX_HINT}"
+
 ALLOWED_EDIT_ROOTS = (
     str(Path(__file__).resolve().parents[2] / "src"),
     str(Path(__file__).resolve().parents[2] / "config"),
@@ -209,9 +303,9 @@ def _safe(fn: Callable[[dict], str]) -> Callable[[dict], str]:
         try:
             return fn(args)
         except Exception as e:  # noqa: BLE001
-            return (
-                f"⚠️ 工具执行失败：{type(e).__name__}: {e}\n"
-                f"{traceback.format_exc(limit=2)}"
+            return _failed(
+                f"⚠️ 工具执行失败：{type(e).__name__}: {e}",
+                "该结果不可作为数据依据。" + traceback.format_exc(limit=2),
             )
     return wrapper
 
@@ -223,13 +317,17 @@ def analyze_stock(args: dict) -> str:
     """个股深度分析：技术面 + AI 评分 + 推荐理由（取数，不含叙述）。"""
     code = _resolve_code(args.get("code", ""))
     if not is_valid_code(code):
-        return f"无法识别股票代码/名称：{args.get('code')!r}。请提供 6 位 A 股代码（如 600519）。"
+        return _failed(
+            f"无法识别股票代码/名称：{args.get('code')!r}。",
+            "请提供 6 位 A 股代码（如 600519）或准确的股票名称。",
+        )
     if not predictor.is_ready:
-        return "预测模型未就绪（未训练），无法给出 AI 评分。请先训练模型或检查模型文件。"
+        return _failed("预测模型未就绪（未训练），无法给出 AI 评分。", "请先训练模型或检查模型文件。")
 
     df = fetcher.get_daily_kline(code, start_date="2015-01-01", end_date=None)
     if len(df) < 60:
-        return f"{_name_of(code)}({code}) 历史数据不足（{len(df)} 行），无法分析。"
+        return _failed(f"{_name_of(code)}({code}) 历史数据不足（{len(df)} 行），无法分析。",
+                       "该标的可能上市不足 60 个交易日。")
 
     close = df["close"]
     last = float(close.iloc[-1])
@@ -273,12 +371,23 @@ def analyze_stock(args: dict) -> str:
 @_safe
 def run_daily_pick(args: dict) -> str:
     """跑每日 AI 选股，返回打分最高的若干只。"""
-    pool = args.get("pool") or app_config.scheduler.pick_pool
+    pool = _resolve_pool(args.get("pool"))
     top = int(args.get("top", 10))
     try:
         df, report = generate_daily_picks(pool=pool, max_picks=top)
     except Exception as e:  # noqa: BLE001
-        return f"选股执行失败：{type(e).__name__}: {e}"
+        return _failed(
+            f"选股执行失败（pool={pool!r}）：{type(e).__name__}: {e}",
+            f"{POOL_HINT}。请改用上述池名重新调用。",
+        )
+    # ⚠️ generate_daily_picks 内部会**吞掉**异常并返回 (空表, status="error")。
+    # 不看 status 就会把「跑失败了」当成「跑通了但没有达标标的」——实测模型
+    # 正是据此捏造出「大盘暂无评分≥55的股票」。这里必须显式区分。
+    if str(report.get("status")) == "error":
+        return _failed(
+            f"选股失败（pool={pool!r}）：{report.get('error')}",
+            f"{POOL_HINT}。请改用上述池名重新调用。",
+        )
     if df is None or len(df) == 0:
         return f"本轮（{pool} 池）没有评分 ≥ {report.get('min_score')} 的达标标的。"
     cols = [c for c in ["代码", "名称", "评分", "上涨概率", "下跌概率", "推荐理由"] if c in df.columns]
@@ -295,14 +404,69 @@ def run_daily_pick(args: dict) -> str:
 
 
 @_safe
+def get_index(args: dict) -> str:
+    """大盘/指数行情：实时点位 + 涨跌幅 + 均线位置 + 近期趋势。
+
+    为什么单独一个工具：`get_realtime` 只认 6 位个股代码，且 000001 对个股是
+    平安银行、对上证指数是 sh000001。把指数塞给个股工具必然张冠李戴，
+    所以指数走独立通道（fetcher.get_index_realtime 自带正确市场前缀）。
+    """
+    sym, err = _normalize_index(args.get("index") or args.get("code") or args.get("name"))
+    if err:
+        return _failed(err)
+    q = fetcher.get_index_realtime(sym)
+    if not q:
+        return _failed(
+            f"{sym} 指数实时行情获取失败（数据源不可用）。",
+            "可稍后重试，或改为查询具体个股。",
+        )
+    lines = [
+        f"## {q.get('名称', sym)}（{sym}）",
+        f"- 最新点位：{q.get('最新价')}（{float(q.get('涨跌幅') or 0):+.2f}%）",
+        f"- 今开 {q.get('今开')}｜最高 {q.get('最高')}｜最低 {q.get('最低')}｜昨收 {q.get('昨收')}",
+        f"- 成交额：{q.get('成交额')} 万元",
+    ]
+    try:
+        df = fetcher.get_index_kline(sym, start_date="2024-01-01")
+    except Exception:  # noqa: BLE001
+        df = None
+    if df is not None and len(df) >= 20:
+        close = df["close"]
+        last = float(close.iloc[-1])
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        pos = "上方" if last >= ma20 else "下方"
+        lines.append(f"- MA20：{ma20:.2f}（现价在 MA20 {pos}）")
+        if len(df) >= 60:
+            ma60 = float(close.rolling(60).mean().iloc[-1])
+            lines.append(f"- MA60：{ma60:.2f}")
+        for n in (5, 20, 60):
+            if len(close) > n:
+                pct = (last / float(close.iloc[-n - 1]) - 1) * 100
+                lines.append(f"- 近 {n} 日涨跌：{pct:+.2f}%")
+    return "\n".join(lines)
+
+
+@_safe
 def get_realtime(args: dict) -> str:
     """实时行情 / 盯盘诊断（腾讯源）。"""
-    code = _resolve_code(args.get("code", ""))
+    raw = args.get("code", "")
+    # 指数写法（大盘/上证指数/创业板…）→ 明确指路，别硬当个股查
+    idx_word = _index_by_word(raw)
+    if idx_word:
+        return _failed(
+            f"「{raw}」是指数，不是个股；个股实时行情只支持 6 位股票代码。",
+            f"请改用 get_index(index=\"{raw}\") 查询指数行情。",
+        )
+    code = _resolve_code(raw)
     if not is_valid_code(code):
-        return f"无法识别股票代码/名称：{args.get('code')!r}。"
+        return _failed(
+            f"无法识别股票代码/名称：{raw!r}。",
+            "请提供 6 位 A 股代码（如 600519）或准确的股票名称；"
+            "若想查大盘，请用 get_index。",
+        )
     q = fetcher.get_realtime_quote(code)
     if not q:
-        return f"{_name_of(code)}({code}) 实时行情获取失败（可能非交易时段或源不可用）。"
+        return _failed(f"{_name_of(code)}({code}) 实时行情获取失败（可能非交易时段或源不可用）。")
     name = q.get("名称", _name_of(code))
     price = q.get("最新价", 0)
     chg = q.get("涨跌幅", 0)
@@ -332,6 +496,9 @@ def generate_report(args: dict) -> str:
     """生成一份综合研报/复盘 Markdown（选股结果 + 进化引擎状态）。"""
     top = int(args.get("top", 10))
     pick_lines = run_daily_pick({"pool": app_config.scheduler.pick_pool, "top": top})
+    # 选股失败就不要拼一份「看起来正常」的研报 —— 直接把失败抛给代理去纠正
+    if pick_lines.startswith(TOOL_FAILED_MARK):
+        return pick_lines
     evo_lines = diagnose_evolution({})
     report = (
         "# 选股神 AI 综合研报\n\n"
@@ -400,7 +567,7 @@ def _now() -> str:
 @_safe
 def screen_stocks(args: dict) -> str:
     """智能筛选：全池 AI 评分 + 技术面条件过滤，自带研判并排序输出达标清单。"""
-    pool = args.get("pool") or app_config.scheduler.pick_pool
+    pool = _resolve_pool(args.get("pool"))
     top = int(_opt_float(args.get("top")) if args.get("top") not in (None, "") else get_strategy_override("top", 15))
     min_score = _opt_float(args.get("min_score")) if args.get("min_score") not in (None, "") else get_strategy_override("min_score", 50.0)
     rsi_max = _opt_float(args.get("rsi_max")) if args.get("rsi_max") not in (None, "") else get_strategy_override("rsi_max", None)
@@ -424,8 +591,11 @@ def screen_stocks(args: dict) -> str:
 
     try:
         codes = fetcher.get_stock_pool(pool)
-    except Exception as e:
-        return f"无法获取股票池 {pool!r}：{e}"
+    except Exception as e:  # noqa: BLE001
+        return _failed(
+            f"无法获取股票池 {pool!r}：{type(e).__name__}: {e}",
+            f"{POOL_HINT}。请改用上述池名重新调用。",
+        )
     raw = fetcher.get_batch_daily_kline(codes, max_workers=_screen_workers())
     stock_data = {c: df for c, df in raw.items() if df is not None and len(df) >= 60}
 
@@ -567,6 +737,10 @@ def set_config(args: dict) -> str:
         return f"⚠️ 参数值非法（{key}={raw!r}）：{e}"
     if not _truthy(args.get("approve")):
         cur = _read_config_current(key)
+        # 空操作拦截：实测「把筛选并发改成 8」在本来就是 8 的情况下仍弹提案
+        # 「从 8 改为 8」，用户点确认后什么都不会变 —— 这正是「点了没用」的来源之一。
+        if str(cur) == str(new_val):
+            return (f"ℹ️ 当前 `{key}` 已经是 `{new_val}`（{spec['label']}），无需修改。")
         return _propose(
             "set_config",
             {"key": key, "value": new_val, "approve": True},
@@ -600,6 +774,12 @@ def set_strategy_param(args: dict) -> str:
         return f"⚠️ 参数值非法（{key}={raw!r}），需要数字"
     if not _truthy(args.get("approve")):
         cur = get_strategy_override(key, "(默认)")
+        # 同 set_config：值没变就别弹提案（否则「确认了也没变化」）
+        try:
+            if cur != "(默认)" and float(cur) == float(new_val):
+                return f"ℹ️ 当前策略参数 `{key}` 已经是 `{new_val}`（{_STRATEGY_LABELS[key]}），无需修改。"
+        except (TypeError, ValueError):
+            pass
         return _propose(
             "set_strategy_param",
             {"key": key, "value": new_val, "approve": True},
@@ -718,13 +898,25 @@ REGISTRY: Dict[str, Tool] = {
     "run_daily_pick": Tool(
         name="run_daily_pick",
         description="运行每日 AI 选股，返回打分最高的若干只标的。",
-        params_desc="pool: 股票池名（默认 hs300）；top: 返回前几只（默认 10）",
+        params_desc=(
+            f"pool: 股票池，只能是 {', '.join(_VALID_POOLS)}"
+            "（中文也可：沪深300/中证500/中证1000/全市场）；top: 返回前几只（默认 10）"
+        ),
         func=run_daily_pick,
+    ),
+    "get_index": Tool(
+        name="get_index",
+        description="查询大盘/指数行情（点位、涨跌幅、MA20/MA60、近期趋势）。问「大盘/指数怎么样」必须用它。",
+        params_desc=(
+            "index: 指数名，如 '上证指数'/'大盘'/'深证成指'/'创业板指'/"
+            "'沪深300'/'中证500'/'科创50'（也接受 sh000001 这类代码）"
+        ),
+        func=get_index,
     ),
     "get_realtime": Tool(
         name="get_realtime",
-        description="获取单只股票的实时行情并做量价诊断（盯盘用）。",
-        params_desc="code: 6位股票代码或名称",
+        description="获取单只**个股**的实时行情并做量价诊断（盯盘用）。指数请用 get_index。",
+        params_desc="code: 6位股票代码或名称（如 '600519' 或 '贵州茅台'）",
         func=get_realtime,
     ),
     "generate_report": Tool(
@@ -743,7 +935,8 @@ REGISTRY: Dict[str, Tool] = {
         name="screen_stocks",
         description="按「AI评分 + 技术面条件」智能筛选全池股票，自带偏多/偏空研判并排序输出达标清单。",
         params_desc=(
-            "pool: 股票池(默认 hs300)；min_score: AI最低评分(默认50)；"
+            "pool: 股票池(hs300/zz500/zz1000/hs300_zz500/all，也认「沪深300」等中文)；"
+            "min_score: AI最低评分(默认50)；"
             "rsi_max/rsi_min: RSI上下限；above_ma20/above_ma60: 是否要求站上均线(bool)；"
             "vol_ratio_min: 最小量比；top: 返回前几只(默认15)"
         ),

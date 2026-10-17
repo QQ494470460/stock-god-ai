@@ -365,6 +365,40 @@ class DeepSeekClient:
         resp = self.chat("你是连接测试助手。", "回复：连接成功", max_tokens=20)
         return f"连接成功 · 模型 {self.config.model} · {resp[:30]}"
 
+    def warmup(self, keep_alive: str = "30m") -> bool:
+        """预热本地模型并保活，消掉「闲置 5 分钟后再问，先等 30~45 秒」的冷启动。
+
+        为什么需要它：Ollama 默认 ``keep_alive=5m``，闲置后会把模型从显存卸载；
+        下次请求要重新加载 4.6GB 权重（实测冷启动 30~45s，热态 1~2s）。用户看到的
+        「AI 助手半天没反应」绝大部分是这一次冷加载。
+
+        只对 ``local`` 生效（云端没有本地加载问题）。用原生 ``/api/generate``：
+        OpenAI 兼容的 ``/v1/chat/completions`` 不支持 ``keep_alive``。
+        失败一律返回 False，不抛——预热失败不该阻断正常提问。
+        """
+        if not self.is_local:
+            return False
+        base = str(self.config.base_url or "").strip().rstrip("/")
+        for suf in ("/chat/completions", "/v1"):
+            if base.endswith(suf):
+                base = base[: -len(suf)]
+                break
+        url = f"{base}/api/generate"
+        try:
+            resp = requests.post(
+                url,
+                json={"model": self.config.model, "prompt": "hi", "stream": False,
+                      "keep_alive": keep_alive, "options": {"num_predict": 1}},
+                timeout=max(self.config.timeout, 120),
+                **self._bypass_proxy_kwargs(url),
+            )
+            resp.raise_for_status()
+            logger.info(f"本地模型已预热并保活（keep_alive={keep_alive}）")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"模型预热失败（不影响正常提问）: {e}")
+            return False
+
     # ========== 业务方法 ==========
 
     def analyze_stock(self, name: str, code: str, metrics: Dict) -> str:

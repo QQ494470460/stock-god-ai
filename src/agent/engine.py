@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from src.models.llm import deepseek
-from src.agent.tools import get_tools, call_tool
+from src.agent.tools import get_tools, call_tool, TOOL_FAILED_MARK
 
 # 工具可能在返回中附带 REPORT_FILE:<绝对路径> 标记，引擎负责收集成可下载产物
 _REPORT_FILE_RE = re.compile(r"REPORT_FILE:(\S+)")
@@ -51,10 +51,27 @@ SYSTEM_PROMPT = """你是「选股神 AI」内置的智能助手，可以帮助�
 3. 工具结果会以 `RESULT:` 形式返回给你，继续分析，必要时再调工具，直到能给出结论，
    最后用 `FINAL:` 开头给出给用户的正式回答（可用 Markdown，含要点、风险提示）。
 
+# 常见说法 → 工具/键（本地 7B 对应不上同义说法，实测会张冠李戴）
+用户说的「说法」必须落到下面对应的键上，别自己类推：
+- 并发 / 线程数 / worker / 同时拉几只行情 → `set_config` key=`agent.screen_fetch_workers`
+- 模型融合 / ensemble / 多模型投票      → `set_config` key=`ml.use_ensemble`
+- 筛选返回几只 / 前 N 只 / 出几只        → `set_strategy_param` key=`top`
+- 最低评分 / 评分门槛                   → `set_strategy_param` key=`min_score`
+- RSI 上限 / 下限，量比门槛             → `set_strategy_param` key=`rsi_max`/`rsi_min`/`vol_ratio_min`
+⚠️ 「筛选并发」指的是**拉行情的并发线程数**（`agent.screen_fetch_workers`），
+   不是「筛选出几只」（`top`）。这两个千万别弄混。
+
 # 严格要求
 - 只使用上面列出的工具；不要编造工具名。
 - ACTION_INPUT 必须是合法 JSON（双引号）。
 - 所有结论必须基于工具返回的真实数据，不要编造数字。
+- **问「大盘 / 指数 / 今天行情怎么样」要用 `get_index`**（上证指数/深证成指/创业板指/
+  沪深300/中证500）。`get_realtime` 只认个股，把「大盘」传进去必然失败。
+- **工具返回以 `[[TOOL_FAILED]]` 开头 = 这次调用失败了。**此时：
+  ① 绝不能把它当成「查到了，结果是空」；
+  ② 不要据此下任何结论（尤其不许说成「没有符合条件的股票」）；
+  ③ 应该按提示改正参数重试一次（例如 pool 只填 hs300/zz500/zz1000/all）；
+  ④ 重试仍失败，就直接告诉用户失败原因，不要硬编答案。
 - 🚫 **严禁在 FINAL 回答里声称「已经帮你改好 / 已修改 / 已完成」**——那不是事实。
   真正的修改只能由工具发起，且（修改/交易类）需用户确认后才生效。
   如果你发了 ACTION 并收到 `PENDING_ACTION:...` 提案，把该提案原文转述给用户即可，不要自行断言已完成。
@@ -147,6 +164,27 @@ def _parse_args(arg_raw: str) -> Dict:
     return {"value": arg_raw}
 
 
+def _honest_failure(steps: List[AgentStep]) -> str:
+    """所有工具都失败时，用失败摘要替换模型自由发挥的最终回答。
+
+    实测回归：``pool='shanghai'`` 触发 ``ValueError: 未知股票池``，模型却把报错
+    当「查到了、结果是空」，答成「大盘暂无评分 ≥ 55 的股票符合条件」——凭空捏造。
+    只要没有任何一次成功观测，模型的结论就没有数据支撑，必须拦下。
+    """
+    errs = [
+        s.observation.replace(TOOL_FAILED_MARK, "").strip().splitlines()[0]
+        for s in steps
+        if s.observation.startswith(TOOL_FAILED_MARK)
+    ]
+    body = "\n".join(f"- {e}" for e in errs[:3])
+    return (
+        f"⚠️ 本次没能取到数据（{len(errs)} 次工具调用都失败了），因此无法给出结论，"
+        f"更不会去猜一个结果。\n\n{body}\n\n"
+        "请换个说法，或直接给出明确的股票代码 / 指数（如「上证指数」「600519」）再试。\n\n"
+        "（不构成投资建议）"
+    )
+
+
 def run_agent(
     user_message: str,
     history: Optional[List[Dict]] = None,
@@ -177,6 +215,12 @@ def run_agent(
 
     steps: List[AgentStep] = []
     result = AgentResult()
+    n_ok = n_fail = 0
+    # 同轮内相同调用的观测缓存。
+    # 为什么必须要有：``screen_stocks`` 这类工具单次要 50~60 秒（zz500 扫 425 只），
+    # 而本地 7B 常在同一次任务里把同一个 ACTION 重复发两三遍（换了措辞但参数一样），
+    # 实测把一次「帮我筛选几只偏多的股票」拖到 12 分钟还没结束 —— 体感就是「卡死」。
+    obs_cache: Dict[str, str] = {}
 
     for _ in range(max_steps):
         try:
@@ -191,12 +235,25 @@ def run_agent(
         if kind in ("final", "raw"):
             result.final_text = payload[0] if payload else ""
             result.steps = steps
+            # 一次成功观测都没有：模型手上的「证据」全是失败，此时它的结论
+            # 必然是编的（实测会答成「暂无符合条件的股票」），直接换成失败说明。
+            if steps and n_ok == 0 and n_fail > 0:
+                result.final_text = _honest_failure(steps)
+                result.error = f"{n_fail} 次工具调用全部失败"
             _ingest_artifacts(result, result.final_text)
             return result
 
         # action
         _, name, args = kind, payload[0], payload[1]
-        observation = call_tool(name, args)
+        cache_key = f"{name}|{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
+        if cache_key in obs_cache:
+            # 重复调用：直接复用上一次的观测，不再真跑（重活会拖到分钟级）
+            observation = obs_cache[cache_key]
+            deduped = True
+        else:
+            observation = call_tool(name, args)
+            obs_cache[cache_key] = observation
+            deduped = False
 
         # 修改类动作：检测到待确认标记即暂停循环，把提案交还 UI 等用户确认
         _pa = _PENDING_ACTION_RE.search(observation)
@@ -209,13 +266,24 @@ def run_agent(
             result.steps = steps
             return result
 
+        if observation.startswith(TOOL_FAILED_MARK):
+            n_fail += 1
+            note = ("\n（⚠️ 本次调用失败：其结果不可作为数据依据。"
+                    "请改正参数重试一次，或如实告知用户失败原因。）")
+        else:
+            n_ok += 1
+            note = ""
+        if deduped:
+            note += ("\n（⚠️ 此调用与之前某步参数完全相同，已直接复用上次结果、"
+                     "没有重复执行。请据此作答，不要再用相同参数调用。）")
+
         step = AgentStep(action=name, action_input=args, observation=observation)
         steps.append(step)
         _ingest_artifacts(result, observation)
 
         transcript += (
             f"\n助手：ACTION: {name}\nACTION_INPUT: {json.dumps(args, ensure_ascii=False)}\n"
-            f"RESULT: {observation}\n"
+            f"RESULT: {observation}{note}\n"
         )
 
     # 超过步数仍无 FINAL：让模型基于已有观测做总结
@@ -229,6 +297,9 @@ def run_agent(
             s.observation for s in steps
         )
         result.error = f"最终总结失败：{e}"
+    if steps and n_ok == 0 and n_fail > 0:
+        result.final_text = _honest_failure(steps)
+        result.error = f"{n_fail} 次工具调用全部失败"
     result.steps = steps
     _ingest_artifacts(result, result.final_text)
     return result
