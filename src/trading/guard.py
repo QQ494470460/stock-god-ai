@@ -747,16 +747,19 @@ class RiskSupervisor:
             True 表示本次真的落盘（未被去重）。
         """
         today = datetime.now().strftime("%Y-%m-%d")
-        if self._signal_dedupe_day != today:
-            self._signal_dedupe.clear()
-            self._signal_dedupe_day = today
-
         bucket = int(round(float(ai_score) / 5.0) * 5)
         sig = (bucket, round(float(agreement), 2), round(float(signal_strength), 2))
         key = (code, side.value if isinstance(side, OrderSide) else str(side))
-        if self._signal_dedupe.get(key) == sig:
-            return False
-        self._signal_dedupe[key] = sig
+
+        # propose_trade 本身不持锁（它要调券商/算仓位，不该长时间占用），
+        # 但去重表是共享可变状态（看板线程 + 调度线程都可能进来），单独加锁。
+        with self._lock:
+            if self._signal_dedupe_day != today:
+                self._signal_dedupe.clear()
+                self._signal_dedupe_day = today
+            if self._signal_dedupe.get(key) == sig:
+                return False
+            self._signal_dedupe[key] = sig
 
         self._emit("signal", {
             "code": code, "name": name, "side": key[1],
