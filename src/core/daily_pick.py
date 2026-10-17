@@ -103,6 +103,24 @@ def generate_daily_picks(
             stock_data, stock_names, top_n=max_picks, min_score=min_score
         )
 
+        # 参考价：把推荐时点的最新收盘价带进 picks，供交易计划 / 执行侧做
+        # 「跳空太多就不追」这类校验。早期没有这一步，计划里 price 恒为 0.0，
+        # 字段名存实亡。取不到就填 0，不影响推荐本身。
+        try:
+            if len(df):
+                col = "代码" if "代码" in df.columns else ("code" if "code" in df.columns else None)
+                if col is not None:
+                    def _last_close(c):
+                        d = stock_data.get(str(c)) or stock_data.get(str(c).zfill(6))
+                        try:
+                            return round(float(d["close"].iloc[-1]), 2)
+                        except Exception:  # noqa: BLE001
+                            return 0.0
+                    df = df.copy()
+                    df["最新价"] = df[col].map(_last_close)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"参考价补充失败（不影响推荐）: {e}")
+
         # 市场状态刷新（写入进化引擎，供阈值自适应）
         try:
             bd = fet.get_benchmark_kline("000300.SH", start_date="2024-01-01")

@@ -69,25 +69,31 @@ def compute_score(
     risk_penalty = -risk_pct * 10.0
 
     # ===== 5. 市场状态因子 (× 0.88 ~ × 1.08) =====
+    # ⚠️ 注意口径：这里的 regime_bull / regime_bear 来自**个股**特征快照
+    # （src/features/engine.py 按个股算的牛熊标记），而交易计划顶层的
+    # ``regime`` 字段来自**指数**基准（daily_pick 用 000300.SH 检测）。
+    # 两者可以合法地不一致 —— 熊市里也有走牛个股。早期文案统一写成
+    # 「牛市顺风」，于是同一份计划里出现 ``regime: bear`` + ``reason: 牛市顺风``
+    # 的自相矛盾，看着像 bug。现在把层级写进文案里。
     regime_factor = 1.0
-    regime_note = "震荡市"
+    regime_note = "个股震荡"
     is_bull = feature_snapshot.get("regime_bull", 0) > 0.5
     is_bear = feature_snapshot.get("regime_bear", 0) > 0.5
 
     if is_bull:
         if prob_up > prob_down:
-            regime_factor = 1.08  # 牛市看涨信号加8%
-            regime_note = "牛市顺风"
+            regime_factor = 1.08  # 个股牛市看涨信号加8%
+            regime_note = "个股牛市顺风"
         else:
-            regime_factor = 0.95  # 牛市但看跌信号？轻扣
-            regime_note = "牛市逆风"
+            regime_factor = 0.95  # 个股牛市但看跌信号？轻扣
+            regime_note = "个股牛市逆风"
     elif is_bear:
         if prob_up > prob_down:
-            regime_factor = 0.88  # 熊市逆势看涨，-12%
-            regime_note = "熊市逆风"
+            regime_factor = 0.88  # 个股熊市逆势看涨，-12%
+            regime_note = "个股熊市逆风"
         else:
-            regime_factor = 1.02  # 熊市看跌正确方向，微加
-            regime_note = "熊市顺风"
+            regime_factor = 1.02  # 个股熊市看跌正确方向，微加
+            regime_note = "个股熊市顺风"
 
     # ===== 汇总 =====
     intermediate = base_score + conf_bonus + agree_bonus + risk_penalty

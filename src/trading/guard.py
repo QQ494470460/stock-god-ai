@@ -700,6 +700,10 @@ class RiskSupervisor:
         self._orders_this_minute: List[float] = []
         self._on_event: Optional[Callable] = None  # UI 事件回调
 
+        # 信号日志去重：{(code, side): (评分档, agreement, strength)}，跨日清空
+        self._signal_dedupe: Dict[Tuple[str, str], Tuple] = {}
+        self._signal_dedupe_day: str = ""
+
         logger.info(
             f"🛡️ RiskSupervisor 初始化 | mode={self.safety.mode.value} "
             f"halted={self.safety.halted}"
@@ -716,6 +720,50 @@ class RiskSupervisor:
                 self._on_event(event, data)
             except Exception:
                 pass
+
+    # ---------- 信号日志（去重） ----------
+    def _log_signal(
+        self,
+        code: str,
+        name: str,
+        side: OrderSide,
+        ai_score: float,
+        agreement: float,
+        signal_strength: float,
+    ) -> bool:
+        """写 ``signal`` 事件，按「交易日 × 标的 × 方向 × 评分档」去重。
+
+        背景：``propose_trade`` 在盘中每个 tick 都会对每只标的调用一次。早期实现
+        在函数第一行**无条件**落盘 signal，于是 10-15 那天固定刷了 1440 条
+        （每分钟 5 只 × 288 分钟），整个 journal 1659 条里 1642 条（99%）是同一条
+        信号的重复。噪声把日志灌满后，真正的 fill / risk_block / halt 事件被淹没，
+        反馈引擎按 ``signal`` 计数也完全失真。
+
+        去重口径：同一交易日内，同一标的同一方向，评分落在同一个 5 分档
+        （且 agreement / strength 未变）就只记一次。评分跨档、方向反转、
+        换交易日都会重新落盘 —— 观测「信号在变」的能力保留，纯 tick 重复被去掉。
+
+        Returns:
+            True 表示本次真的落盘（未被去重）。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._signal_dedupe_day != today:
+            self._signal_dedupe.clear()
+            self._signal_dedupe_day = today
+
+        bucket = int(round(float(ai_score) / 5.0) * 5)
+        sig = (bucket, round(float(agreement), 2), round(float(signal_strength), 2))
+        key = (code, side.value if isinstance(side, OrderSide) else str(side))
+        if self._signal_dedupe.get(key) == sig:
+            return False
+        self._signal_dedupe[key] = sig
+
+        self._emit("signal", {
+            "code": code, "name": name, "side": key[1],
+            "ai_score": ai_score, "agreement": agreement,
+            "signal_strength": signal_strength,
+        })
+        return True
 
     # ---------- 账户/持仓公开访问（PAPER 走纸账户，LIVE 走券商） ----------
     def account(self) -> Optional[AccountInfo]:
@@ -786,11 +834,7 @@ class RiskSupervisor:
         Returns:
             OrderProposal，status 可能为 blocked（含拒绝原因）或 pending
         """
-        self._emit("signal", {
-            "code": code, "name": name, "side": side.value,
-            "ai_score": ai_score, "agreement": agreement,
-            "signal_strength": signal_strength,
-        })
+        self._log_signal(code, name, side, ai_score, agreement, signal_strength)
 
         # 1. 全局开关
         if not self.safety.can_trade():

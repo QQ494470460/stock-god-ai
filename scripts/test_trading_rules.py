@@ -7,12 +7,11 @@
   3. T+1 锁仓（当日买入当日不可卖，次日自动解锁）
   4. 滑点 / 冲击成本（买入更贵、卖出更便宜）
 
-⚠️ 纸交易账户是真实存档，脚本会在开头备份、结尾恢复（try/finally 保证）。
+纸交易账户用例走临时存档（tmp 目录），**不读写**生产 data/paper_account.json。
 
 用法: py -3.12 scripts/test_trading_rules.py
 """
 
-import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -21,7 +20,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.trading.paper import PAPER_ACCOUNT_FILE, PAPER_HISTORY_FILE  # noqa: E402
 from src.trading import calendar as cal  # noqa: E402
 from src.trading.rules import (  # noqa: E402
     board_limit_pct, limit_prices, is_limit_up, is_limit_down,
@@ -117,7 +115,15 @@ def test_t1_and_paper():
     print("\n【4】T+1 锁仓（纸交易账户）")
     from src.trading.paper import PaperAccount
 
-    acc = PaperAccount(initial_cash=1_000_000)
+    # ⚠️ 必须用临时存档：默认路径指向生产的 data/paper_account.json。
+    # 早期这里直接 PaperAccount(initial_cash=...) 再用 main() 的备份/恢复兜底，
+    # 一旦脚本中途崩溃（Ctrl-C / 异常），生产纸账户就被测试数据覆盖了。
+    tmp_dir = Path(tempfile.mkdtemp(prefix="paper_rules_"))
+    acc = PaperAccount(
+        initial_cash=1_000_000,
+        account_file=tmp_dir / "paper_account.json",
+        history_file=tmp_dir / "paper_history.json",
+    )
     acc.reset(1_000_000)
 
     ok, msg, rec = acc.buy("600000", "测试股", 10.00, 1000)
@@ -165,30 +171,11 @@ def main() -> int:
     print("自动交易实盘规则验证")
     print("=" * 66)
 
-    # 备份真实纸交易存档
-    backup_dir = Path(tempfile.mkdtemp(prefix="paper_bak_"))
-    backups = []
-    for f in (PAPER_ACCOUNT_FILE, PAPER_HISTORY_FILE):
-        if f.exists():
-            dst = backup_dir / f.name
-            shutil.copy2(f, dst)
-            backups.append((f, dst))
-
-    try:
-        test_calendar()
-        test_limit_rules()
-        test_slippage()
-        test_t1_and_paper()
-    finally:
-        # 恢复真实存档
-        for orig, bak in backups:
-            try:
-                shutil.copy2(bak, orig)
-            except Exception as e:  # noqa: BLE001
-                print(f"  ⚠️ 恢复 {orig.name} 失败: {e}")
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        if backups:
-            print(f"\n（已恢复 {len(backups)} 个纸交易存档文件）")
+    # 纸账户相关用例走临时存档（见 test_t1_and_paper），不再需要备份/恢复生产文件
+    test_calendar()
+    test_limit_rules()
+    test_slippage()
+    test_t1_and_paper()
 
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

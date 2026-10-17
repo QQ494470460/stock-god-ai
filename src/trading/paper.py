@@ -47,10 +47,27 @@ class TradeRecord:
 class PaperAccount:
     """虚拟账户 — 资金 + 持仓"""
     
-    def __init__(self, initial_cash: float = 100000.0):
+    def __init__(
+        self,
+        initial_cash: float = 100000.0,
+        account_file: Optional[Path] = None,
+        history_file: Optional[Path] = None,
+    ):
+        """纸账户。
+
+        Args:
+            initial_cash: 初始本金（仅在新账户时生效；已有磁盘状态以磁盘为准）
+            account_file: 账户状态文件路径。**测试必须传 tmp 路径**，否则会直写
+                生产的 ``data/paper_account.json``（曾经踩过：单元测试把真实
+                纸账户的现金/持仓/当日盈亏覆盖掉了）。
+            history_file: 成交历史文件路径，同上。
+        """
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.frozen_cash = 0.0
+
+        self.account_file: Path = Path(account_file) if account_file else PAPER_ACCOUNT_FILE
+        self.history_file: Path = Path(history_file) if history_file else PAPER_HISTORY_FILE
         
         # 持仓: code → {quantity, avg_cost, market_value, ...}
         self.holdings: Dict[str, dict] = {}
@@ -74,8 +91,8 @@ class PaperAccount:
     def _load(self):
         """从磁盘恢复状态"""
         try:
-            if PAPER_ACCOUNT_FILE.exists():
-                data = json.loads(PAPER_ACCOUNT_FILE.read_text(encoding="utf-8"))
+            if self.account_file.exists():
+                data = json.loads(self.account_file.read_text(encoding="utf-8"))
                 self.cash = data.get("cash", self.initial_cash)
                 self.holdings = data.get("holdings", {})
                 # 兼容旧存档：补齐 T+1 相关字段，否则卖出时会 KeyError
@@ -105,8 +122,8 @@ class PaperAccount:
             logger.warning(f"加载纸账户失败: {e}")
         
         try:
-            if PAPER_HISTORY_FILE.exists():
-                raw = json.loads(PAPER_HISTORY_FILE.read_text(encoding="utf-8"))
+            if self.history_file.exists():
+                raw = json.loads(self.history_file.read_text(encoding="utf-8"))
                 self.trade_history = [TradeRecord(**r) for r in raw]
                 logger.info(f"📋 已加载 {len(self.trade_history)} 条交易记录")
         except Exception as e:
@@ -123,14 +140,16 @@ class PaperAccount:
                 "today_trades": self.today_trades,
                 "last_reset_date": self._last_reset_date,
             }
-            PAPER_ACCOUNT_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.account_file.parent.mkdir(parents=True, exist_ok=True)
+            self.account_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
     
     def _save_history(self):
         try:
             records = [r.__dict__ for r in self.trade_history[-500:]]  # 保留最近500条
-            PAPER_HISTORY_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.history_file.parent.mkdir(parents=True, exist_ok=True)
+            self.history_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
             self._history_dirty = False
         except Exception:
             pass

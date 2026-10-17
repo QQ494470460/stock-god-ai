@@ -235,8 +235,17 @@ def _normalize_picks(picks: Any) -> List[dict]:
         except Exception:  # noqa: BLE001
             score = 0.0
         reason = r.get("reason") or r.get("推荐理由") or ""
+        # 参考价：优先用推荐时点的最新价/收盘价。早期版本从没透传过价格，
+        # 于是计划里 10 只目标全是 price=0.0，字段名存实亡 —— 执行侧读不到
+        # 任何参考价，没法做「价格跳空太多就别追」的校验。
+        try:
+            price = float(
+                r.get("price") or r.get("最新价") or r.get("收盘价") or r.get("close") or 0
+            )
+        except Exception:  # noqa: BLE001
+            price = 0.0
         rows.append({"code": str(code), "name": str(name),
-                     "score": score, "reason": str(reason)})
+                     "score": score, "reason": str(reason), "price": price})
 
     rows.sort(key=lambda x: x["score"], reverse=True)
     return rows
@@ -305,7 +314,8 @@ def build_trade_plan(
     rows = rows[: max(0, limit)]
 
     targets = [
-        PlanTarget(code=r["code"], name=r["name"], score=r["score"], reason=r["reason"])
+        PlanTarget(code=r["code"], name=r["name"], score=r["score"],
+                   reason=r["reason"], price=float(r.get("price") or 0.0))
         for r in rows
     ]
 

@@ -22,7 +22,7 @@ from src.trading.broker import (
     BrokerAPI, Order, OrderSide, OrderType, OrderStatus,
     Position, AccountInfo, TickData,
 )
-from src.trading.guard import RiskSupervisor, build_supervisor, TradingMode
+from src.trading.guard import RiskSupervisor, TradingMode
 
 
 # ---------------- 零风险 Fake 对象 ----------------
@@ -102,7 +102,27 @@ def main():
     cfg_path = str(ROOT / "config" / "trading_guard.yaml")
     broker = FakeBroker()
     paper = FakePaper()
-    sup = build_supervisor(broker, config_path=cfg_path, paper_account=paper)
+
+    # ⚠️ 演示必须隔离状态与审计日志。
+    # 早期这里直接用 config/trading_guard.yaml 的默认路径，于是 demo 的
+    # kill_switch / arm_live / 成交全部写进**生产**的
+    # data/trading_guard_state.json 与 data/trading_journal.jsonl：
+    #   - 生产审计流水里混进 operator_alice / operator_bob 的假成交
+    #   - 更危险的是 arm_live 会把真实状态置为 live_pending，若演示中途异常退出，
+    #     生产就卡在一个「已武装但无 arm 留痕」的非法状态（10-16 确实发生过，
+    #     事后只能人工写 mode_change 退回 PAPER）
+    from tempfile import mkdtemp
+    from src.trading.guard import GuardConfig
+
+    demo_dir = Path(mkdtemp(prefix="guard_demo_"))
+    if Path(cfg_path).exists():
+        cfg = GuardConfig.from_yaml(cfg_path)
+    else:
+        cfg = GuardConfig()
+    cfg.state_file = str(demo_dir / "state.json")
+    cfg.journal_file = str(demo_dir / "journal.jsonl")
+    sup = RiskSupervisor(broker, cfg, paper_account=paper)
+    print(f"🔒 演示隔离目录（不触碰生产状态/日志）: {demo_dir}")
 
     # 演示用：强制放行交易时段日历检查（仅 dry-run 演示，真实运行不会这样）
     import src.trading.calendar as _cal
