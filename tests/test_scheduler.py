@@ -24,6 +24,38 @@ def _isolate_job_leases(tmp_path, monkeypatch):
     monkeypatch.setattr(auto_scheduler, "LEASE_DIR", tmp_path)
 
 
+# 生产状态文件：全文件级值守。任何用例（包括将来新加的）只要让它们变了就立刻失败。
+_PROD_STATE = (
+    ROOT / "data" / "evolution_state.json",
+    ROOT / "data" / "prediction_history.json",
+    ROOT / "config" / "evolution_overrides.json",
+)
+
+
+@pytest.fixture(autouse=True)
+def _guard_production_state():
+    """逐用例比对生产状态文件，杜绝「忘了带替身夹具 → 真跑作业 → 写脏生产」的复发。
+
+    回归背景：新增的两个租约用例只关心锁行为，直接调了 ``job_evolution()``，
+    却没带 ``patched`` 夹具 —— ``_job_evolution_impl`` 用模块级真实 ``evolution``
+    单例，于是 ``mark_checked()`` 把 ``last_check_at`` 写进了生产
+    ``data/evolution_state.json``，还顺带真跑了一遍 ``verify_all_pending()`` 和
+    行情拉取。用例自身全部通过，只有比对文件指纹才看得出来。
+
+    只值守「闭环 tick 不会碰」的三件：evolution 态、预测历史、进化覆盖参数。
+    ``trading_guard_state.json`` / ``trading_journal.jsonl`` / ``paper_account.json``
+    会常驻进程在盘中真实写入，放进来会变成随机失败，故不在此列。
+    """
+    before = {p: (p.read_bytes() if p.exists() else None) for p in _PROD_STATE}
+    yield
+    for p, old in before.items():
+        now = p.read_bytes() if p.exists() else None
+        assert now == old, (
+            f"用例污染了生产状态文件 {p.relative_to(ROOT)}。"
+            f"请给该用例加 `patched` 夹具，或把写入路径指向 tmp_path。"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fake 依赖
 # ---------------------------------------------------------------------------
@@ -273,7 +305,7 @@ def test_daily_pick_plan_dry_run_writes_nothing(patched, monkeypatch, tmp_path):
 # 跨进程作业租约（看板 + run_loop 两份调度器不得重复触发同一 cron）
 # ---------------------------------------------------------------------------
 
-def test_job_lease_prevents_double_run(tmp_path):
+def test_job_lease_prevents_double_run(tmp_path, patched):
     """锁被别的进程占着时，本次必须跳过且不碰真实作业；跑完必须解锁。"""
     lock = tmp_path / ".job_evolution.lock"
     lock.write_text("99999")          # 模拟另一个进程持锁
@@ -288,7 +320,7 @@ def test_job_lease_prevents_double_run(tmp_path):
     assert not lock.exists(), "作业结束后必须释放租约"
 
 
-def test_stale_job_lease_is_taken_over(tmp_path):
+def test_stale_job_lease_is_taken_over(tmp_path, patched):
     """持锁进程崩了（锁超时）必须能被接管，否则作业会被永久卡死。"""
     import os
     import time

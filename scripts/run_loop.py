@@ -33,6 +33,7 @@
 """
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -52,6 +53,50 @@ except Exception:  # noqa: BLE001
 
 
 _stop_requested = False
+# 单实例锁的文件句柄：进程存活期间一直持有，退出（含崩溃）由 OS 自动释放
+_instance_lock_handle = None
+
+
+def acquire_single_instance(lock_path: Path) -> bool:
+    """拿「全机唯一闭环实例」的进程级文件锁，拿不到返回 False。
+
+    为什么必须有：闭环一旦多开一个实例，就会对同一份计划**再下一遍单**。
+    加了开机自启之后，最容易出现「计划任务拉了一份 + 你手动又开一份」，
+    而且两边的风控/纸账户各有一份内存副本，对账也会乱。
+
+    用 OS 级文件锁（Windows msvcrt / POSIX flock）而不是 PID 文件：
+    进程无论正常退出还是崩溃，操作系统都会释放锁，不会留下"假死锁"。
+    注意不能用 ``os.kill(pid, 0)`` 探活 —— Windows 上它会真的
+    TerminateProcess，把正在跑的进程杀掉。
+    """
+    global _instance_lock_handle
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        f = open(lock_path, "a+")
+    except OSError as e:
+        print(f"⚠️  无法创建单实例锁 {lock_path}: {e}", file=sys.stderr)
+        return True          # 锁不可用时不阻断运行（宁可能跑，不可不跑）
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:                # pragma: no cover - POSIX
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+
+    try:
+        f.seek(0)
+        f.truncate()
+        f.write(f"pid={os.getpid()}\nsince={datetime.now().isoformat(timespec='seconds')}\n")
+        f.flush()
+    except OSError:
+        pass
+    _instance_lock_handle = f
+    return True
 
 
 def _on_signal(signum, _frame):  # pragma: no cover - 信号路径
@@ -246,6 +291,19 @@ def main() -> int:
                     help="配合 --rebaseline-peak：重置基线后顺便解除熔断")
     ap.add_argument("--operator", default="cli", help="操作者标识（写入 journal，默认 cli）")
     args = ap.parse_args()
+
+    # ---- 单实例闸门（必须在建 broker/guard 之前，尽早失败）----
+    # 两个闭环实例会对同一份计划重复下单，且各自的纸账户/风控是独立内存副本，
+    # 对账一定会乱。--preview 只读，不受限制。
+    if not args.preview:
+        from config.settings import DATA_DIR as _DATA_DIR
+        if not acquire_single_instance(Path(_DATA_DIR) / ".run_loop.lock"):
+            print("❌ 已有一个闭环实例在运行（单实例锁被占用），本次退出。\n"
+                  "   两个实例会对同一份计划重复下单。\n"
+                  "   确认确实没有实例在跑后，删除 data/.run_loop.lock 再重试；\n"
+                  "   想看状态请读 data/loop_heartbeat.json 的 age_sec。",
+                  file=sys.stderr)
+            return 3
 
     loop, broker, cfg = build_loop(args)
     if loop is None:
