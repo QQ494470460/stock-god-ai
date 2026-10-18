@@ -165,11 +165,12 @@ class AlphaSubPredictor(SubPredictor):
             feats = feats.drop(columns=["close"])
         latest = feats.iloc[-1:]
         if self._alpha_cols:
-            # 取全历史再切片（而不是只取最后一天），这样诊断用的 shift 才有意义
-            a = self._alpha_for_code(code, feats.index)
             if _ALPHA_LAG > 0:
-                a = a.shift(_ALPHA_LAG)
-            a = a.iloc[-1:]
+                # 只有诊断模式才需要全历史（shift 要按交易日位移，单看最后一行没法移）。
+                # 代价是回填慢一倍，故生产（lag=0）绝不走这条。
+                a = self._alpha_for_code(code, feats.index).shift(_ALPHA_LAG).iloc[-1:]
+            else:
+                a = self._alpha_for_code(code, latest.index)
             row = latest.reindex(columns=self._ref_cols, fill_value=0.0)
             row = pd.concat([row, a.reindex(index=row.index)], axis=1)
         else:
