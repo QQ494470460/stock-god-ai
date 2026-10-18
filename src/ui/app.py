@@ -244,6 +244,317 @@ _auto_reload_model_if_updated()
 _ensure_scheduler_running()
 
 
+# ========== 个股盯盘片段（原地刷新） ==========
+# 把盯盘面板的「拉取 + 渲染」包进 st.fragment：自动刷新只重跑该片段、
+# 不触发整页 rerun，从而彻底消除刷新间隙的闪动、也不打扰同页其它控件。
+_WATCH_POLL_SEC = 5  # 片段轮询周期（秒）；行情/AI 的实际重拉仍由各自 TTL 控制
+
+
+def _save_last_watched(code: str) -> None:
+    """把最近盯盘的代码持久化到 config/watch_last.json，跨会话（重开看板）仍带出。"""
+    try:
+        import json as _json
+        _p = Path(__file__).parent.parent.parent / "config" / "watch_last.json"
+        _p.write_text(_json.dumps({"code": code}, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_last_watched() -> str:
+    try:
+        import json as _json
+        _p = Path(__file__).parent.parent.parent / "config" / "watch_last.json"
+        if _p.exists():
+            return _json.loads(_p.read_text(encoding="utf-8")).get("code", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+@st.fragment(run_every=_WATCH_POLL_SEC)
+def render_watch_fragment() -> None:
+    """个股盯盘面板：行情/AI 双层 TTL + 实时价滚动 sparkline，原地刷新。
+
+    读取同页控件（watch_code / watch_interval / watch_ai_interval / watch_auto /
+    watch_go / watch_refresh）的 session_state；行情按 5s（盘中自动）或用户间隔刷新，
+    AI 按 watch_ai_interval 重算，避免盘中每次刷新都跑模型。
+    """
+    watch_code = (st.session_state.get("watch_code") or "").strip().upper()
+    watch_interval = int(st.session_state.get("watch_interval", 10))
+    watch_ai_interval = int(st.session_state.get("watch_ai_interval", 60))
+    watch_auto = bool(st.session_state.get("watch_auto", True))
+    watch_go = bool(st.session_state.get("watch_go", False))
+    watch_refresh = bool(st.session_state.get("watch_refresh", False))
+
+    # 交易时段：片段独立重跑，必须自己算，不能依赖外层捕获
+    now = datetime.now()
+    market_open = (now.weekday() < 5 and (
+        (now.hour == 9 and now.minute >= 30) or now.hour == 10 or
+        (now.hour == 11 and now.minute <= 30) or now.hour == 13 or
+        now.hour == 14 or (now.hour == 15 and now.minute == 0)))
+
+    cache = st.session_state.get("watch_cache", {}) or {}
+    code = watch_code
+
+    # 行情刷新 TTL：盘中自动时按轮询周期拿实时价（行情便宜），其余按用户间隔
+    _quote_ttl = _WATCH_POLL_SEC if (market_open and watch_auto) else watch_interval
+    _force = watch_go or watch_refresh
+    _first = bool(code and "watch_last_ts" not in st.session_state)
+    _last = st.session_state.get("watch_last_ts")
+    _auto_due = bool(code and watch_auto and _last is not None and (now - _last).total_seconds() > _quote_ttl)
+    need_quote = _force or _first or _auto_due
+
+    _prev_pred = cache.get("pred") if cache.get("code") == code else None
+    _ai_ts = cache.get("ai_fetched_at")
+    _ai_age = (now - _ai_ts).total_seconds() if _ai_ts else 1e9
+    need_ai = bool(_force) or (_prev_pred is None) or (_ai_age > watch_ai_interval) or (cache.get("code") != code)
+
+    if need_quote and code:
+        if not is_valid_code(code):
+            st.warning("请输入6位股票代码")
+        else:
+            st.session_state.watch_last_ts = now
+            stock_name = get_name(code)
+            df_k = _cached_daily_kline(code, "", "")
+            if len(df_k) < 30:
+                if _force:
+                    st.warning(f"{code} {stock_name} 数据不足")
+            else:
+                close = df_k["close"]
+                last_close = float(close.iloc[-1])
+                prev_close = float(close.iloc[-2])
+                day_chg = (last_close / prev_close - 1) * 100
+
+                live_price = last_close
+                live_chg = day_chg
+                live_vol = int(df_k["volume"].iloc[-1])
+                if market_open:
+                    spot = fetcher.get_realtime_quote(code)
+                    if spot and spot.get("最新价", 0) > 0:
+                        live_price = float(spot["最新价"])
+                        live_chg = float(spot.get("涨跌幅", day_chg))
+                        if spot.get("成交量", 0) > 0:
+                            live_vol = int(spot["成交量"])
+                    else:
+                        try:
+                            import akshare as ak
+                            df_spot = ak.stock_zh_a_spot_em().set_index("代码")
+                            if code in df_spot.index:
+                                spot2 = df_spot.loc[code]
+                                live_price = float(spot2.get("最新价", last_close))
+                                live_chg = float(spot2.get("涨跌幅", day_chg))
+                                live_vol = int(float(spot2.get("成交量", 0))) if spot2.get("成交量", 0) else live_vol
+                        except Exception:
+                            pass
+
+                if need_ai:
+                    pred = None
+                    try:
+                        pred = predictor.predict_single(df_k, code, stock_name)
+                    except Exception:
+                        pred = None
+                    ai_fetched_at = now
+                else:
+                    pred = _prev_pred
+                    ai_fetched_at = _ai_ts
+
+                st.session_state.watch_cache = {
+                    "code": code, "stock_name": stock_name,
+                    "live_price": live_price, "live_chg": live_chg, "live_vol": live_vol,
+                    "df_k": df_k, "pred": pred,
+                    "fetched_at": now, "ai_fetched_at": ai_fetched_at, "market_open": market_open,
+                }
+
+                # 实时价滚动缓冲（仅盘中），最多保留 60 个点
+                if market_open and live_price > 0:
+                    _hist = st.session_state.setdefault("watch_prices", {})
+                    _buf = _hist.setdefault(code, [])
+                    _buf.append((now, live_price))
+                    if len(_buf) > 60:
+                        _hist[code] = _buf[-60:]
+                    for _k in list(_hist.keys()):
+                        if _k != code:
+                            _hist.pop(_k, None)
+
+                # 跨会话持久化 last-watched（仅代码变化时写盘）
+                if st.session_state.get("_watch_persist_code") != code:
+                    _save_last_watched(code)
+                    st.session_state._watch_persist_code = code
+
+    # ---- 渲染（始终从缓存） ----
+    _cache = st.session_state.get("watch_cache", {}) or {}
+    if _cache.get("code"):
+        code = _cache["code"]
+        stock_name = _cache["stock_name"]
+        live_price = _cache["live_price"]
+        live_chg = _cache["live_chg"]
+        live_vol = _cache["live_vol"]
+        df_k = _cache["df_k"]
+        pred = _cache["pred"]
+        fetched_at = _cache.get("fetched_at")
+
+        close = df_k["close"]
+        last_close = float(close.iloc[-1])
+
+        # 价格卡片行
+        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+        chg_icon = "📈" if live_chg >= 0 else "📉"
+        with pc1:
+            metric_card(label=f"{chg_icon} {stock_name}({code})", value=f"{live_price:.2f}", chg=live_chg)
+        with pc2:
+            ma5 = float(close.rolling(5).mean().iloc[-1])
+            metric_card(label="MA5", value=f"{ma5:.2f}",
+                        chg=(live_price / ma5 - 1) * 100 if ma5 > 0 else None,
+                        chg_text=f"{(live_price/ma5-1)*100:+.2f}% vs 现价" if ma5 > 0 else "")
+        with pc3:
+            vol_wan = live_vol / 10000
+            avg_vol = float(df_k["volume"].rolling(20).mean().iloc[-1]) / 10000
+            st.metric(label="成交量(万)", value=f"{vol_wan:.0f}", delta=f"{vol_wan/avg_vol*100:.0f}% vs 20日均量" if avg_vol > 0 else None)
+        with pc4:
+            rsi_v = float(calc_rsi(close).iloc[-1])
+            rsi_label = "超买" if rsi_v > 70 else ("超卖" if rsi_v < 30 else ("偏强" if rsi_v > 50 else "偏弱"))
+            st.metric(label=f"RSI(14)·{rsi_label}", value=f"{rsi_v:.0f}")
+        with pc5:
+            if pred:
+                ai_icon = "📈" if pred.prob_up > 0.5 else ("📉" if pred.prob_down > 0.5 else "➡️")
+                st.metric(label=f"{ai_icon} AI评分", value=f"{pred.score:.0f}", delta=f"确信{pred.confidence*100:.0f}%")
+            else:
+                st.metric(label="AI评分", value="—")
+
+        # 盘中实时价滚动 sparkline
+        _hist = st.session_state.get("watch_prices", {})
+        _buf = _hist.get(code)
+        if _buf and len(_buf) >= 2 and _cache.get("market_open"):
+            _ts = [t for t, _ in _buf]
+            _px = [p for _, p in _buf]
+            fig_sp = go.Figure()
+            _sp_color = UP_COLOR if _px[-1] >= _px[0] else DOWN_COLOR
+            fig_sp.add_trace(go.Scatter(x=_ts, y=_px, mode="lines",
+                                        line=dict(color=_sp_color, width=1.5),
+                                        fill="tozeroy", fillcolor=_sp_color + "22"))
+            fig_sp.update_layout(height=90, margin=dict(l=0, r=0, t=4, b=4),
+                                 xaxis=dict(visible=False), yaxis=dict(visible=False),
+                                 template="plotly_white", showlegend=False)
+            st.plotly_chart(fig_sp, use_container_width=True, key="watch_spark")
+
+        # 交易信号 + K线
+        tc1, tc2 = st.columns([1, 1.5])
+        with tc1:
+            if pred:
+                st.markdown('<div class="section-title">🎯 交易信号</div>', unsafe_allow_html=True)
+                reason_html = ""
+                for r in getattr(pred, 'reasons', [])[:4]:
+                    reason_html += f'<div style="font-size:0.8rem;padding:2px 0;color:#475569;">• {r}</div>'
+                if pred.score >= 80:
+                    adv = ("强力做多", "#ef4444", "🟢")
+                elif pred.score >= 65:
+                    adv = ("建议做多", "#f59e0b", "🟡")
+                elif pred.score >= 50:
+                    adv = ("谨慎关注", "#64748b", "⚪")
+                elif pred.score >= 35:
+                    adv = ("建议观望", "#64748b", "⚪")
+                else:
+                    adv = ("建议回避", "#059669", "🔴")
+                st.markdown(f"""
+                <div style="background:{adv[1]}10; border:1px solid {adv[1]}30; border-radius:12px; padding:0.8rem; margin:0.5rem 0;">
+                    <p style="font-weight:700; color:{adv[1]}; font-size:1.1rem; margin:0;">{adv[2]} {adv[0]}</p>
+                    <p style="color:#64748b; font-size:0.75rem; margin:0.3rem 0 0 0;">综合评分 {pred.score:.0f} | 置信度 {pred.confidence*100:.0f}% | {'模型看涨' if pred.xgb_signal == 1 else ('模型看跌' if pred.xgb_signal == -1 else '模型观望')}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption("模型预测概率")
+                st.markdown(f"""
+                <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+                    <span style="font-size:0.75rem; width:30px; color:#ef4444;">📈涨</span>
+                    <div style="flex:1; height:18px; background:#e2e8f0; border-radius:9px; overflow:hidden;">
+                        <div style="width:{pred.prob_up*100:.0f}%; height:100%; background:linear-gradient(90deg,#ef4444,#f87171); border-radius:9px;"></div>
+                    </div>
+                    <span style="font-size:0.75rem; font-weight:600; color:#ef4444;">{pred.prob_up*100:.0f}%</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
+                    <span style="font-size:0.75rem; width:30px; color:#059669;">📉跌</span>
+                    <div style="flex:1; height:18px; background:#e2e8f0; border-radius:9px; overflow:hidden;">
+                        <div style="width:{pred.prob_down*100:.0f}%; height:100%; background:linear-gradient(90deg,#059669,#34d399); border-radius:9px;"></div>
+                    </div>
+                    <span style="font-size:0.75rem; font-weight:600; color:#059669;">{pred.prob_down*100:.0f}%</span>
+                </div>
+                """, unsafe_allow_html=True)
+                if reason_html:
+                    st.markdown(reason_html, unsafe_allow_html=True)
+            else:
+                st.info("模型未就绪")
+        with tc2:
+            df_plot = df_k.iloc[-60:].copy()
+            fig_mini = go.Figure()
+            colors_k = ["#ef4444" if df_plot["close"].iloc[i] >= df_plot["open"].iloc[i] else "#059669" for i in range(len(df_plot))]
+            fig_mini.add_trace(go.Candlestick(
+                x=df_plot["date"], open=df_plot["open"], high=df_plot["high"],
+                low=df_plot["low"], close=df_plot["close"],
+                increasing_line_color="#ef4444", decreasing_line_color="#059669",
+                name="K线"
+            ))
+            fig_mini.add_trace(go.Scatter(x=df_plot["date"], y=df_plot["close"].rolling(5).mean(),
+                                           mode="lines", line=dict(color="#f59e0b", width=1), name="MA5"))
+            fig_mini.add_trace(go.Scatter(x=df_plot["date"], y=df_plot["close"].rolling(20).mean(),
+                                           mode="lines", line=dict(color="#8b5cf6", width=1.2), name="MA20"))
+            high60 = float(df_plot["high"].max())
+            low60 = float(df_plot["low"].min())
+            pivot = (float(df_plot["high"].iloc[-1]) + float(df_plot["low"].iloc[-1]) + float(df_plot["close"].iloc[-1])) / 3
+            for y, name, color, dash in [(high60, "压力", "#ef4444", "dash"), (low60, "支撑", "#059669", "dash"), (pivot, "枢轴", "#64748b", "dot")]:
+                fig_mini.add_hline(y=y, line_dash=dash, line_color=color, opacity=0.5,
+                                   annotation_text=f"{name} {y:.2f}", annotation_position="top right")
+            fig_mini.update_layout(height=320, template="plotly_white",
+                                    title=f"{stock_name} ({code}) · 60日K线",
+                                    xaxis_rangeslider_visible=False,
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02))
+            st.plotly_chart(fig_mini, use_container_width=True, key="watch_kline")
+
+        # 技术指标速览
+        ti1, ti2, ti3, ti4, ti5, ti6 = st.columns(6)
+        dif, dea, macd_bar = calc_macd(close)
+        macd_val = float(macd_bar.iloc[-1])
+        with ti1:
+            st.metric(label="MACD", value=f"{macd_val:.3f}", delta="金叉" if macd_val > 0 and float(macd_bar.iloc[-2]) <= 0 else ("死叉" if macd_val < 0 and float(macd_bar.iloc[-2]) >= 0 else None))
+        low9 = df_k["low"].rolling(9).min()
+        high9 = df_k["high"].rolling(9).max()
+        rsv = (close - low9) / (high9 - low9 + 1e-10) * 100
+        k_val = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d_val = k_val.ewm(alpha=1/3, adjust=False).mean()
+        j_val = 3 * k_val - 2 * d_val
+        with ti2:
+            st.metric(label="KDJ-K", value=f"{float(k_val.iloc[-1]):.0f}")
+        with ti3:
+            st.metric(label="KDJ-J", value=f"{float(j_val.iloc[-1]):.0f}", delta="超买" if float(j_val.iloc[-1]) > 100 else ("超卖" if float(j_val.iloc[-1]) < 0 else None))
+        bb_mid = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
+        bb_pos = (last_close - float(bb_mid.iloc[-1])) / (2 * float(bb_std.iloc[-1]) + 1e-10)
+        with ti4:
+            st.metric(label="布林位置", value=f"{bb_pos:.2f}σ", delta="上轨附近" if bb_pos > 0.8 else ("下轨附近" if bb_pos < -0.8 else None))
+        with ti5:
+            chg_5d = (last_close / float(close.iloc[-6]) - 1) * 100 if len(close) >= 6 else 0
+            st.metric(label="5日涨幅", value=f"{chg_5d:+.2f}%")
+        with ti6:
+            chg_20d = (last_close / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0
+            st.metric(label="20日涨幅", value=f"{chg_20d:+.2f}%")
+
+        # 数据时效提示（行情 vs AI 分开展示）
+        if fetched_at:
+            _age = int((datetime.now() - fetched_at).total_seconds())
+            _ai_ts = _cache.get("ai_fetched_at")
+            _ai_age = int((datetime.now() - _ai_ts).total_seconds()) if _ai_ts else None
+            if _cache.get("market_open"):
+                _src = "盘中实时行情"
+            elif watch_auto:
+                _src = "非交易时段 · 仅显示上一交易日收盘"
+            else:
+                _src = "非交易时段 · 自动刷新已关闭"
+            _cap = f"🕒 行情 {_age} 秒前 · AI评分" + (f" {_ai_age} 秒前" if _ai_age is not None else " —") + f"（{_src}）"
+            st.caption(_cap)
+        st.divider()
+    else:
+        st.caption("👆 输入股票代码，或点选上方自选股，开始盯盘")
+
+
 # ========== 大盘涨跌条 ==========
 
 def render_market_ticker():
@@ -1780,7 +2091,7 @@ elif page == "📡 实时监控":
     mon1, mon2, mon3, mon4, mon5, mon6 = st.columns([2.0, 1.1, 1.0, 1.0, 0.9, 0.9])
     with mon1:
         # 默认带出上次盯盘的股票；首次打开则带出自选股第一只，避免面板空置
-        _default = st.session_state.get("watch_code") or (_wl[0] if _wl else "")
+        _default = st.session_state.get("watch_code") or _load_last_watched() or (_wl[0] if _wl else "")
         watch_code = st.text_input("输入股票代码盯盘", value=_default, placeholder="例: 000001, 600519", key="watch_code", label_visibility="collapsed")
     with mon2:
         watch_go = st.button("🔍 开始盯盘", type="primary", use_container_width=True, key="watch_go")
@@ -1794,279 +2105,7 @@ elif page == "📡 实时监控":
     with mon6:
         watch_refresh = st.button("🔄 刷新", use_container_width=True, key="watch_refresh")
 
-    need_watch = watch_go or watch_refresh
-    # 已带出代码但本次会话还没盯过 → 首屏立即跑一次（解决「打开即空」）
-    if watch_code and "watch_last_ts" not in st.session_state:
-        need_watch = True
-    elif watch_code and watch_auto and "watch_last_ts" in st.session_state:
-        elapsed = (datetime.now() - st.session_state.watch_last_ts).total_seconds()
-        if elapsed > watch_interval:
-            need_watch = True
-
-    # 盯盘结果缓存：面板统一从缓存渲染，避免交互/刷新间隙面板闪空
-    if "watch_cache" not in st.session_state:
-        st.session_state.watch_cache = {}
-
-    if need_watch and watch_code:
-        st.session_state.watch_last_ts = datetime.now()
-        code = watch_code.strip().upper()
-        if not is_valid_code(code):
-            st.warning("请输入6位股票代码")
-        else:
-            # 股票名：走统一的 code/name 映射（列表列名是英文，不能用中文列取）
-            stock_name = get_name(code)
-
-            # 日线数据
-            df_k = _cached_daily_kline(code, "", "")
-            if len(df_k) < 30:
-                st.warning(f"{code} {stock_name} 数据不足")
-            else:
-                close = df_k["close"]
-                last_close = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
-                day_chg = (last_close / prev_close - 1) * 100
-
-                # 获取实时行情（交易时段）
-                live_price = last_close
-                live_chg = day_chg
-                live_vol = int(df_k["volume"].iloc[-1])
-                if market_open:
-                    # 优先腾讯源（稳定快速），失败回退东方财富
-                    spot = fetcher.get_realtime_quote(code)
-                    if spot and spot.get("最新价", 0) > 0:
-                        live_price = float(spot["最新价"])
-                        live_chg = float(spot.get("涨跌幅", day_chg))
-                        if spot.get("成交量", 0) > 0:
-                            live_vol = int(spot["成交量"])
-                    else:
-                        try:
-                            import akshare as ak
-                            df_spot = ak.stock_zh_a_spot_em()
-                            df_spot = df_spot.set_index("代码")
-                            if code in df_spot.index:
-                                spot2 = df_spot.loc[code]
-                                live_price = float(spot2.get("最新价", last_close))
-                                live_chg = float(spot2.get("涨跌幅", day_chg))
-                                live_vol = int(float(spot2.get("成交量", 0))) if spot2.get("成交量", 0) else live_vol
-                        except Exception:
-                            pass
-
-                # AI 预测（双层 TTL）：行情每次都刷新，AI 模型按更长周期重算，避免盘中卡模型
-                _prev = st.session_state.watch_cache
-                _cache_pred = _prev.get("pred") if _prev.get("code") == code else None
-                _ai_ts = _prev.get("ai_fetched_at")
-                _ai_age = (datetime.now() - _ai_ts).total_seconds() if _ai_ts else 1e9
-                _force_ai = bool(watch_go or watch_refresh) or (_cache_pred is None) \
-                    or (_ai_age > watch_ai_interval) or (_prev.get("code") != code)
-                if _force_ai:
-                    pred = None
-                    try:
-                        pred = predictor.predict_single(df_k, code, stock_name)
-                    except Exception:
-                        pred = None
-                    ai_fetched_at = datetime.now()
-                else:
-                    pred = _cache_pred
-                    ai_fetched_at = _ai_ts
-
-                # 写入缓存：面板渲染统一从缓存读，不依赖本次是否刚拉取
-                st.session_state.watch_cache = {
-                    "code": code,
-                    "stock_name": stock_name,
-                    "live_price": live_price,
-                    "live_chg": live_chg,
-                    "live_vol": live_vol,
-                    "df_k": df_k,
-                    "pred": pred,
-                    "fetched_at": datetime.now(),
-                    "ai_fetched_at": ai_fetched_at,
-                    "market_open": market_open,
-                }
-
-    # ---- 渲染盯盘面板：始终从缓存渲染，保证面板不闪烁/不空置 ----
-    _cache = st.session_state.get("watch_cache") or {}
-    if _cache.get("code"):
-        code = _cache["code"]
-        stock_name = _cache["stock_name"]
-        live_price = _cache["live_price"]
-        live_chg = _cache["live_chg"]
-        live_vol = _cache["live_vol"]
-        df_k = _cache["df_k"]
-        pred = _cache["pred"]
-        fetched_at = _cache.get("fetched_at")
-
-        close = df_k["close"]
-        last_close = float(close.iloc[-1])
-
-        # 价格卡片行
-        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-        chg_icon = "📈" if live_chg >= 0 else "📉"
-        with pc1:
-            # 用自绘卡片而非 st.metric：metric 的 delta_color="normal"
-            # 是欧美配色（涨绿跌红），在 A 股界面里语义是反的
-            metric_card(
-                label=f"{chg_icon} {stock_name}({code})",
-                value=f"{live_price:.2f}",
-                chg=live_chg,
-            )
-        with pc2:
-            ma5 = float(close.rolling(5).mean().iloc[-1])
-            metric_card(label="MA5", value=f"{ma5:.2f}",
-                        chg=(live_price / ma5 - 1) * 100 if ma5 > 0 else None,
-                        chg_text=f"{(live_price/ma5-1)*100:+.2f}% vs 现价" if ma5 > 0 else "")
-        with pc3:
-            vol_wan = live_vol / 10000
-            avg_vol = float(df_k["volume"].rolling(20).mean().iloc[-1]) / 10000
-            st.metric(label="成交量(万)", value=f"{vol_wan:.0f}", delta=f"{vol_wan/avg_vol*100:.0f}% vs 20日均量" if avg_vol > 0 else None)
-        with pc4:
-            # RSI
-            rsi_v = float(calc_rsi(close).iloc[-1])
-            rsi_label = "超买" if rsi_v > 70 else ("超卖" if rsi_v < 30 else ("偏强" if rsi_v > 50 else "偏弱"))
-            st.metric(label=f"RSI(14)·{rsi_label}", value=f"{rsi_v:.0f}")
-        with pc5:
-            if pred:
-                ai_icon = "📈" if pred.prob_up > 0.5 else ("📉" if pred.prob_down > 0.5 else "➡️")
-                st.metric(label=f"{ai_icon} AI评分", value=f"{pred.score:.0f}", delta=f"确信{pred.confidence*100:.0f}%")
-            else:
-                st.metric(label="AI评分", value="—")
-
-        # 交易信号 + K线
-        tc1, tc2 = st.columns([1, 1.5])
-        with tc1:
-            if pred:
-                st.markdown('<div class="section-title">🎯 交易信号</div>', unsafe_allow_html=True)
-                reason_html = ""
-                for r in getattr(pred, 'reasons', [])[:4]:
-                    reason_html += f'<div style="font-size:0.8rem;padding:2px 0;color:#475569;">• {r}</div>'
-
-                # 建议
-                if pred.score >= 80:
-                    adv = ("强力做多", "#ef4444", "🟢")
-                elif pred.score >= 65:
-                    adv = ("建议做多", "#f59e0b", "🟡")
-                elif pred.score >= 50:
-                    adv = ("谨慎关注", "#64748b", "⚪")
-                elif pred.score >= 35:
-                    adv = ("建议观望", "#64748b", "⚪")
-                else:
-                    adv = ("建议回避", "#059669", "🔴")
-
-                st.markdown(f"""
-                <div style="background:{adv[1]}10; border:1px solid {adv[1]}30; border-radius:12px; padding:0.8rem; margin:0.5rem 0;">
-                    <p style="font-weight:700; color:{adv[1]}; font-size:1.1rem; margin:0;">{adv[2]} {adv[0]}</p>
-                    <p style="color:#64748b; font-size:0.75rem; margin:0.3rem 0 0 0;">综合评分 {pred.score:.0f} | 置信度 {pred.confidence*100:.0f}% | {'模型看涨' if pred.xgb_signal == 1 else ('模型看跌' if pred.xgb_signal == -1 else '模型观望')}</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # 概率条
-                st.caption("模型预测概率")
-                st.markdown(f"""
-                <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
-                    <span style="font-size:0.75rem; width:30px; color:#ef4444;">📈涨</span>
-                    <div style="flex:1; height:18px; background:#e2e8f0; border-radius:9px; overflow:hidden;">
-                        <div style="width:{pred.prob_up*100:.0f}%; height:100%; background:linear-gradient(90deg,#ef4444,#f87171); border-radius:9px;"></div>
-                    </div>
-                    <span style="font-size:0.75rem; font-weight:600; color:#ef4444;">{pred.prob_up*100:.0f}%</span>
-                </div>
-                <div style="display:flex; align-items:center; gap:8px; margin:4px 0;">
-                    <span style="font-size:0.75rem; width:30px; color:#059669;">📉跌</span>
-                    <div style="flex:1; height:18px; background:#e2e8f0; border-radius:9px; overflow:hidden;">
-                        <div style="width:{pred.prob_down*100:.0f}%; height:100%; background:linear-gradient(90deg,#059669,#34d399); border-radius:9px;"></div>
-                    </div>
-                    <span style="font-size:0.75rem; font-weight:600; color:#059669;">{pred.prob_down*100:.0f}%</span>
-                </div>
-                """, unsafe_allow_html=True)
-
-                if reason_html:
-                    st.markdown(reason_html, unsafe_allow_html=True)
-            else:
-                st.info("模型未就绪")
-
-        with tc2:
-            # 迷你K线 (最近60天)
-            df_plot = df_k.iloc[-60:].copy()
-            fig_mini = go.Figure()
-            colors_k = ["#ef4444" if df_plot["close"].iloc[i] >= df_plot["open"].iloc[i] else "#059669" for i in range(len(df_plot))]
-            fig_mini.add_trace(go.Candlestick(
-                x=df_plot["date"], open=df_plot["open"], high=df_plot["high"],
-                low=df_plot["low"], close=df_plot["close"],
-                increasing_line_color="#ef4444", decreasing_line_color="#059669",
-                name="K线"
-            ))
-            # MA5, MA20
-            fig_mini.add_trace(go.Scatter(x=df_plot["date"], y=df_plot["close"].rolling(5).mean(),
-                                           mode="lines", line=dict(color="#f59e0b", width=1), name="MA5"))
-            fig_mini.add_trace(go.Scatter(x=df_plot["date"], y=df_plot["close"].rolling(20).mean(),
-                                           mode="lines", line=dict(color="#8b5cf6", width=1.2), name="MA20"))
-            # 支撑/压力线
-            high60 = float(df_plot["high"].max())
-            low60 = float(df_plot["low"].min())
-            pivot = (float(df_plot["high"].iloc[-1]) + float(df_plot["low"].iloc[-1]) + float(df_plot["close"].iloc[-1])) / 3
-            for y, name, color, dash in [(high60, "压力", "#ef4444", "dash"), (low60, "支撑", "#059669", "dash"), (pivot, "枢轴", "#64748b", "dot")]:
-                fig_mini.add_hline(y=y, line_dash=dash, line_color=color, opacity=0.5,
-                                   annotation_text=f"{name} {y:.2f}", annotation_position="top right")
-
-            fig_mini.update_layout(height=320, template="plotly_white",
-                                    title=f"{stock_name} ({code}) · 60日K线",
-                                    xaxis_rangeslider_visible=False,
-                                    margin=dict(l=10, r=10, t=30, b=10),
-                                    legend=dict(orientation="h", yanchor="bottom", y=1.02))
-            st.plotly_chart(fig_mini, use_container_width=True)
-
-        # 技术指标速览
-        ti1, ti2, ti3, ti4, ti5, ti6 = st.columns(6)
-        # MACD
-        dif, dea, macd_bar = calc_macd(close)
-        macd_val = float(macd_bar.iloc[-1])
-        with ti1:
-            st.metric(label="MACD", value=f"{macd_val:.3f}", delta="金叉" if macd_val > 0 and float(macd_bar.iloc[-2]) <= 0 else ("死叉" if macd_val < 0 and float(macd_bar.iloc[-2]) >= 0 else None))
-        # KDJ
-        low9 = df_k["low"].rolling(9).min()
-        high9 = df_k["high"].rolling(9).max()
-        rsv = (close - low9) / (high9 - low9 + 1e-10) * 100
-        k_val = rsv.ewm(alpha=1/3, adjust=False).mean()
-        d_val = k_val.ewm(alpha=1/3, adjust=False).mean()
-        j_val = 3 * k_val - 2 * d_val
-        with ti2:
-            st.metric(label="KDJ-K", value=f"{float(k_val.iloc[-1]):.0f}")
-        with ti3:
-            st.metric(label="KDJ-J", value=f"{float(j_val.iloc[-1]):.0f}", delta="超买" if float(j_val.iloc[-1]) > 100 else ("超卖" if float(j_val.iloc[-1]) < 0 else None))
-        # 布林带位置
-        bb_mid = close.rolling(20).mean()
-        bb_std = close.rolling(20).std()
-        bb_pos = (last_close - float(bb_mid.iloc[-1])) / (2 * float(bb_std.iloc[-1]) + 1e-10)
-        with ti4:
-            st.metric(label="布林位置", value=f"{bb_pos:.2f}σ", delta="上轨附近" if bb_pos > 0.8 else ("下轨附近" if bb_pos < -0.8 else None))
-        # 涨幅统计
-        with ti5:
-            chg_5d = (last_close / float(close.iloc[-6]) - 1) * 100 if len(close) >= 6 else 0
-            st.metric(label="5日涨幅", value=f"{chg_5d:+.2f}%")
-        with ti6:
-            chg_20d = (last_close / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0
-            st.metric(label="20日涨幅", value=f"{chg_20d:+.2f}%")
-
-        # 数据时效提示（行情 vs AI 分开展示）
-        if fetched_at:
-            _age = int((datetime.now() - fetched_at).total_seconds())
-            _ai_ts = _cache.get("ai_fetched_at")
-            _ai_age = int((datetime.now() - _ai_ts).total_seconds()) if _ai_ts else None
-            if _cache.get("market_open"):
-                _src = "盘中实时行情"
-            else:
-                _src = "非交易时段 · 仅显示上一交易日收盘"
-            _cap = f"🕒 行情 {_age} 秒前 · AI评分" + (f" {_ai_age} 秒前" if _ai_age is not None else " —") + f"（{_src}）"
-            st.caption(_cap)
-        st.divider()
-    else:
-        st.caption("👆 输入股票代码，或点选上方自选股，开始盯盘")
-
-    # 自动刷新倒计时
-    if watch_code and watch_auto and "watch_last_ts" in st.session_state:
-        remaining = watch_interval - int((datetime.now() - st.session_state.watch_last_ts).total_seconds())
-        if remaining > 0:
-            st.caption(f"⏱️ 盯盘 {remaining} 秒后自动刷新")
-        else:
-            st.rerun()
+    render_watch_fragment()
 
     # ========== 批量监控 ==========
     st.markdown('<div class="section-title">📋 批量监控</div>', unsafe_allow_html=True)
