@@ -2811,7 +2811,8 @@ def render_safety_panel():
                 save_scheduler_state(True)
             r = start_scheduler()
             if r:
-                st.success("✅ 已启动（工作日 18:30 更新数据 / 18:45 生成推荐 / 19:00 进化验证）")
+                st.success("✅ 已启动（工作日 18:30 更新数据 / 18:45 生成推荐 / "
+                           "19:00 进化验证 / 19:15 RankIC 回填）")
             else:
                 st.error("❌ 启动失败：APScheduler 未安装，或 cron 表达式无效。查看日志了解详情。")
                 st.info("安装依赖：pip install apscheduler")
@@ -2821,9 +2822,12 @@ def render_safety_panel():
             stop_scheduler(); st.success("🛑 已停止"); st.rerun()
     with s3:
         if st.button("🚀 立即跑一轮", key="sch_run", use_container_width=True):
+            # 试跑模式：不写报告、不含 RankIC 回填（扫全池拉行情要几分钟，会卡死主线程）
             out = run_all_once(dry_run=True)
             st.json({k: (v.get("status") if isinstance(v, dict) else v)
                      for k, v in out.items() if k != "ran_at"})
+            st.caption("试跑不写推荐报告，RankIC 回填按 19:15 的定时作业跑；"
+                       "需立刻补点请用 scripts/rolling_ic_backfill.py。")
     st.caption(f"调度状态：{'🟢 运行中' if is_running() else '⚪ 未运行'}")
 
 

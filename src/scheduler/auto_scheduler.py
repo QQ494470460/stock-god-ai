@@ -398,18 +398,36 @@ def is_running() -> bool:
     return _scheduler is not None and getattr(_scheduler, "running", False)
 
 
-def run_all_once(dry_run: bool = False) -> Dict:
-    """
-    立即顺序跑一轮全部任务（手动触发 / 测试用）。
+def run_all_once(dry_run: bool = False, heavy: bool = True) -> Dict:
+    """立即顺序跑一轮全部任务（手动触发 / 测试用）。
+
     dry_run=True 时每日推荐不写报告文件。
+
+    rolling_ic 是**重量级**作业：要扫全池拉行情再逐日横截面打分，实测数分钟
+    （开启集成融合后更长）。它只在收盘后由 cron 触发（19:15），不应出现在
+    「点一下看看通不通」的同步路径上 —— 看板「🚀 立即跑一轮」按钮和测试都走
+    dry_run=True，一旦带上它整个 Streamlit 主线程会被卡死几十分钟。
+
+    因此默认规则：``dry_run=True`` 或 ``heavy=False`` 时跳过回填，只留一条 skipped
+    记录；要真补点请显式 ``run_all_once(dry_run=False)`` 或直接跑
+    ``scripts/rolling_ic_backfill.py``。
     """
     logger.info(f"🚀 手动跑一轮自动化任务（dry_run={dry_run}）")
     out = {
         "data_update": job_data_update(),
         "daily_pick": job_daily_pick(dry_run=dry_run),
         "evolution": job_evolution(),
-        "rolling_ic": job_rolling_ic(dry_run=dry_run),
     }
+    if heavy and not dry_run:
+        out["rolling_ic"] = job_rolling_ic(dry_run=False)
+    else:
+        out["rolling_ic"] = {
+            "job": "rolling_ic",
+            "status": "skipped",
+            "reason": "试跑模式跳过重量级回填（扫全池拉行情耗时数分钟）；"
+                      "需补点请 dry_run=False 或跑 scripts/rolling_ic_backfill.py",
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
     out["ran_at"] = datetime.now().isoformat(timespec="seconds")
     # 简要落盘（便于追溯）
     try:

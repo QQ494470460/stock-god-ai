@@ -13,6 +13,22 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from src.models.ensemble import EnsemblePredictor, SubPredictor, _proba_to_score  # noqa: E402
+from config.settings import config as app_config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pin_no_shrinkage():
+    """把「权重收缩」钉为 0，让本文件的权重测试只验证纯加权逻辑。
+
+    收缩是独立旋钮（生产默认 0.5），若不钉住会让下面的期望值随全局配置漂移。
+    收缩本身的效果由 test_ensemble_shrinkage_pulls_weights_to_uniform 单独验证。
+    """
+    old = getattr(app_config.ml, "ensemble_shrinkage", 0.0)
+    app_config.ml.ensemble_shrinkage = 0.0
+    try:
+        yield
+    finally:
+        app_config.ml.ensemble_shrinkage = old
 
 
 class FakePred:
@@ -55,6 +71,18 @@ class UnavailableSub(SubPredictor):
         raise RuntimeError("model file missing")
 
 
+class NoneSub(SubPredictor):
+    """可用，但对某些标的出分为 None（特征不足 / 该腿模型没覆盖这只票）。"""
+
+    name = "none"
+
+    def _ensure(self):
+        pass
+
+    def _score(self, df, code):
+        return None
+
+
 def _df():
     return pd.DataFrame({"close": [1.0, 2.0, 3.0]})
 
@@ -89,6 +117,42 @@ def test_unavailable_sub_skipped():
     out = ep.predict_batch({"a": _df()})
     # 唯一子模型不可用 → 回退主模型分
     assert out["a"].score == 60.0
+
+
+def test_ensemble_shrinkage_pulls_weights_to_uniform():
+    """权重收缩：把子模型权重向等权拉，降低单腿过置信权重的方差。"""
+    def _blend(shrink):
+        app_config.ml.ensemble_shrinkage = shrink
+        ep = EnsemblePredictor(FakePrimary(0.0))
+        ep.add_sub(FakeSub(100.0), weight=1.0)
+        ep.add_sub(FakeSub(60.0), weight=3.0)   # 权重 3:1，偏置信第二腿
+        return ep.predict_batch({"a": _df()})["a"].score
+
+    # shrink=0：原始权重 [1,3] → (0*1 + 100*1 + 60*3)/5 = 56.0
+    assert abs(_blend(0.0) - 56.0) < 1e-6
+    # shrink=1：子腿全部等权（总权重 4 → 各 2）→ (0*1 + 100*2 + 60*2)/5 = 64.0
+    assert abs(_blend(1.0) - 64.0) < 1e-6
+    # 单调性：收缩越强，越偏向「两腿平均」（100 与 60 的平均=80，即权重对等时更靠近高分腿）
+    assert _blend(1.0) > _blend(0.0)
+
+
+def test_detail_tables_stay_aligned_when_a_leg_returns_none():
+    """某条腿对某只股票出分 None 时，ensemble_detail 三张表必须同长度。
+
+    回归背景（2026-10-18）：加权重收缩后 eff_ws 是「全部可用腿」的权重表，
+    而 scores 只收「真正出分」的腿。一旦某腿返回 None，weights 就比 scores 长，
+    看板按腿名对不上号，诊断信息失真（而融合分本身碰巧还算对，问题很隐蔽）。
+    """
+    app_config.ml.ensemble_shrinkage = 0.5
+    ep = EnsemblePredictor(FakePrimary(50.0))
+    ep.add_sub(NoneSub(), weight=1.0)
+    ep.add_sub(FakeSub(70.0), weight=1.0)
+    p = ep.predict_batch({"a": _df()})["a"]
+    d = p.ensemble_detail
+    assert set(d["scores"]) == set(d["weights"]) == {"xgboost", "fake"}
+    assert len(d["scores"]) == len(d["weights"])
+    # 只有两条腿参与（主 50 / fake 70，等权）→ 60
+    assert abs(p.score - 60.0) < 1e-6
 
 
 def test_proba_to_score_5class():

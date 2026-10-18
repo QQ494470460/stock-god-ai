@@ -184,15 +184,22 @@ class MLConfig:
     # 超级集成开关：以 XGBoost 为主模型，另加 Alpha(生产+北向/融资/龙虎榜/行业)
     # 与 LSTM 两条腿加权融合（predict_batch 会走这条路）。
     #
-    # 默认 **False** —— 项目口径是「统一为单模型：全部训练与预测只使用 XGBoost，
-    # 模型文件 models/xgboost_model.pkl」。此前默认 True，于是看板一边写死
-    # 「已统一为单模型」、一边在后台融合两条腿，口径与实际行为不一致。
-    # 想恢复多模型加权：把它设为 True 即可（两条腿的产物都还在 models/ 下）。
-    use_ensemble: bool = False
+    # 默认 **True**（已开启，用户明确要求）：三条腿是**独立信号**（实测 600519：
+    # 主线 46.4 / Alpha 53.2 / LSTM 43.8），多模型平均可显著削减单模型预测方差，
+    # 是提升每日 IC 稳定性（日频 IR）的正路；截面中性化已实测对该模型≈无提升，
+    # 故方差削减改走集成平均。想退回单模型：设为 False 即可（行为与改动前一致）。
+    # 前提：两条腿的产物都还在 models/ 下（alpha_xgboost_model.pkl / lstm_best.pt），
+    # 且 torch 可用；任一腿缺失由 EnsemblePredictor 自动降级，绝不拖垮主模型。
+    use_ensemble: bool = True
     # 各腿融合权重（默认按样本外 RankIC 自动归一化；此处作可选覆盖）
     ensemble_weights: dict = field(default_factory=lambda: {
         "xgboost": 1.0, "alpha_xgboost": 1.0, "lstm": 0.8,
     })
+    # 预测方差收缩（0~1）：把子模型权重向「等权」收缩，降低对单腿过置信权重的方差。
+    # 0 = 用原始权重；1 = 全部等权（最大分散、融合方差最小）；主模型权重恒为 1.0 不收缩。
+    # 这是叠加在集成平均之上的第二层方差削减（集成平均削的是模型间误差方差，
+    # 这里削的是权重估计带来的方差）。
+    ensemble_shrinkage: float = 0.5
 
     # 横截面行业中性化（默认开启）：在 predict_batch 内对全市场评分做「行业去均值」，
     # 消除「模型在某行业系统性偏高/偏低」造成的排名偏差，降低单日 IC 的板块噪声，

@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from config.settings import MODEL_DIR, DATA_DIR
+from config.settings import MODEL_DIR, DATA_DIR, config as app_config
 from src.features.engine import feature_engine
 
 
@@ -236,6 +236,16 @@ class EnsemblePredictor:
     def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
         """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。"""
         avail = self._available_subs()
+        # 权重收缩（预测方差收缩）：把子模型权重向「等权」收缩，降低对单腿过置信权重的方差。
+        # shrink=0 → 原始权重；shrink=1 → 全部等权（最大分散、最小融合方差）。
+        # 主模型权重恒为 1.0（基准，不收缩）。仅当子模型≥2 时生效。
+        shrink = float(getattr(app_config.ml, "ensemble_shrinkage", 0.0) or 0.0)
+        if shrink > 0 and len(avail) > 1:
+            total = sum(w for _, w in avail)
+            uni = total / len(avail)
+            eff_ws = [w * (1.0 - shrink) + uni * shrink for _, w in avail]
+        else:
+            eff_ws = [w for _, w in avail]
         results: Dict[str, object] = {}
         for code, df in stock_data.items():
             try:
@@ -255,11 +265,13 @@ class EnsemblePredictor:
                 primary_score = pred.score
             sub_scores = [primary_score]  # 主模型权重 1.0
             sub_weights = [1.0]
-            for sub, w in avail:
-                s = sub.score_for(df, code)
-                if s is not None:
-                    sub_scores.append(s)
-                    sub_weights.append(w)
+            used_names = ["xgboost"]
+            for (sub, _), ew in zip(avail, eff_ws):
+                sc = sub.score_for(df, code)
+                if sc is not None:
+                    sub_scores.append(sc)
+                    sub_weights.append(ew)
+                    used_names.append(sub.name)
             if len(sub_scores) > 1:
                 arr = np.array(sub_scores, dtype=float)
                 wts = np.array(sub_weights, dtype=float)
@@ -270,11 +282,11 @@ class EnsemblePredictor:
                 # 真实分歧记录在 agreement_spread（不阻断下单）
                 pred.agreement = max(0.8, 1.0 - spread / 100.0)
                 pred.xgb_signal = pred.xgb_signal  # 主信号不变
-                if not hasattr(pred, "ensemble_detail"):
-                    pass
+                # 名称/分数/权重一律只列「本只股票真正出分」的腿，
+                # 避免某腿返回 None 时三张表长度错位（曾因用 eff_ws 全量而错位）。
                 pred.ensemble_detail = {
-                    "scores": dict(zip(["xgboost"] + [s.name for s, _ in avail], sub_scores)),
-                    "weights": dict(zip(["xgboost"] + [s.name for s, _ in avail], [float(x) for x in sub_weights])),
+                    "scores": dict(zip(used_names, sub_scores)),
+                    "weights": dict(zip(used_names, [float(x) for x in sub_weights])),
                     "spread": spread,
                 }
             results[code] = pred

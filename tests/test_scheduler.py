@@ -133,6 +133,10 @@ def patched(monkeypatch, tmp_path):
     import src.models.tracker_v2 as _tracker
     monkeypatch.setattr(_tracker, "TRACK_FILE",
                         tmp_path / "prediction_history.json")
+    # rolling_ic 回填：即便将来有用例忘了打桩，落盘也必须落在 tmp，绝不写生产
+    import src.core.rolling_ic as _ric
+    monkeypatch.setattr(_ric, "IC_LOG", tmp_path / "rolling_ic_log.json")
+    monkeypatch.setattr(_ric, "STATUS_FILE", tmp_path / "rolling_ic_status.json")
     return ff, fp, fe
 
 
@@ -258,10 +262,42 @@ def test_job_evolution_writes_into_tmp(patched, tmp_path):
 
 
 def test_run_all_once(patched, monkeypatch, tmp_path):
+    """一轮跑通四个作业的接线；试跑模式下重量级回填必须被跳过（不许联网）。
+
+    回归背景（2026-10-18）：把 rolling_ic 接进 run_all_once 后没有同步隔离，
+    于是这个用例会真的扫全池拉行情 + 逐日打分（150 只 × 5 天），开了集成融合
+    后还要多跑一遍 LSTM 推理 —— 单测从秒级变成几十分钟「卡死」，而看板
+    「🚀 立即跑一轮」按钮走的是同一条同步路径，同样会被卡死。
+    """
     monkeypatch.setattr("src.core.daily_pick.app_config.scheduler.report_dir", str(tmp_path))
     out = auto_scheduler.run_all_once(dry_run=True)
     assert "data_update" in out and "daily_pick" in out and "evolution" in out
     assert out["daily_pick"]["n_passed"] == 2
+    # 重量级作业：试跑只留 skipped 记录，不得真的去拉行情
+    assert out["rolling_ic"]["status"] == "skipped"
+    assert not (tmp_path / "rolling_ic_log.json").exists()
+
+
+def test_run_all_once_heavy_runs_rolling_ic(patched, monkeypatch, tmp_path):
+    """反证：显式 dry_run=False 时回填确实会被接进这一轮（用打桩替掉联网）。"""
+    monkeypatch.setattr("src.core.daily_pick.app_config.scheduler.report_dir", str(tmp_path))
+    # dry_run=False 会顺手产出交易计划，必须落到 tmp，不能写进生产 data/trade_plans/
+    import src.trading.trade_plan as tp
+    monkeypatch.setattr(tp, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(tp, "resolve_target_date", lambda ref=None: "2026-10-15")
+
+    calls = {}
+
+    def _fake_backfill(**kw):
+        calls.update(kw)
+        return {"status": "ok", "added": 1, "total": 1}
+
+    import src.core.rolling_ic as _ric
+    monkeypatch.setattr(_ric, "run_backfill", _fake_backfill)
+
+    out = auto_scheduler.run_all_once(dry_run=False)
+    assert out["rolling_ic"]["status"] == "ok"
+    assert calls.get("dry_run") is False, "真跑模式必须把 dry_run 透传下去"
 
 
 def test_daily_pick_also_produces_trade_plan(patched, monkeypatch, tmp_path):
