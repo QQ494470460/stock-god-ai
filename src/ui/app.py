@@ -1757,9 +1757,31 @@ elif page == "📡 实时监控":
     
     # 个股盯盘 ==========
     st.markdown('<div class="section-title">🎯 个股盯盘</div>', unsafe_allow_html=True)
+
+    # 自选股快速选择：点一下即可盯盘，避免「打开页面空空如也」的观感。
+    # 背景：盯盘面板原先只在用户手动输入代码并点「开始盯盘」后才渲染，
+    # 打开页面时输入框为空、整块面板空置，看起来就像「没有任何数据」。
+    try:
+        import json as _json
+        _wl_cfg = _json.loads((Path(__file__).parent.parent.parent / "config" / "watchlist.json").read_text(encoding="utf-8"))
+        _wl = list(_wl_cfg.get("watchlist", []))
+    except Exception:
+        _wl = []
+    if _wl:
+        st.caption("⭐ 自选股快速盯盘：")
+        _wl_cols = st.columns(min(len(_wl), 8))
+        for i, _c in enumerate(_wl):
+            with _wl_cols[i % 8]:
+                if st.button(_c, key=f"wlpick_{_c}", use_container_width=True):
+                    st.session_state.watch_code = _c
+                    st.session_state.pop("watch_last_ts", None)  # 强制立即盯盘该票
+                    st.rerun()
+
     mon1, mon2, mon3, mon4 = st.columns([2, 1.5, 1, 1])
     with mon1:
-        watch_code = st.text_input("输入股票代码盯盘", value=st.session_state.get("watch_code", ""), placeholder="例: 000001, 600519", key="watch_code", label_visibility="collapsed")
+        # 默认带出上次盯盘的股票；首次打开则带出自选股第一只，避免面板空置
+        _default = st.session_state.get("watch_code") or (_wl[0] if _wl else "")
+        watch_code = st.text_input("输入股票代码盯盘", value=_default, placeholder="例: 000001, 600519", key="watch_code", label_visibility="collapsed")
     with mon2:
         watch_go = st.button("🔍 开始盯盘", type="primary", use_container_width=True, key="watch_go")
     with mon3:
@@ -1768,7 +1790,10 @@ elif page == "📡 实时监控":
         watch_auto = st.checkbox("自动刷新", value=True, key="watch_auto")
 
     need_watch = watch_go
-    if watch_code and watch_auto and "watch_last_ts" in st.session_state:
+    # 已带出代码但本次会话还没盯过 → 首屏立即跑一次（解决「打开即空」）
+    if watch_code and "watch_last_ts" not in st.session_state:
+        need_watch = True
+    elif watch_code and watch_auto and "watch_last_ts" in st.session_state:
         elapsed = (datetime.now() - st.session_state.watch_last_ts).total_seconds()
         if elapsed > watch_interval:
             need_watch = True
