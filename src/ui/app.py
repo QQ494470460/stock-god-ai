@@ -1777,7 +1777,7 @@ elif page == "📡 实时监控":
                     st.session_state.pop("watch_last_ts", None)  # 强制立即盯盘该票
                     st.rerun()
 
-    mon1, mon2, mon3, mon4 = st.columns([2, 1.5, 1, 1])
+    mon1, mon2, mon3, mon4, mon5, mon6 = st.columns([2.0, 1.1, 1.0, 1.0, 0.9, 0.9])
     with mon1:
         # 默认带出上次盯盘的股票；首次打开则带出自选股第一只，避免面板空置
         _default = st.session_state.get("watch_code") or (_wl[0] if _wl else "")
@@ -1785,11 +1785,16 @@ elif page == "📡 实时监控":
     with mon2:
         watch_go = st.button("🔍 开始盯盘", type="primary", use_container_width=True, key="watch_go")
     with mon3:
-        watch_interval = st.select_slider("刷新间隔(秒)", options=[5, 10, 15, 30, 60], value=10, key="watch_interval")
+        watch_interval = st.select_slider("行情刷新(秒)", options=[5, 10, 15, 30, 60], value=10, key="watch_interval")
     with mon4:
+        watch_ai_interval = st.select_slider("AI重评(秒)", options=[30, 60, 120, 300], value=60, key="watch_ai_interval",
+                                             help="AI 模型推理较重，按更长周期重算；行情价格仍按上方间隔实时刷新")
+    with mon5:
         watch_auto = st.checkbox("自动刷新", value=True, key="watch_auto")
+    with mon6:
+        watch_refresh = st.button("🔄 刷新", use_container_width=True, key="watch_refresh")
 
-    need_watch = watch_go
+    need_watch = watch_go or watch_refresh
     # 已带出代码但本次会话还没盯过 → 首屏立即跑一次（解决「打开即空」）
     if watch_code and "watch_last_ts" not in st.session_state:
         need_watch = True
@@ -1846,12 +1851,23 @@ elif page == "📡 实时监控":
                         except Exception:
                             pass
 
-                # AI 预测
-                pred = None
-                try:
-                    pred = predictor.predict_single(df_k, code, stock_name)
-                except Exception:
+                # AI 预测（双层 TTL）：行情每次都刷新，AI 模型按更长周期重算，避免盘中卡模型
+                _prev = st.session_state.watch_cache
+                _cache_pred = _prev.get("pred") if _prev.get("code") == code else None
+                _ai_ts = _prev.get("ai_fetched_at")
+                _ai_age = (datetime.now() - _ai_ts).total_seconds() if _ai_ts else 1e9
+                _force_ai = bool(watch_go or watch_refresh) or (_cache_pred is None) \
+                    or (_ai_age > watch_ai_interval) or (_prev.get("code") != code)
+                if _force_ai:
                     pred = None
+                    try:
+                        pred = predictor.predict_single(df_k, code, stock_name)
+                    except Exception:
+                        pred = None
+                    ai_fetched_at = datetime.now()
+                else:
+                    pred = _cache_pred
+                    ai_fetched_at = _ai_ts
 
                 # 写入缓存：面板渲染统一从缓存读，不依赖本次是否刚拉取
                 st.session_state.watch_cache = {
@@ -1863,6 +1879,7 @@ elif page == "📡 实时监控":
                     "df_k": df_k,
                     "pred": pred,
                     "fetched_at": datetime.now(),
+                    "ai_fetched_at": ai_fetched_at,
                     "market_open": market_open,
                 }
 
@@ -2028,10 +2045,17 @@ elif page == "📡 实时监控":
             chg_20d = (last_close / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0
             st.metric(label="20日涨幅", value=f"{chg_20d:+.2f}%")
 
-        # 数据时效提示
+        # 数据时效提示（行情 vs AI 分开展示）
         if fetched_at:
             _age = int((datetime.now() - fetched_at).total_seconds())
-            st.caption(f"🕒 数据更新于 {_age} 秒前" + ("（盘中实时行情）" if _cache.get("market_open") else "（收盘日线）"))
+            _ai_ts = _cache.get("ai_fetched_at")
+            _ai_age = int((datetime.now() - _ai_ts).total_seconds()) if _ai_ts else None
+            if _cache.get("market_open"):
+                _src = "盘中实时行情"
+            else:
+                _src = "非交易时段 · 仅显示上一交易日收盘"
+            _cap = f"🕒 行情 {_age} 秒前 · AI评分" + (f" {_ai_age} 秒前" if _ai_age is not None else " —") + f"（{_src}）"
+            st.caption(_cap)
         st.divider()
     else:
         st.caption("👆 输入股票代码，或点选上方自选股，开始盯盘")
@@ -2041,8 +2065,7 @@ elif page == "📡 实时监控":
         remaining = watch_interval - int((datetime.now() - st.session_state.watch_last_ts).total_seconds())
         if remaining > 0:
             st.caption(f"⏱️ 盯盘 {remaining} 秒后自动刷新")
-        elif remaining <= 0:
-            time.sleep(0.5)
+        else:
             st.rerun()
 
     # ========== 批量监控 ==========
