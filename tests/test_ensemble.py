@@ -155,6 +155,58 @@ def test_detail_tables_stay_aligned_when_a_leg_returns_none():
     assert abs(p.score - 60.0) < 1e-6
 
 
+def test_torch_preloaded_before_xtquant():
+    """回归：券商账号链路（会拉 xtquant）必须**先**把 torch 预载进来。
+
+    反序会让 torch 的 c10.dll 初始化失败（WinError 1114），LSTM 腿静默降级、
+    集成从三条腿变两条腿而看板上看不出来。import 顺序在本进程里无法回退，
+    所以必须用子进程验证。
+    """
+    import subprocess
+    code = (
+        "import sys; sys.path.insert(0, r'{root}');"
+        " import src.trading.account;"                    # 会顺带 import xtquant
+        " from src.models.ensemble import LSTMSubPredictor;"
+        " print('TORCH', 'torch' in sys.modules, 'LSTM', LSTMSubPredictor().available)"
+    ).format(root=ROOT)
+    r = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True, timeout=300)
+    assert "TORCH True" in r.stdout, r.stdout + r.stderr
+    assert "LSTM True" in r.stdout, r.stdout + r.stderr
+
+
+def test_alpha_lag_defaults_to_zero():
+    """诊断开关默认必须关闭：不能因为环境变量就悄悄改掉生产的 alpha 口径。"""
+    from src.models import ensemble as ens
+    assert ens._ALPHA_LAG == 0
+
+
+def test_alpha_lag_shifts_disclosure_by_one_day(monkeypatch, tmp_path):
+    """ALPHA_LAG_DAYS=1 时，当日披露的 alpha 值必须推迟一天才可见。
+
+    只验证位移/对齐机制本身（不加载真实模型）。这个开关用来量化「披露滞后
+    虚高了多少 IC」，机制若错位，结论就全错。
+    """
+    import src.models.ensemble as ens
+    monkeypatch.setattr(ens, "DATA_DIR", tmp_path)
+    idx = pd.to_datetime(["2026-10-13", "2026-10-14", "2026-10-15"])
+    pd.DataFrame({"000001": [1.0, 2.0, 3.0]}, index=idx).to_parquet(
+        tmp_path / "alpha_margin.parquet")
+
+    sub = object.__new__(ens.AlphaSubPredictor)
+    sub._alpha_cols = ["alpha_margin"]
+
+    def _last(lag):
+        monkeypatch.setattr(ens, "_ALPHA_LAG", lag)
+        a = sub._alpha_for_code("000001", idx)
+        if lag:
+            a = a.shift(lag)
+        return float(a.iloc[-1]["alpha_margin"])
+
+    assert _last(0) == 3.0   # 现口径：当天披露当天可见（含前视）
+    assert _last(1) == 2.0   # 滞后一天：只能用昨天已披露的
+
+
 def test_proba_to_score_5class():
     s = _proba_to_score(np.array([0.1, 0.1, 0.2, 0.3, 0.3]), [0, 1, 2, 3, 4])
     # prob_up=0.6, prob_down=0.2 -> (0.6*0.7 - 0.2*0.3 + 0.3)*100 = 66.0

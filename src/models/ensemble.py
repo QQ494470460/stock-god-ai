@@ -33,6 +33,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+import os
+
 from config.settings import MODEL_DIR, DATA_DIR, config as app_config
 from src.features.engine import feature_engine
 
@@ -45,6 +47,7 @@ class SubPredictor:
 
     name: str = "base"
     _ready: Optional[bool] = None
+    _reason: Optional[str] = None   # 不可用的原因（留给运维排查，见 _available_subs）
 
     @property
     def available(self) -> bool:
@@ -53,7 +56,11 @@ class SubPredictor:
                 self._ensure()
                 self._ready = True
             except Exception as e:  # noqa: BLE001
-                logger.debug(f"[{self.name}] 不可用，已降级: {e}")
+                # 原因必须留档：曾出现「LSTM 腿在生产进程里静默降级」——
+                # 只有 DEBUG 一行 WinError 1114（torch 的 c10.dll 初始化失败），
+                # INFO 层只说「已跳过」，看板上看不出集成其实只剩两条腿。
+                self._reason = f"{type(e).__name__}: {str(e)[:160]}"
+                logger.warning(f"[{self.name}] 子模型不可用，已降级: {e}")
                 self._ready = False
         return self._ready
 
@@ -95,6 +102,17 @@ def _proba_to_score(proba: np.ndarray, classes) -> float:
 # ---------------------------------------------------------------------------
 # Alpha XGBoost 子预测器（生产特征 + alpha 列）
 # ---------------------------------------------------------------------------
+# 诊断开关（**默认 0 = 不改变生产行为**）：把 alpha 面板整体推迟 N 个交易日可见。
+#
+# 背景：alpha 腿用了北向/融资余额/龙虎榜等「当日收盘后才披露」的数据，
+# 而 akshare_alpha 的口径是「统计日=当日，预测时视为已知」（见 margin_panel 注释），
+# 回测又按当日收盘价成交 → 这一段 IC 是**前视**来的，含系统性虚高。
+# 设 ALPHA_LAG_DAYS=1 后重跑 scripts/ab_ensemble_ic.py，与不加 lag 的结果对比，
+# 即可量化「同一天披露」贡献了多少 IC（注意：这是诊断值，不是修好的值 ——
+# 真正的修法是用滞后后的特征**重训** alpha 模型，否则 train/serve 不一致）。
+_ALPHA_LAG = int(os.environ.get("ALPHA_LAG_DAYS", "0") or 0)
+
+
 class AlphaSubPredictor(SubPredictor):
     name = "alpha_xgboost"
 
@@ -147,7 +165,11 @@ class AlphaSubPredictor(SubPredictor):
             feats = feats.drop(columns=["close"])
         latest = feats.iloc[-1:]
         if self._alpha_cols:
-            a = self._alpha_for_code(code, latest.index)
+            # 取全历史再切片（而不是只取最后一天），这样诊断用的 shift 才有意义
+            a = self._alpha_for_code(code, feats.index)
+            if _ALPHA_LAG > 0:
+                a = a.shift(_ALPHA_LAG)
+            a = a.iloc[-1:]
             row = latest.reindex(columns=self._ref_cols, fill_value=0.0)
             row = pd.concat([row, a.reindex(index=row.index)], axis=1)
         else:
@@ -230,7 +252,9 @@ class EnsemblePredictor:
             if sub.available:
                 out.append((sub, w))
             else:
-                logger.info(f"  集成：{sub.name} 不可用，已跳过")
+                why = getattr(sub, "_reason", None)
+                logger.warning(f"  集成：{sub.name} 不可用，已跳过"
+                               + (f"（原因：{why}）" if why else ""))
         return out
 
     def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:

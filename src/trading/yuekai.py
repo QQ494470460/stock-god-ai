@@ -18,6 +18,15 @@ from src.trading.broker import (
     Position, AccountInfo, TickData,
 )
 
+# ★ 必须先加载 torch，再加载 xtquant。
+# 反序会导致 torch 的 c10.dll 初始化失败（WinError 1114），LSTM 子模型静默降级、
+# 集成从三条腿退化成两条腿而日志上看不出来。详见 src/models/torch_preload.py。
+try:
+    from src.models.torch_preload import preload_torch
+    preload_torch("xtquant 之前先加载 torch，避免 c10.dll 初始化失败")
+except Exception:  # noqa: BLE001
+    pass
+
 # xtquant 是可选依赖，运行时检查
 try:
     from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
