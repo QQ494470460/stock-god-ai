@@ -244,7 +244,16 @@ class EnsemblePredictor:
                 logger.debug(f"主模型预测失败 {code}: {e}")
                 continue
             # 收集各子模型评分
-            sub_scores = [pred.score]  # 主模型权重 1.0
+            # 主模型贡献用 score_raw（纯概率分，与子模型的 _proba_to_score 同口径），
+            # 而非 pred.score（含 compute_score 的 regime/risk/预期收益加成）。
+            # 否则主腿与其他腿尺度错位，融合权重失真。最终 blend 才是真正用于排名的评分；
+            # 行业中性化在 predict_batch 内统一对 blend 再做一次截面处理。
+            # 防御：真实 StockPrediction 必有 score_raw；若调用方传入的占位对象缺该属性，
+            # 退回用 score，避免 AttributeError（向后兼容历史测试桩）。
+            primary_score = getattr(pred, "score_raw", None)
+            if primary_score is None:
+                primary_score = pred.score
+            sub_scores = [primary_score]  # 主模型权重 1.0
             sub_weights = [1.0]
             for sub, w in avail:
                 s = sub.score_for(df, code)

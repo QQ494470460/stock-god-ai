@@ -194,6 +194,12 @@ class MLConfig:
         "xgboost": 1.0, "alpha_xgboost": 1.0, "lstm": 0.8,
     })
 
+    # 横截面行业中性化（默认开启）：在 predict_batch 内对全市场评分做「行业去均值」，
+    # 消除「模型在某行业系统性偏高/偏低」造成的排名偏差，降低单日 IC 的板块噪声，
+    # 提升每日 IC 稳定性（Grinold-Kahn IR = mean/std）。不改变组内排序，只剔行业水位。
+    # 无行业映射（fetcher.get_industry_map 取不到）时自动跳过，零影响。
+    cross_sectional_neutralize: bool = True
+
 
 @dataclass  
 class DataConfig:

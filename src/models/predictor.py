@@ -23,6 +23,7 @@ from loguru import logger
 from config.settings import config as app_config, MODEL_DIR
 from src.features.engine import feature_engine
 from src.models.scoring import compute_score, get_score_interpretation
+from src.models.signal_quality import neutralize_cross_section
 
 # LLM 定性叠加覆盖层（可选，默认不用）：用 try/except 包住，避免无 openai 时
 # 导入失败影响核心预测路径（核心 xgboost 推理完全不依赖它）。
@@ -112,6 +113,9 @@ class Predictor:
 
         # 超级集成（懒加载；use_ensemble 开启且有可用子模型时才生效）
         self._ensemble = None
+
+        # 行业映射缓存（predict_batch 做截面中性化时懒取一次，避免每次打接口/读盘）
+        self._industry_map_cache: Optional[Dict[str, str]] = None
 
     @property
     def trainer(self):
@@ -659,6 +663,31 @@ class Predictor:
             features_snapshot=feature_snapshot
         )
     
+    def _neutralize_scores(self, predictions: List["StockPrediction"]) -> None:
+        """对整批预测做行业中性化（原地修改 pred.score）。
+
+        只在 ml.cross_sectional_neutralize 为真时生效；任何异常都安全降级为「不改分」，
+        绝不因行业映射取不到而中断排名。行业映射懒取并缓存到实例，避免每次批量重取。
+        """
+        if not getattr(app_config.ml, "cross_sectional_neutralize", False):
+            return
+        if not predictions:
+            return
+        try:
+            from src.data.fetcher import fetcher
+            if self._industry_map_cache is None:
+                self._industry_map_cache = fetcher.get_industry_map() or {}
+            ind_map = self._industry_map_cache
+            if not ind_map:
+                return
+            scores = pd.Series({p.code: float(p.score) for p in predictions})
+            neu = neutralize_cross_section(scores, ind_map)
+            for p in predictions:
+                if p.code in neu.index:
+                    p.score = float(neu[p.code])
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"行业中性化跳过（安全降级）: {e}")
+
     def predict_batch(
         self,
         stock_data: Dict[str, pd.DataFrame],
@@ -691,6 +720,10 @@ class Predictor:
             for pred in predictions:
                 self._apply_llm_overlay(pred, as_of_date)
             logger.info(f"🤖 LLM 覆盖层已应用: {len(predictions)} 只, as_of={as_of_date}")
+
+        # 横截面行业中性化（默认开启）：在排序前对整批评分去行业水位，
+        # 让排名不被「模型系统性偏好某些行业」带偏，降低单日 IC 的板块噪声。
+        self._neutralize_scores(predictions)
 
         # 按评分排序
         predictions.sort(key=lambda x: x.score, reverse=True)
