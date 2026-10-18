@@ -84,6 +84,24 @@ class StockPrediction:
     llm_confidence: float = 0.0   # 置信度 (0~1)
 
 
+def _board_of(code: str) -> str:
+    """按股票代码前缀粗分板块（零网络兜底分组，用于行业映射缺失时的中性化）。"""
+    c = str(code)
+    if c.startswith(("688", "689")):
+        return "科创板"
+    if c.startswith("60"):
+        return "沪主板"
+    if c.startswith(("8", "4")):
+        return "北交所"
+    if c.startswith("30"):
+        return "创业板"
+    if c.startswith(("00", "001", "002", "003")):
+        return "深主板"
+    if c.startswith(("200", "900")):
+        return "B股"
+    return "其他"
+
+
 class Predictor:
     """股票预测器"""
     
@@ -116,6 +134,8 @@ class Predictor:
 
         # 行业映射缓存（predict_batch 做截面中性化时懒取一次，避免每次打接口/读盘）
         self._industry_map_cache: Optional[Dict[str, str]] = None
+        # 诊断：最近一次中性化实际使用的分组口径（"industry"/"board"/None）
+        self._last_neutral_kind: Optional[str] = None
 
     @property
     def trainer(self):
@@ -664,10 +684,14 @@ class Predictor:
         )
     
     def _neutralize_scores(self, predictions: List["StockPrediction"]) -> None:
-        """对整批预测做行业中性化（原地修改 pred.score）。
+        """对整批预测做截面中性化（原地修改 pred.score）。
 
-        只在 ml.cross_sectional_neutralize 为真时生效；任何异常都安全降级为「不改分」，
-        绝不因行业映射取不到而中断排名。行业映射懒取并缓存到实例，避免每次批量重取。
+        分组优先级：
+          1) 行业映射（fetcher.get_industry_map，生产本机走东财正常）—— 粒度最细、去偏最强；
+          2) 行业映射缺失时回退「板级分组」（按代码前缀，零网络）—— 粗粒度但绝不静默失效，
+             仍可剔除板块整体水位带来的排名偏差。
+        任何异常都安全降级为「不改分」，绝不因取数失败而中断排名。
+        记录 self._last_neutral_kind（"industry"/"board"/None）供诊断/回测标注。
         """
         if not getattr(app_config.ml, "cross_sectional_neutralize", False):
             return
@@ -678,15 +702,21 @@ class Predictor:
             if self._industry_map_cache is None:
                 self._industry_map_cache = fetcher.get_industry_map() or {}
             ind_map = self._industry_map_cache
-            if not ind_map:
-                return
+            if ind_map:
+                group_map = ind_map
+                self._last_neutral_kind = "industry"
+            else:
+                group_map = {p.code: _board_of(p.code) for p in predictions}
+                self._last_neutral_kind = "board"
+                logger.info("行业映射不可用，回退板级中性化（粗粒度，仅去板块水位）")
             scores = pd.Series({p.code: float(p.score) for p in predictions})
-            neu = neutralize_cross_section(scores, ind_map)
+            neu = neutralize_cross_section(scores, group_map)
             for p in predictions:
                 if p.code in neu.index:
                     p.score = float(neu[p.code])
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"行业中性化跳过（安全降级）: {e}")
+            self._last_neutral_kind = None
+            logger.debug(f"截面中性化跳过（安全降级）: {e}")
 
     def predict_batch(
         self,

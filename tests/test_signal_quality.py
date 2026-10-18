@@ -123,6 +123,37 @@ def test_predictor_neutralize_disabled_is_noop():
         fetcher_mod.fetcher.get_industry_map = orig
 
 
+def test_predictor_neutralize_falls_back_to_board_when_no_industry():
+    """行业映射为空时回退板级分组，中性化仍应生效（不静默跳过）。"""
+    old_flag = app_config.ml.cross_sectional_neutralize
+    old_cache = predictor._industry_map_cache
+    orig = fetcher_mod.fetcher.get_industry_map
+    try:
+        app_config.ml.cross_sectional_neutralize = True
+        predictor._industry_map_cache = {}  # 空 → 触发板级兜底
+        fetcher_mod.fetcher.get_industry_map = lambda *a, **k: {}
+        # 沪主板整体偏高、科创板整体偏低（各 2 只，确保超过 min_group）
+        preds = [
+            _make_pred("600001", 90.0), _make_pred("600002", 80.0),  # 沪主板 均值85
+            _make_pred("688001", 20.0), _make_pred("688002", 10.0),  # 科创板 均值15
+        ]
+        predictor._neutralize_scores(preds)
+        by_code = {p.code: p.score for p in preds}
+        sh = (by_code["600001"] + by_code["600002"]) / 2
+        kc = (by_code["688001"] + by_code["688002"]) / 2
+        # 两板均值被拉平到总均值（=50），且组内序保持
+        assert abs(sh - kc) < 1e-6
+        assert abs(sh - 50.0) < 1e-6
+        assert by_code["600001"] > by_code["600002"]
+        assert by_code["688001"] > by_code["688002"]
+        # 诊断字段应记录实际口径为 board
+        assert predictor._last_neutral_kind == "board"
+    finally:
+        app_config.ml.cross_sectional_neutralize = old_flag
+        predictor._industry_map_cache = old_cache
+        fetcher_mod.fetcher.get_industry_map = orig
+
+
 # ---------------------------------------------------------------------------
 # 3) 集成主腿尺度一致性（用 score_raw 而非 score 融合）
 # ---------------------------------------------------------------------------
