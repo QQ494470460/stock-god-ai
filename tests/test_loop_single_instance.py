@@ -97,8 +97,16 @@ def test_dashboard_loop_shares_the_same_lock_file():
     assert ".run_loop.lock" in ui, "看板没有指定单实例锁文件"
     assert "lock_path=_loop_lock_path()" in ui, "构建 TradingLoop 时没有传入锁路径"
 
+    # 锁的实现已下沉到 src/core/single_instance.py（调度器也要用，且不能为了
+    # 一把锁去 import src.trading.loop —— 那会连带拉起打包版已排除的 xtquant）。
+    # loop.py 仍须 re-export 它，老调用方 `from src.trading.loop import ...` 不能断。
+    from src.core.single_instance import SingleInstanceLock as _Core
+    from src.trading.loop import SingleInstanceLock as _ViaLoop
+    assert _Core is _ViaLoop, "loop.py 必须 re-export 同一个锁类，不能各有一份实现"
+
+    core = (ROOT / "src" / "core" / "single_instance.py").read_text(encoding="utf-8")
+    assert "class SingleInstanceLock" in core
     engine = (ROOT / "src" / "trading" / "loop.py").read_text(encoding="utf-8")
-    assert "class SingleInstanceLock" in engine
     assert "def start(self, interval_seconds: Optional[float] = None) -> bool:" in engine, (
         "start() 必须返回 bool，好让 UI 能区分「已启动」和「被拒绝」"
     )

@@ -39,6 +39,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -87,6 +88,57 @@ def _force_utf8_stdio() -> None:
 _force_utf8_stdio()
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONUTF8", "1")
+
+LOG_DIR = ROOT / "logs"
+
+
+def _install_headless_logfile(log_path: Optional[Path] = None):
+    """无控制台（pythonw / 后台任务）时，把 stdout/stderr 接管到日志文件。
+
+    2026-10-19 真事故：用后台任务拉常驻闭环时写的是
+    ``pythonw scripts/run_loop.py --no-notify``（**没做重定向**）。
+    pythonw 没有控制台，Python 会把 ``sys.stdout`` / ``sys.stderr`` 置为 ``None``，
+    而 ``print()`` 在 stdout 为 None 时是**静默空操作**（不抛异常！），loguru 的
+    默认 sink 也指向这个 None。结果是极其阴险的一种"活着"：
+
+        data/loop_heartbeat.json 照常每 30 秒刷新（看起来一切正常），
+        但 logs/run_loop.log 一个字节都不再增长 —— 闭环在裸奔，
+        任何异常、任何调度作业日志都查不到，只能靠猜。
+
+    这里做的兜底：只要发现 stdout/stderr 是 None，立刻打开日志文件接管。
+
+    ⚠️ 不是"总是写文件"：开机自启的 .bat 已经是 ``>> logs/run_loop.log 2>&1``，
+    那时 stdout 是有效句柄，再挂一个文件 sink 会**双写重复行**，反而更难读。
+    """
+    path = Path(log_path) if log_path else Path(
+        os.environ.get("RUN_LOOP_LOG") or (LOG_DIR / "run_loop.log"))
+    need = [n for n in ("stdout", "stderr") if getattr(sys, n, None) is None]
+    if not need:
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+    except Exception as e:  # noqa: BLE001
+        # 连日志都接不上也不能让闭环起不来 —— 只是继续哑着跑
+        if getattr(sys, "stderr", None) is not None:
+            print(f"⚠️  无法接管日志文件 {path}: {e}", file=sys.stderr)
+        return None
+    for n in need:
+        setattr(sys, n, f)
+    # loguru 若已进 sys.modules，它的默认 sink 绑的是刚才那个 None，
+    # 必须重挂一次，否则整条日志链（含调度作业）依旧是哑的。
+    _lg = sys.modules.get("loguru")
+    if _lg is not None:
+        try:
+            _lg.logger.remove()
+            _lg.logger.add(f, level="INFO")
+        except Exception:  # noqa: BLE001
+            pass
+    print(f"📝 无控制台（stdout=None，多为 pythonw 后台启动）：日志已接管到 {path}")
+    return f
+
+
+_headless_logfile = _install_headless_logfile()
 
 # ⚠️ 必须在使用 xtquant 之前导入 config.settings ——
 # 它的模块级 _extend_sys_path_for_external_libs() 会把 <exe 同级>/libs

@@ -137,6 +137,14 @@ def patched(monkeypatch, tmp_path):
     import src.core.rolling_ic as _ric
     monkeypatch.setattr(_ric, "IC_LOG", tmp_path / "rolling_ic_log.json")
     monkeypatch.setattr(_ric, "STATUS_FILE", tmp_path / "rolling_ic_status.json")
+    # ⚠️ 跨进程锁目录也必须隔离到 tmp。
+    # 2026-10-19 真事故（测试侧）：给调度器加了跨进程单实例锁之后，
+    # ``is_running()`` 会去探 ``data/.scheduler.lock``。本机常驻 run_loop 正持着
+    # 那把生产锁 → ``test_scheduler_disabled_by_default`` 里 ``is_running()``
+    # 返回 True → 用例失败。这是**结果依赖机器状态**，时好时坏（常驻没起来就通过）。
+    # 锁是全局单例语义，测试必须各自拿到自己的目录。
+    monkeypatch.setattr(auto_scheduler, "SCHED_LOCK_DIR", tmp_path)
+    monkeypatch.setattr(auto_scheduler, "LEASE_DIR", tmp_path)
     return ff, fp, fe
 
 

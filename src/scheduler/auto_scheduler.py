@@ -46,6 +46,7 @@ except Exception:  # noqa: BLE001
 
 from config.settings import DATA_DIR
 from config.settings import config as app_config
+from src.core.single_instance import SingleInstanceLock
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
 from src.models.evolution import evolution
@@ -55,8 +56,15 @@ from src.core.daily_pick import generate_daily_picks
 _scheduler: Optional["BackgroundScheduler"] = None
 _lock = threading.Lock()
 
+# 「调度器本体」的进程级持有者：谁抢到 data/.scheduler.lock，谁才真正起
+# APScheduler。看板与常驻 run_loop 都会调 start_scheduler()，靠这把锁收敛到
+# 唯一进程，避免出现两份互不知情的 APScheduler（用户称之为"双调度"）。
+_sched_holder = None          # type: Optional["SingleInstanceLock"]
+
 # 作业租约锁文件目录（测试可 monkeypatch 到 tmp_path，避免在 data/ 留痕）
 LEASE_DIR: Path = Path(DATA_DIR)
+# 调度器本体锁目录（测试同样可 monkeypatch）
+SCHED_LOCK_DIR: Path = Path(DATA_DIR)
 
 
 # ----------------------------------------------------------------------------
@@ -346,7 +354,7 @@ def _make_trigger(cron: str):
 
 def start_scheduler() -> Optional["BackgroundScheduler"]:
     """启动调度器。受 config.scheduler.enabled 控制；未启用则返回 None。"""
-    global _scheduler
+    global _scheduler, _sched_holder
     with _lock:
         if _scheduler is not None and getattr(_scheduler, "running", False):
             logger.info("调度器已在运行")
@@ -358,6 +366,19 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
         if not _HAS_APS:
             logger.error("❌ APScheduler 未安装，无法启动调度。pip install apscheduler 后重试。")
             return None
+
+        # 跨进程单实例：只有抢到 data/.scheduler.lock 的进程才真正起 APScheduler。
+        # 看板（app.py）与常驻 run_loop 都会调 start_scheduler()，以前两者的
+        # APScheduler 互不知情、各跑一遍 18:45 的 daily_pick（"双调度"）。
+        # 现在收敛为唯一持有者：常驻进程先抢到，看板就自动退让不再起第二份。
+        lock = SingleInstanceLock(Path(SCHED_LOCK_DIR) / ".scheduler.lock")
+        if not lock.acquire():
+            logger.info(
+                "调度器已被另一个进程持有（通常是常驻 run_loop），"
+                "本进程不再重复拉起第二份 APScheduler —— 作业由持有者跑，效果一致"
+            )
+            return None
+        _sched_holder = lock
 
         sched = BackgroundScheduler(timezone=app_config.scheduler.timezone)
         jobs = [
@@ -380,8 +401,8 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
 
 
 def stop_scheduler() -> bool:
-    """停止调度器。"""
-    global _scheduler
+    """停止调度器，并释放「调度器本体」的进程锁（让别的进程可以接手）。"""
+    global _scheduler, _sched_holder
     with _lock:
         if _scheduler is None:
             return False
@@ -390,12 +411,29 @@ def stop_scheduler() -> bool:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"停止调度器时异常: {e}")
         _scheduler = None
-        logger.info("🛑 调度器已停止")
+        if _sched_holder is not None:
+            _sched_holder.release()
+            _sched_holder = None
+        logger.info("🛑 调度器已停止（已释放调度进程锁）")
         return True
 
 
 def is_running() -> bool:
-    return _scheduler is not None and getattr(_scheduler, "running", False)
+    """调度是否**在生效**。
+
+    不只是「本进程有没有起 APScheduler」—— 调度可能由常驻 ``run_loop`` 进程
+    持有（看板因抢不到 .scheduler.lock 而主动退让）。若这里只报本进程状态，
+    看板会显示「未启动」，而实际上作业照常在跑，属于误导。
+    """
+    if _scheduler is not None and getattr(_scheduler, "running", False):
+        return True
+    # 探测锁：抢得到=没人持有（空闲），抢不到=有进程持有（可能是自己，也可能是常驻进程）
+    probe = SingleInstanceLock(Path(SCHED_LOCK_DIR) / ".scheduler.lock")
+    got = probe.acquire()
+    if got:
+        probe.release()
+        return False
+    return True
 
 
 def run_all_once(dry_run: bool = False, heavy: bool = True) -> Dict:

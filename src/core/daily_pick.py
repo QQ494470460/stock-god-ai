@@ -32,6 +32,41 @@ from src.models.predictor import predictor
 from src.models.evolution import evolution
 
 
+# 大盘状态 → 中文语境（与 evolution.detect_regime 返回值对齐）
+_MARKET_REGIME_CTX = {
+    "bull": "大盘牛市",
+    "bear": "大盘熊市",
+    "sideways": "大盘震荡",
+}
+
+
+def _annotate_reason(reason: str, market_regime: Optional[str]) -> str:
+    """把「个股口吻」的推荐理由叠加「大盘口吻」，消除两份计划里
+    ``regime: bear`` + ``reason: 牛市顺风`` 这种看着像矛盾、实则两个口径的困惑。
+
+    scoring.compute_score 的 ``regime_note`` 只反映**个股**特征牛熊
+    （熊市里也有走牛个股），而交易计划顶层的 ``regime`` 是**指数基准**的大盘口径，
+    两者可以不一致。这里只做文案融合，**不动评分**，让用户一眼看出
+    「这是大盘熊市下个股逆势走强」，而不是以为系统把牛熊搞反了。
+    """
+    r = (reason or "").strip()
+    if not r:
+        return r
+    # 把个股口吻的「顺风/逆风」转成语义更清楚的「逆势/顺势」，再带大盘语境
+    if "个股牛市顺风" in r:
+        base = "个股逆势走强" if market_regime == "bear" else "个股共振走强"
+    elif "个股牛市逆风" in r:
+        base = "个股牛市却走弱" if market_regime == "bull" else "个股逆势走弱"
+    elif "个股熊市顺风" in r:
+        base = "顺势防御"
+    elif "个股熊市逆风" in r:
+        base = "逆风抗跌"
+    else:
+        base = r
+    ctx = _MARKET_REGIME_CTX.get(market_regime or "")
+    return f"{base}（{ctx}）" if ctx else base
+
+
 def generate_daily_picks(
     pool: Optional[str] = None,
     max_picks: Optional[int] = None,
@@ -137,6 +172,12 @@ def generate_daily_picks(
             logger.warning(f"regime 检测失败: {e}")
 
         report["n_passed"] = len(df)
+        # 把「个股口吻」理由叠加「大盘口吻」（regime 是指数基准，两者口径不同），
+        # 避免 plan 顶层 regime=bear 却显示「牛市顺风」这种看着像矛盾、实则合法的文案。
+        if len(df) and "推荐理由" in df.columns:
+            mkt = report.get("regime")
+            if mkt:
+                df["推荐理由"] = df["推荐理由"].map(lambda r: _annotate_reason(str(r), mkt))
         report["picks"] = df.to_dict(orient="records") if len(df) else []
         if len(df) == 0:
             report["status"] = "empty"

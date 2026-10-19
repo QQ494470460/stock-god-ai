@@ -38,7 +38,9 @@ def parse_args():
     p.add_argument("--lookback-years", type=int, default=0,
                    help="重训用近期数据年数（0=用配置值）")
     p.add_argument("--n-trials", type=int, default=0,
-                   help="Optuna trials（0=用快速模式默认 20）")
+                   help="Optuna trials（0=用快速模式默认 12）")
+    p.add_argument("--timeout-min", type=int, default=90,
+                   help="重训子进程硬超时（分钟，默认 90）。超时即视为失败并带回日志尾部便于诊断。")
     return p.parse_args()
 
 
@@ -54,7 +56,7 @@ def get_start_date(lookback_years: int) -> str:
 def run_retrain(args) -> dict:
     """执行重训，调用 train_optuna.py 快速模式"""
     start_date = get_start_date(args.lookback_years)
-    n_trials = args.n_trials if args.n_trials > 0 else 20
+    n_trials = args.n_trials if args.n_trials > 0 else 12
     log_file = LOG_DIR / f"auto_retrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
     logger.info(f"🚀 离线重训启动：start_date={start_date}, trials={n_trials}")
@@ -80,6 +82,12 @@ def run_retrain(args) -> dict:
     ]
 
     try:
+        # 先把命令写进日志文件头部，这样即使 1 小时后超时子进程被 kill、
+        # stdout 从未完整落盘，log 里也至少留下可复现的命令与参数。
+        log_file.write_text(
+            "CMD: " + " ".join(str(c) for c in cmd) + "\n",
+            encoding="utf-8", errors="replace",
+        )
         result = subprocess.run(
             cmd,
             cwd=str(ROOT_DIR),
@@ -88,7 +96,7 @@ def run_retrain(args) -> dict:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60 * 60,  # 最多 1 小时
+            timeout=int(args.timeout_min) * 60,  # 默认 90 分钟，可配
         )
         # 同时写日志文件
         log_file.write_text(result.stdout, encoding="utf-8", errors="replace")
@@ -113,8 +121,18 @@ def run_retrain(args) -> dict:
             logger.error("❌ 离线重训失败：训练未完成")
             return {"success": False, "error": "训练未完成", "log": str(log_file)}
     except subprocess.TimeoutExpired:
-        logger.error("❌ 离线重训超时（>1小时）")
-        return {"success": False, "error": "超时", "log": str(log_file)}
+        # 超时 = 子进程被 kill，stdout 没落盘。这里把 log 里已有的 CMD 尾部带上，
+        # 让人一眼看到"是拿什么参数跑挂的"，而不是只看到一句「超时」。
+        tail = ""
+        try:
+            if log_file.exists():
+                tail = log_file.read_text(encoding="utf-8", errors="replace")[-500:]
+        except Exception:  # noqa: BLE001
+            pass
+        logger.error(f"❌ 离线重训超时（>{args.timeout_min}分钟）。可 --timeout-min 调大，"
+                     f"或降 --n-trials / --lookback-years 缩小规模。\n日志尾部:\n{tail}")
+        return {"success": False, "error": f"超时(>{args.timeout_min}分钟)",
+                "log": str(log_file), "log_tail": tail}
     except Exception as e:
         logger.error(f"❌ 离线重训异常: {e}")
         return {"success": False, "error": str(e), "log": str(log_file)}
