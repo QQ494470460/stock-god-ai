@@ -1013,6 +1013,10 @@ class DataFetcher:
     # 空缓存的负缓存窗口（小时）：这段时间里不再重试，否则每次预测都要白跑
     # 上百个必然失败的请求，把选股流程拖死。
     _INDUSTRY_NEG_TTL_H = 6.0
+    # 全市场快照至少要覆盖这么多只才算「齐了」（A 股约 5400 只）。
+    # 覆盖太少时宁可不落盘：半张表会让「中性化过的分」和「没中性化的分」
+    # 混在同一份排名里，比统一的粗粒度板级中性化更糟。
+    _INDUSTRY_BULK_MIN_CODES = 2500
 
     def get_industry_map(self, force_refresh: bool = False) -> Dict[str, str]:
         """获取股票代码→行业映射（内存缓存）。
@@ -1054,31 +1058,47 @@ class DataFetcher:
                 self._industry_map = {}
                 return {}
 
-        logger.info("从 AKShare 获取行业分类数据…")
+        logger.info("获取行业分类数据…")
         self._industry_map = {}
+        # 路线一：东财行情列表接口自带 f100（所属行业），全市场只要 1~10 次请求。
+        # 本机到东财是**间歇性**可达（2026-10-19 实测：某两分钟里 200 OK、拿到 496 个
+        # 行业板块，之后连续 ProxyError / ConnectionReset），原路线要「列板块 + 逐板块
+        # 拉成分股」上百次请求，几乎不可能全部撞在可用窗口里。请求越少、成功率越高，
+        # 且拿到一次就永久落盘缓存，之后不再打网络。
         try:
-            # 按申万行业分类批量获取
-            industry_df = _ak().stock_board_industry_name_em()
-            if len(industry_df) > 0:
-                # 遍历每个行业获取成分股
-                industries = industry_df.head(100)["板块名称"].tolist()  # 取前100个行业
-                for _i, ind in enumerate(industries):
-                    try:
-                        cons = _ak().stock_board_industry_cons_em(symbol=ind)
-                        if len(cons) > 0:
-                            for _, row in cons.iterrows():
-                                code = str(row.get("代码", ""))
-                                if code:
-                                    self._industry_map[code] = ind
-                    except Exception:
-                        continue
-                    # 接口"看起来通、其实全空"时要尽早止损：连试 10 个行业
-                    # 一个成分股都没有，再跑下去只是浪费 90 次请求。
-                    if _i >= 9 and not self._industry_map:
-                        logger.warning("连续 10 个行业板块都拿不到成分股，判定接口不可用，提前放弃")
-                        break
-        except Exception as e:
-            logger.warning(f"行业映射获取失败: {e}")
+            bulk = self._fetch_industry_map_bulk()
+            if len(bulk) >= self._INDUSTRY_BULK_MIN_CODES:
+                self._industry_map = bulk
+                logger.info(f"行业映射（全市场快照）: {len(bulk)} 只")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"全市场行业快照失败（回退板块循环）: {e}")
+
+        if not self._industry_map:
+            # 路线二（兜底）：先拉板块列表，再逐板块拉成分股 —— 上百次请求，
+            # 只在路线一完全不可用时才走。
+            logger.info("从 AKShare 逐板块获取行业分类…")
+            try:
+                industry_df = _ak().stock_board_industry_name_em()
+                if len(industry_df) > 0:
+                    # 遍历每个行业获取成分股
+                    industries = industry_df.head(100)["板块名称"].tolist()  # 取前100个行业
+                    for _i, ind in enumerate(industries):
+                        try:
+                            cons = _ak().stock_board_industry_cons_em(symbol=ind)
+                            if len(cons) > 0:
+                                for _, row in cons.iterrows():
+                                    code = str(row.get("代码", ""))
+                                    if code:
+                                        self._industry_map[code] = ind
+                        except Exception:
+                            continue
+                        # 接口"看起来通、其实全空"时要尽早止损：连试 10 个行业
+                        # 一个成分股都没有，再跑下去只是浪费 90 次请求。
+                        if _i >= 9 and not self._industry_map:
+                            logger.warning("连续 10 个行业板块都拿不到成分股，判定接口不可用，提前放弃")
+                            break
+            except Exception as e:
+                logger.warning(f"行业映射获取失败: {e}")
 
         # 缓存：只有拿到可信规模才覆盖，否则保留旧值（或仅刷新"失败时间戳"）
         _n = len(self._industry_map)
@@ -1095,6 +1115,78 @@ class DataFetcher:
         logger.info(f"行业映射获取完成: {_n} 只")
         return self._industry_map
     
+    def _fetch_industry_map_bulk(self, timeout: float = 12.0, max_pages: int = 12,
+                                 max_seconds: float = 25.0,
+                                 _get=None) -> Dict[str, str]:
+        """**一次分页**拿到全市场「代码 → 所属行业」。
+
+        为什么另开这条路：``stock_board_industry_name_em`` + 逐板块拉成分股要上百次
+        请求，而本机到东财是**间歇性**可达（代理和直连都会随机 ProxyError /
+        ConnectionReset），请求越多越不可能全部成功。东财行情列表接口自带
+        ``f100``（所属行业）字段，翻几页就能覆盖全 A 股 —— 抢到一个可用窗口即可，
+        拿到后由调用方落盘，之后永远不再打网络。
+
+        容错：每一页都「先直连、再走代理」各试一次，任意一页彻底失败就立即返回
+        已有结果（不抛异常），由调用方按覆盖量决定采不采用。
+
+        ⚠️ ``max_seconds`` 是**总时限**，不是单次超时：这条路径是在 18:45 的选股
+        作业里同步跑的，网络全挂时若让「12 页 × 2 次 × 12s」跑满，光等超时就要
+        近 5 分钟，把整个收盘后调度拖住。到点即停，拿多少算多少。
+        """
+        try:
+            import requests as _rq
+        except Exception:  # noqa: BLE001
+            return {}
+
+        import time as _time
+        deadline = _time.time() + max(0.0, max_seconds)
+
+        getter = _get or _rq.get
+        url = "https://17.push2.eastmoney.com/api/qt/clist/get"
+        ut = "bd1d9ddb04089700cf9c27f6f7426281"
+        # 全 A：沪主板 + 深主板/创业板 + 科创板 + 北交所
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+        page_size = 1000
+
+        out: Dict[str, str] = {}
+        total = 0
+        for pn in range(1, max_pages + 1):
+            params = {
+                "pn": pn, "pz": page_size, "po": 1, "np": 1, "ut": ut,
+                "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
+                "fields": "f12,f14,f100",
+            }
+            payload = None
+            # 直连优先（代理失败时它是唯一能通的路），再退回调代理
+            for kwargs in ({"proxies": {"http": None, "https": None}}, {}):
+                try:
+                    resp = getter(url, params=params, timeout=timeout, **kwargs)
+                    payload = (resp.json() or {}).get("data") or {}
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not payload:
+                break
+            rows = payload.get("diff") or []
+            if not rows:
+                break
+            for row in rows:
+                code = str(row.get("f12") or "").strip()
+                ind = str(row.get("f100") or "").strip()
+                if code and ind and ind != "-":
+                    out[code] = ind
+            try:
+                total = int(payload.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total and pn * page_size >= total:
+                break
+            if _time.time() > deadline:
+                logger.debug(f"全市场行业快照到时限（{max_seconds:.0f}s），已取 {len(out)} 只")
+                break
+        logger.debug(f"全市场行业快照: {len(out)}/{total or '?'} 只")
+        return out
+
     def filter_by_board(self, codes: List[str], boards: List[str]) -> List[str]:
         """按板块过滤股票代码
         
