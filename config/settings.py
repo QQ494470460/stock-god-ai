@@ -251,6 +251,10 @@ class SchedulerConfig:
     daily_pick_cron: str = "45 18 * * mon-fri"  # 生成每日推荐（工作日 18:45）
     evolution_cron: str = "0 19 * * mon-fri"    # 回测验证 + 触发进化（工作日 19:00）
     rolling_ic_cron: str = "15 19 * * mon-fri"  # 每日 RankIC 回填（工作日 19:15，收盘后补当日点）
+    # 行业映射补齐：东财在本机是**间歇性**可达（限流时会连着几小时 ProxyError），
+    # 而映射一旦拿到就永久落盘、之后不再打网络 —— 所以值得每小时给一次机会。
+    # 全 A 只要翻几页列表接口，网络不通时秒级失败，不会拖住其它作业。
+    industry_map_cron: str = "0 * * * *"        # 每小时整点
     timezone: str = "Asia/Shanghai"
     # 每日推荐产物
     report_dir: str = "data/daily_reports"

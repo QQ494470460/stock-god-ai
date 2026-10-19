@@ -290,6 +290,55 @@ def _skipped(job: str, ttl: float) -> Dict:
             "at": datetime.now().isoformat(timespec="seconds")}
 
 
+def _job_industry_map_impl() -> Dict:
+    """机会主义地补齐「代码 → 所属行业」。
+
+    为什么要单开一个高频作业：本机到东财是**间歇性**可达（2026-10-19 实测
+    30 分钟内 40 次尝试全败，但此前某两分钟里能正常取到 496 个行业板块）。
+    行业映射一旦补齐就永久落盘、之后不再打网络，所以**多试几次就有意义**；
+    而每日一次（18:45 选股时顺带尝试）的曝光率太低了。
+
+    已经有了就不再折腾（直接返回 already_ok），没拿到也不算失败 ——
+    中性化会退到板级分组，交易照常，只是粒度粗。
+    """
+    info: Dict = {"job": "industry_map", "at": datetime.now().isoformat(timespec="seconds"),
+                  "status": "ok", "n": 0}
+    try:
+        from src.data.fetcher import DataFetcher, fetcher
+        need = DataFetcher._INDUSTRY_BULK_MIN_CODES
+        cache = Path(fetcher.cache_dir) / "industry_map.json"
+        try:
+            have = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
+        except Exception:  # noqa: BLE001
+            have = {}
+        if len(have) >= need:
+            info["status"] = "already_ok"
+            info["n"] = len(have)
+            return info
+
+        got = fetcher.get_industry_map(force_refresh=True) or {}
+        info["n"] = len(got)
+        info["status"] = "ok" if len(got) >= need else "empty"
+        if info["status"] == "ok":
+            logger.info(f"🏷️  行业映射已补齐：{len(got)} 只 / "
+                        f"{len(set(got.values()))} 个行业 → 中性化切回行业粒度")
+        else:
+            logger.debug(f"行业映射仍未拿到（{len(got)}/{need}），继续走板级中性化")
+    except Exception as e:  # noqa: BLE001
+        info["status"] = "error"
+        info["error"] = str(e)
+        logger.warning(f"行业映射补齐失败（已忽略）: {e}")
+    return info
+
+
+def job_industry_map() -> Dict:
+    """行业映射补齐（带跨进程租约，每小时一次）。"""
+    with _job_lease("industry_map", ttl_sec=1800) as ok:
+        if not ok:
+            return _skipped("industry_map", 1800)
+        return _job_industry_map_impl()
+
+
 def job_data_update() -> Dict:
     """数据更新（带跨进程租约）。"""
     with _job_lease("data_update", ttl_sec=1800) as ok:
@@ -386,6 +435,10 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
             ("daily_pick", app_config.scheduler.daily_pick_cron, job_daily_pick),
             ("evolution", app_config.scheduler.evolution_cron, job_evolution),
             ("rolling_ic", app_config.scheduler.rolling_ic_cron, job_rolling_ic),
+            # 机会型作业：东财间歇性可达，多给几次机会就能把行业映射补齐
+            ("industry_map",
+             getattr(app_config.scheduler, "industry_map_cron", "0 * * * *"),
+             job_industry_map),
         ]
         for jid, cron, fn in jobs:
             trig = _make_trigger(cron)
