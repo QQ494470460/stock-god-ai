@@ -11,10 +11,16 @@ import streamlit as st
 from src.models.llm import deepseek
 from src.agent.engine import run_agent
 from src.agent.tools import call_tool, TOOL_FAILED_MARK
+from src.ui.common import render_hero
 
 
 def render_agent_page():
-    st.markdown('<p class="main-header">🤖 AI 助手</p>', unsafe_allow_html=True)
+    render_hero(
+        "AI 助手",
+        "自然语言驱动：自主调用工具取数、分析、生成结论；任何「改配置/下单」动作都会先弹确认闸",
+        icon="🤖",
+        badges=[("violet", "ReAct 工具调用")],
+    )
     st.markdown(
         "用自然语言驱动选股神 AI：分析个股、跑每日选股、查实时行情、生成研报、诊断进化引擎。"
         "助手会**自主调用工具**拿数据，再综合成回答。"

@@ -43,6 +43,51 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+
+def _force_utf8_stdio() -> None:
+    """把 stdout/stderr 就地改成 UTF-8 —— 无头启动时**必须先跑这个**。
+
+    2026-10-18 真事故：启动器用 ``pythonw scripts\\run_loop.py >> run_loop.log 2>&1``
+    起常驻进程，重定向后的 stdout 默认按 OEM 码页（简中 cp936/GBK）编码，
+    而本文件里有大量 emoji 输出（``✅ 已连接…`` / ``🧪 演练模式…`` / ``🛡️ 安全中枢…``）。
+    第一个 emoji 就抛：
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\u2705'
+
+    → 进程退出码 1 → 启动器重试 5 次全失败后放弃 → **交易闭环整天没跑**，
+    而心跳文件只是停在昨天，看起来像「休市没动」，极易被误判为正常。
+
+    修法与 ``src/ui/app.py`` 完全一致：用 ``reconfigure()`` **就地**改编码
+    （重新赋值 sys.stdout 对已经持有旧对象的库无效），并且 ``errors="replace"``
+    兜底 —— 宁可日志里出现一个问号，也不能因为一行日志把交易进程干掉。
+    """
+    import io as _io
+
+    for _name in ("stdout", "stderr"):
+        _stream = getattr(sys, _name, None)
+        if _stream is None:
+            continue
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            continue
+        except Exception:  # noqa: BLE001
+            pass
+        # 兜底：不是 TextIOWrapper（或被重定向到管道）时整体换一个 UTF-8 包装
+        try:
+            _buf = getattr(_stream, "buffer", None)
+            if _buf is None:
+                continue
+            setattr(sys, _name, _io.TextIOWrapper(
+                _buf, encoding="utf-8", errors="replace", line_buffering=True))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# 必须在任何 print 之前调用（本文件后面满是 emoji 输出）
+_force_utf8_stdio()
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 # ⚠️ 必须在使用 xtquant 之前导入 config.settings ——
 # 它的模块级 _extend_sys_path_for_external_libs() 会把 <exe 同级>/libs
 # 注入 sys.path，否则打包版 exe 里 import xtquant 会失败。

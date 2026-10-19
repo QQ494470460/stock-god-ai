@@ -702,18 +702,31 @@ def cmd_live_ic(args) -> int:
     ic = _spearman(scores, excess)
 
     # 累积滚动日志（按评分日去重：非交易日/同日重复跑不追加，避免污染滚动序列）
-    log = _load_json(ROLLING_IC_LOG) or []
+    #
+    # ⚠️ 去重必须扫**全部**日期，不能只看 log[-1]：本文件和 ``run_backfill``
+    # 是两个生产者，后者落盘前会按日期重排，末尾元素未必是刚才追加的那条，
+    # 只比对 log[-1] 会漏判并写出重复日期。
+    # ⚠️ 截断上限必须不小于 ``run_backfill`` 的 250，否则一次盘后审计就会把
+    # 辛苦回填的历史 IC 悄悄砍成 60 条。
+    log = [x for x in (_load_json(ROLLING_IC_LOG) or []) if isinstance(x, dict)]
     d_str = d.strftime("%Y-%m-%d")
-    if log and log[-1].get("date") == d_str:
+    if any(x.get("date") == d_str for x in log):
         appended = False
     else:
         log.append({"date": d_str, "ic": round(float(ic), 4),
                     "n": len(scores), "offline": offline})
-        log = log[-60:]
+        log = sorted(log, key=lambda x: x.get("date", ""))[-250:]
         try:
             ROLLING_IC_LOG.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+        # 同步刷新状态文件 —— 否则看板上读到的还是上一次回填留下的
+        # 「20 条 / 最后 2026-10-09」，而日志其实已经更新（2026-10-19 实测）。
+        try:
+            from src.core.rolling_ic import refresh_status
+            refresh_status(ROLLING_IC_LOG)
+        except Exception as _e:
+            print(f"⚠️ 刷新 rolling_ic_status.json 失败（已忽略）: {_e}")
         appended = True
 
     ics = [x["ic"] for x in log if x["ic"] == x["ic"]]

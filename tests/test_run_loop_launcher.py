@@ -157,6 +157,76 @@ def test_probe_unusable_path_fails_open(tmp_path):
     assert mod.probe(blocked) == 0
 
 
+# --------------------------------------------------------------------------
+# 4) 无头启动的编码兜底（2026-10-18 真事故）
+#
+# 启动器是 `pythonw scripts\run_loop.py >> run_loop.log 2>&1`：重定向后的
+# stdout 默认走 OEM 码页（简中 cp936/GBK），而 run_loop.py 里有大量 emoji
+# 输出（"✅ 已连接…"）。第一个 emoji 就抛 UnicodeEncodeError → 退出码 1 →
+# 启动器重试 5 次放弃 → **交易闭环整天没跑**，心跳只停在昨天，看着像"休市"。
+# --------------------------------------------------------------------------
+
+
+def test_run_loop_source_calls_utf8_stdio_before_any_print():
+    src = (ROOT / "scripts" / "run_loop.py").read_text(encoding="utf-8")
+    assert "def _force_utf8_stdio" in src, "run_loop.py 缺少 UTF-8 stdio 兜底函数"
+    call = src.index("_force_utf8_stdio()")
+    first_print = src.index("print(")
+    assert call < first_print, (
+        "必须在任何 print 之前调用 _force_utf8_stdio()，否则第一个 emoji 就会崩"
+    )
+
+
+def test_daemon_bat_sets_utf8_env():
+    text = BAT.read_text(encoding="ascii")
+    assert "PYTHONIOENCODING=utf-8" in text, (
+        "批处理没设 PYTHONIOENCODING=utf-8：pythonw 重定向下 stdout 会退回 GBK"
+    )
+
+
+def _run_py(code: str, env_extra: dict) -> "subprocess.CompletedProcess":
+    import subprocess
+
+    env = dict(os.environ)
+    env.update(env_extra)
+    env["PYTHONPATH"] = str(ROOT)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(ROOT), env=env, capture_output=True, timeout=180,
+    )
+
+
+def test_run_loop_import_survives_gbk_stdout():
+    """真的把 stdout 压成 GBK，再 import run_loop 并打 emoji —— 必须不崩。
+
+    这是**正向**断言：修复前它一定 UnicodeEncodeError（返回码 1）。
+    """
+    code = (
+        "import sys; sys.path.insert(0, '.');"
+        "import scripts.run_loop as r;"
+        "print('✅ emoji ok')"
+    )
+    proc = _run_py(code, {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"})
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == 0, (
+        f"GBK 环境下 import run_loop 失败（rc={proc.returncode}）\n"
+        f"stdout={out[-800:]}\nstderr={err[-1200:]}"
+    )
+    assert "emoji ok" in out
+    assert "UnicodeEncodeError" not in err
+
+
+def test_run_loop_without_fix_would_fail_probe():
+    """负向对照：不 import run_loop 时，同样的 GBK 环境打 emoji 必然崩。
+
+    这条用来证明上面那条用例**真的在测编码**，而不是恒真。
+    """
+    proc = _run_py("print('✅ emoji ok')", {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"})
+    assert proc.returncode != 0, "对照组竟然通过了，说明这个验证方式无效"
+    assert b"UnicodeEncodeError" in proc.stderr
+
+
 def test_probe_matches_run_loop_semantics(tmp_path):
     """探针与 run_loop.acquire_single_instance 必须互补：探针 =1 ⟺ 主程序拒绝启动。"""
     run_loop = pytest.importorskip("scripts.run_loop")

@@ -23,6 +23,7 @@ from src.trading.paper import paper_account
 # 走本包的 paths 模块而非直接 `from config.settings import CONFIG_DIR`：
 # 后者在「看板进程早于源码改动启动」时会撞上缓存里的旧模块并抛 ImportError。
 from src.ui.paths import CONFIG_DIR
+from src.ui.common import render_hero
 
 
 def _guard_config_path() -> str | None:
@@ -44,7 +45,12 @@ def _guard_config_path() -> str | None:
 
 def render_autotrade_page():
     """渲染自动交易页面"""
-    st.markdown('<p class="main-header">💹 量化自动交易</p>', unsafe_allow_html=True)
+    render_hero(
+        "量化自动交易",
+        "纸交易零风险验证 · 实时交易日志 · 策略绩效追踪 —— 默认 PAPER，绝不自动实盘",
+        icon="💹",
+        badges=[("warn", "默认模拟盘")],
+    )
 
     # Session state init
     defaults = {
@@ -277,6 +283,21 @@ _STATE_LABEL = {
 }
 
 
+def _data_dir() -> Path:
+    """数据目录（与 CONFIG_DIR 同级）。闭环单实例锁就放在这里。"""
+    return Path(CONFIG_DIR).parent / "data"
+
+
+def _loop_lock_path() -> str:
+    """全机唯一的闭环单实例锁。
+
+    必须与常驻 ``scripts/run_loop.py`` 用的是**同一个文件**
+    （``data/.run_loop.lock``），否则「看板点启动」+「开机自启拉一份」
+    会同时跑两个实例，对同一份计划各下一遍单（2026-10-19 实测踩到）。
+    """
+    return str(_data_dir() / ".run_loop.lock")
+
+
 def _ensure_loop(broker, guard):
     """构建/复用闭环引擎（TradingLoop）。串接安全中枢、纸账户与推送。"""
     from src.trading.loop import TradingLoop, LoopConfig
@@ -302,6 +323,7 @@ def _ensure_loop(broker, guard):
     loop = TradingLoop(
         broker, guard=guard, paper_account=paper_account,
         config=cfg, notifier=notifier, event_callback=_on_event,
+        lock_path=_loop_lock_path(),
     )
     st.session_state.trade_loop = loop
     return loop
@@ -332,8 +354,16 @@ def _render_loop():
         if not loop.is_running:
             if st.button("▶️ 启动闭环", type="primary", use_container_width=True,
                          key="btn_loop_start"):
-                loop.start()
-                st.success("✅ 闭环已启动（后台线程按周期运行）")
+                if loop.start():
+                    st.success("✅ 闭环已启动（后台线程按周期运行）")
+                else:
+                    st.error(
+                        "⛔ **已有另一个闭环实例在运行**（单实例锁 "
+                        f"`{_loop_lock_path()}` 被占用），已拒绝启动第二个实例 —— "
+                        "两个实例会对同一份计划各下一遍单。"
+                        "请先在原实例（常驻 `run_loop.py` 或另一个看板标签页）"
+                        "停止闭环后再启动。"
+                    )
                 st.rerun()
         else:
             if st.button("⏹️ 停止闭环", use_container_width=True, key="btn_loop_stop"):

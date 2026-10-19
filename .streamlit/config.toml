@@ -1,0 +1,23 @@
+# 选股神 AI · Streamlit 主题
+#
+# 为什么必须有这个文件：不设主题时 Streamlit 用默认主色 #FF4B4B（西瓜红），
+# 滑杆、勾选框、页签高亮、spinner 全是红的，和界面的品牌紫 + A股涨红跌绿打架，
+# 一眼就"不像一个产品"。这里把主色统一成品牌紫 #5b21b6。
+#
+# ⚠️ 打包成 exe 时必须把 .streamlit/ 一起 add-data 到 <exe>/.streamlit/，
+#    否则打包版仍会用默认主题（见 build_exe.py）。
+
+[theme]
+base = "light"
+primaryColor = "#5b21b6"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f7fb"
+textColor = "#0f172a"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+# 隐藏右上角「Deploy」按钮（本地单机看板没有部署语义，纯干扰）
+[client]
+toolbarMode = "minimal"

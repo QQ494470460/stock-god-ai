@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 
 # 性能优化：xgboost / sklearn（经 MLTrainer 传递）都**不**在顶层 import。
@@ -82,6 +82,14 @@ class StockPrediction:
     llm_sentiment: float = 0.0    # 情绪分 (-1~1, +看多 / -看空)
     llm_risk: float = 0.0         # 风险标记 (0/1, 1=利空/风险事件)
     llm_confidence: float = 0.0   # 置信度 (0~1)
+    # 超级集成明细（融合成功才填充）：各腿评分 / 权重 / 分歧度 spread
+    # 原先是 ensemble.py 里动态挂上去的，这里补齐声明，避免下游 getattr 兜底。
+    ensemble_detail: dict = field(default_factory=dict)
+    # 本次评分**实际**走的口径："ensemble"=超级集成分 / "single"=纯 XGBoost 单模型分。
+    # 必须显式记录：历史上 predict_single 恒走单模型，与选股（predict_batch）口径不一致，
+    # 而单模型实测 mean IC 0.0575 / t=1.40 **统计不显著**（集成 t≈4.6）。
+    # UI 据此标注，避免把不显著的单模型分误当成集成分来下单。
+    model_mode: str = "single"
 
 
 def _board_of(code: str) -> str:
@@ -529,9 +537,19 @@ class Predictor:
         self,
         df: pd.DataFrame,
         code: str = "000000",
-        name: str = "未知"
+        name: str = "未知",
+        apply_ensemble: bool = False,
     ) -> StockPrediction:
-        """对单只股票进行预测"""
+        """对单只股票进行预测。
+
+        ``apply_ensemble=True`` 时走超级集成融合（与选股批量共用
+        ``EnsemblePredictor.blend_one``，口径一致）。
+
+        默认 **False** 是刻意的：``EnsemblePredictor.predict_batch`` 内部就是
+        调本方法再做 blend，若这里默认 True 会**双重融合**。故只有「直接面向
+        用户/orchestrator 的单只调用」（如个股分析页）才显式传 True。
+        融合失败一律保留纯单模型分并把 ``model_mode`` 置为 "single"，绝不抛错。
+        """
         if not self.is_ready:
             raise RuntimeError("模型未加载，请先训练模型")
         
@@ -665,7 +683,7 @@ class Predictor:
         if not reasons:
             reasons.append(note)
         
-        return StockPrediction(
+        pred = StockPrediction(
             code=code,
             name=name,
             prob_up=prob_up,
@@ -682,6 +700,16 @@ class Predictor:
             reasons=reasons,
             features_snapshot=feature_snapshot
         )
+        # 超级集成融合（与选股批量共用 blend_one，保证口径一致）
+        if apply_ensemble:
+            try:
+                ep = self._get_ensemble()
+                if ep is not None:
+                    ep.blend_one(pred, df, code)
+            except Exception as e:  # noqa: BLE001
+                # 融合失败必须安全退回单模型分：个股分析页不能因为集成挂掉而白屏
+                logger.warning(f"超级集成融合失败，保留单模型分: {e}")
+        return pred
     
     def _neutralize_scores(self, predictions: List["StockPrediction"]) -> None:
         """对整批预测做截面中性化（原地修改 pred.score）。

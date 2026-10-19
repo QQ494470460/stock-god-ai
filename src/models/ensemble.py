@@ -258,62 +258,81 @@ class EnsemblePredictor:
                                + (f"（原因：{why}）" if why else ""))
         return out
 
-    def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
-        """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。"""
-        avail = self._available_subs()
-        # 权重收缩（预测方差收缩）：把子模型权重向「等权」收缩，降低对单腿过置信权重的方差。
-        # shrink=0 → 原始权重；shrink=1 → 全部等权（最大分散、最小融合方差）。
-        # 主模型权重恒为 1.0（基准，不收缩）。仅当子模型≥2 时生效。
+    def _eff_weights(self, avail) -> List[float]:
+        """按 ensemble_shrinkage 把子模型权重向「等权」收缩（方差削减第二层）。
+
+        shrink=0 → 原始权重；shrink=1 → 全部等权（最大分散、最小融合方差）。
+        主模型权重恒为 1.0（基准，不收缩）。仅当可用子模型 ≥2 时生效。
+        """
         shrink = float(getattr(app_config.ml, "ensemble_shrinkage", 0.0) or 0.0)
         if shrink > 0 and len(avail) > 1:
             total = sum(w for _, w in avail)
             uni = total / len(avail)
-            eff_ws = [w * (1.0 - shrink) + uni * shrink for _, w in avail]
-        else:
-            eff_ws = [w for _, w in avail]
+            return [w * (1.0 - shrink) + uni * shrink for _, w in avail]
+        return [w for _, w in avail]
+
+    def blend_one(self, pred, df: pd.DataFrame, code: str) -> bool:
+        """把子模型评分融合进「单只股票」的 pred（就地改 score/agreement/ensemble_detail）。
+
+        **predict_batch 与 Predictor.predict_single 共用这一条路径**，保证
+        「选股批量」和「个股分析页」两处口径绝对一致（2026-10-18 修：此前个股分析页
+        恒走单模型，而单模型实测 mean IC 0.0575 / t=1.40 **统计不显著**）。
+
+        返回是否真的发生了融合。任一腿缺失 / 评分失败都保留原单模型分
+        （model_mode 仍为 "single"），绝不拖垮调用方。
+        """
+        avail = self._available_subs()
+        if not avail:
+            return False
+        eff_ws = self._eff_weights(avail)
+        # 主模型贡献用 score_raw（纯概率分，与子模型 _proba_to_score 同口径），
+        # 而非 pred.score（含 compute_score 的 regime/risk/预期收益加成）。
+        # 否则主腿与其他腿尺度错位，融合权重失真。
+        # 防御：真实 StockPrediction 必有 score_raw；若调用方传入的占位对象缺该属性，
+        # 退回用 score，避免 AttributeError（向后兼容历史测试桩）。
+        primary_score = getattr(pred, "score_raw", None)
+        if primary_score is None:
+            primary_score = pred.score
+        sub_scores = [primary_score]  # 主模型权重 1.0
+        sub_weights = [1.0]
+        used_names = ["xgboost"]
+        for (sub, _), ew in zip(avail, eff_ws):
+            sc = sub.score_for(df, code)
+            if sc is not None:
+                sub_scores.append(sc)
+                sub_weights.append(ew)
+                used_names.append(sub.name)
+        if len(sub_scores) <= 1:
+            return False
+        arr = np.array(sub_scores, dtype=float)
+        wts = np.array(sub_weights, dtype=float)
+        blended = float(np.average(arr, weights=wts))
+        spread = float(arr.max() - arr.min())
+        pred.score = blended
+        # agreement 保持 >=0.8 以兼容交易执行器硬闸门（require_agreement < 0.8 拒单）；
+        # 真实分歧记录在 ensemble_detail["spread"]，不阻断下单。
+        pred.agreement = max(0.8, 1.0 - spread / 100.0)
+        # 只列「本只股票真正出分」的腿，避免某腿返回 None 时三张表长度错位。
+        pred.ensemble_detail = {
+            "scores": dict(zip(used_names, sub_scores)),
+            "weights": dict(zip(used_names, [float(x) for x in sub_weights])),
+            "spread": spread,
+        }
+        pred.model_mode = "ensemble"
+        return True
+
+    def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
+        """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。"""
         results: Dict[str, object] = {}
         for code, df in stock_data.items():
             try:
+                # apply_ensemble 默认 False：融合统一由下面的 blend_one 做，
+                # 避免「predict_single 内部再融一次」的双重加权。
                 pred = self.primary.predict_single(df, code=code)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"主模型预测失败 {code}: {e}")
                 continue
-            # 收集各子模型评分
-            # 主模型贡献用 score_raw（纯概率分，与子模型的 _proba_to_score 同口径），
-            # 而非 pred.score（含 compute_score 的 regime/risk/预期收益加成）。
-            # 否则主腿与其他腿尺度错位，融合权重失真。最终 blend 才是真正用于排名的评分；
-            # 行业中性化在 predict_batch 内统一对 blend 再做一次截面处理。
-            # 防御：真实 StockPrediction 必有 score_raw；若调用方传入的占位对象缺该属性，
-            # 退回用 score，避免 AttributeError（向后兼容历史测试桩）。
-            primary_score = getattr(pred, "score_raw", None)
-            if primary_score is None:
-                primary_score = pred.score
-            sub_scores = [primary_score]  # 主模型权重 1.0
-            sub_weights = [1.0]
-            used_names = ["xgboost"]
-            for (sub, _), ew in zip(avail, eff_ws):
-                sc = sub.score_for(df, code)
-                if sc is not None:
-                    sub_scores.append(sc)
-                    sub_weights.append(ew)
-                    used_names.append(sub.name)
-            if len(sub_scores) > 1:
-                arr = np.array(sub_scores, dtype=float)
-                wts = np.array(sub_weights, dtype=float)
-                blended = float(np.average(arr, weights=wts))
-                spread = float(arr.max() - arr.min())
-                pred.score = blended
-                # agreement 保持 >=0.8 以兼容交易执行器硬闸门；
-                # 真实分歧记录在 agreement_spread（不阻断下单）
-                pred.agreement = max(0.8, 1.0 - spread / 100.0)
-                pred.xgb_signal = pred.xgb_signal  # 主信号不变
-                # 名称/分数/权重一律只列「本只股票真正出分」的腿，
-                # 避免某腿返回 None 时三张表长度错位（曾因用 eff_ws 全量而错位）。
-                pred.ensemble_detail = {
-                    "scores": dict(zip(used_names, sub_scores)),
-                    "weights": dict(zip(used_names, [float(x) for x in sub_weights])),
-                    "spread": spread,
-                }
+            self.blend_one(pred, df, code)
             results[code] = pred
         return results
 

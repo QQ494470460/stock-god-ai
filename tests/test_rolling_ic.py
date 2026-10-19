@@ -161,6 +161,44 @@ def test_run_backfill_dry_run_shape(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# refresh_status：日志与状态文件的对账入口
+# ---------------------------------------------------------------------------
+
+def test_refresh_status_reflects_log(tmp_path, monkeypatch):
+    """状态文件必须与日志一致 —— 两个生产者都要能刷新它。"""
+    statusp = tmp_path / "status.json"
+    monkeypatch.setattr(rolling_ic, "STATUS_FILE", statusp)
+    ics = [0.10, 0.20, -0.05]
+    logp = tmp_path / "log.json"
+    logp.write_text(json.dumps([
+        {"date": "2026-09-01", "ic": ics[0], "n": 50},
+        {"date": "2026-09-03", "ic": ics[2], "n": 50},
+        {"date": "2026-09-02", "ic": ics[1], "n": 50},   # 故意乱序
+    ]), encoding="utf-8")
+
+    st = rolling_ic.refresh_status(logp)
+    assert st["total"] == 3
+    assert st["last_date"] == "2026-09-03", "last_date 必须按日期排序后取最大"
+    assert st["mean_ic"] == pytest.approx(float(np.mean(ics)), abs=1e-4)
+    assert st["pos_rate"] == pytest.approx(2 / 3, abs=1e-3)   # 落盘时保留 3 位
+    assert json.loads(statusp.read_text(encoding="utf-8"))["total"] == 3
+
+
+def test_refresh_status_never_writes_nan(tmp_path, monkeypatch):
+    """样本不足时落 None，绝不往 JSON 里写 NaN（严格解析器会直接报错）。"""
+    statusp = tmp_path / "status.json"
+    monkeypatch.setattr(rolling_ic, "STATUS_FILE", statusp)
+    logp = tmp_path / "log.json"
+    logp.write_text(json.dumps([{"date": "2026-09-01", "ic": 0.1, "n": 50}]),
+                    encoding="utf-8")
+
+    st = rolling_ic.refresh_status(logp)
+    assert st["mean_ic"] == pytest.approx(0.1)
+    assert st["ir_mean_std"] is None and st["t_stat"] is None
+    assert "NaN" not in statusp.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # 调度器接线
 # ---------------------------------------------------------------------------
 

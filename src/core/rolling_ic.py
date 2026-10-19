@@ -66,6 +66,53 @@ def _write_status(d: Dict) -> None:
         pass
 
 
+def _stats_from_entries(entries: List[Dict]) -> Dict:
+    """从 IC 日志条目算出 {total, mean_ic, ir_mean_std, t_stat, pos_rate, last_date}。"""
+    ics = [float(r.get("ic")) for r in entries
+           if r.get("ic") is not None and r.get("ic") == r.get("ic")]
+    if not ics:
+        return {"total": len(entries), "mean_ic": None, "ir_mean_std": None,
+                "t_stat": None, "pos_rate": None,
+                "last_date": entries[-1]["date"] if entries else None}
+    m = float(np.mean(ics))
+    sd = float(np.std(ics, ddof=1)) if len(ics) > 1 else float("nan")
+    se = sd / (len(ics) ** 0.5) if len(ics) > 1 and sd == sd else float("nan")
+    ir = m / sd if sd and sd > 0 else float("nan")
+    tstat = m / se if se and se > 0 else float("nan")
+    return {
+        "total": len(entries),
+        "mean_ic": round(m, 4),
+        "ir_mean_std": round(ir, 3) if ir == ir else None,
+        "t_stat": round(tstat, 2) if tstat == tstat else None,
+        "pos_rate": round(sum(1 for v in ics if v > 0) / len(ics), 3),
+        "last_date": entries[-1]["date"] if entries else None,
+    }
+
+
+def refresh_status(log_path: Optional[Path] = None, extra: Optional[Dict] = None) -> Dict:
+    """按**当前日志**重算并落盘 ``rolling_ic_status.json``。
+
+    为什么需要这个入口：``rolling_ic_log.json`` 有**两个生产者** ——
+    ``run_backfill``（收盘后批量回填）和 ``scripts/paper_shadow_audit.py``
+    （盘后算当天 live-IC）。2026-10-19 之前后者只往日志里追加、从不更新状态，
+    于是看板从状态文件读到「20 条 / 最后 2026-10-09」，而日志里其实已经有
+    31 条 / 最后 2026-10-12 —— 显示和真实数据对不上，且没人知道该信哪个。
+    """
+    path = Path(log_path) if log_path else IC_LOG
+    log = _load_json(path) or []
+    entries = sorted(
+        [r for r in log if isinstance(r, dict) and r.get("date")],
+        key=lambda r: r.get("date", ""),
+    )
+    status: Dict = {"status": "ok" if entries else "empty"}
+    status.update(_stats_from_entries(entries))
+    status["at"] = datetime.now().isoformat(timespec="seconds")
+    if extra:
+        status.update(extra)
+    _write_status(status)
+    return status
+
+
 def run_backfill(
     days: int = 30,
     sample: int = 150,
@@ -192,20 +239,12 @@ def run_backfill(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(merged_list, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        ics = [e["ic"] for e in merged_list]
-        m = float(np.mean(ics))
-        sd = float(np.std(ics, ddof=1)) if len(ics) > 1 else float("nan")
-        se = sd / (len(ics) ** 0.5) if len(ics) > 1 and sd == sd else float("nan")
-        ir = m / sd if sd and sd > 0 else float("nan")
-        tstat = m / se if se and se > 0 else float("nan")
-        pos_rate = sum(1 for v in ics if v > 0) / len(ics)
-        result = {
-            "status": "ok", "added": len(new_entries), "total": len(merged_list),
-            "mean_ic": round(m, 4), "ir_mean_std": round(ir, 3),
-            "t_stat": round(tstat, 2), "pos_rate": round(pos_rate, 3),
-            "last_date": merged_list[-1]["date"] if merged_list else None,
-        }
-        _write_status({"status": "ok", **result, "at": datetime.now().isoformat(timespec="seconds")})
+        # 统计口径与 refresh_status 完全一致（共用一个函数，避免两个生产者
+        # 各算一套、对不上账）。非有限值一律落成 None，别往 JSON 里写 NaN。
+        result: Dict = {"status": "ok", "added": len(new_entries)}
+        result.update(_stats_from_entries(merged_list))
+        result["at"] = datetime.now().isoformat(timespec="seconds")
+        _write_status(dict(result))
         return result
     except Exception as e:  # noqa: BLE001
         _write_status({"status": "error", "error": str(e),

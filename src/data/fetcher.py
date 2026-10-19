@@ -14,7 +14,7 @@ import numpy as np
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from loguru import logger
 
@@ -31,6 +31,38 @@ def _ak():
 
         _AK = akshare
     return _AK
+
+
+def _parse_cap(val: Any) -> float:
+    """把东方财富返回的市值/股本解析成「亿」为单位的浮点数。
+
+    东方财富 ``stock_individual_info_em`` 的 总市值/总股本 等字段通常是「元」量级的数值
+    （如 1.6e11），少数情况可能带「亿/万」单位的字符串。统一归一到「亿」。
+    """
+    if val is None:
+        return 0.0
+    try:
+        if isinstance(val, (int, float)):
+            num = float(val)
+        else:
+            s = str(val).strip()
+            if not s:
+                return 0.0
+            unit = 1.0
+            if "亿" in s:
+                unit = 1.0
+                s = s.replace("亿", "")
+            elif "万" in s:
+                unit = 1e-4
+                s = s.replace("万", "")
+            num = float(s.replace(",", ""))
+            num *= unit
+        # 数值极大（元量级）→ 视为「元」，换算成「亿」
+        if num > 1e6:
+            num = num / 1e8
+        return float(num)
+    except Exception:
+        return 0.0
 
 from config.settings import config as app_config, DATA_DIR
 
@@ -250,6 +282,42 @@ class DataFetcher:
                                           "area", "listed_date", "total_cap", "float_cap"])
             raise
     
+    def get_stock_info(self, code: str) -> Dict[str, Any]:
+        """获取单只股票的实时基本信息（名称/行业/总市值/流通市值/上市日期/股本）。
+
+        数据源：东方财富 ``stock_individual_info_em``（个股信息最全的接口，命中
+        push2.eastmoney.com，部分网络/代理环境会被拦截）。
+        返回标准化 dict，市值/股本单位统一为「亿」。
+        若调用失败，返回含 ``_error`` 字段的 dict（上层据此显示明确告警，而非静默留空）。
+        """
+        result: Dict[str, Any] = {"code": code, "name": code}
+        try:
+            time.sleep(app_config.data.rate_limit)
+            raw = _ak().stock_individual_info_em(symbol=code)
+            if raw is None or len(raw) == 0:
+                result["_error"] = "东方财富返回空数据"
+                return result
+            kv: Dict[str, Any] = {}
+            for _, r in raw.iterrows():
+                item = str(r.get("item", "")).strip()
+                val = r.get("value")
+                if item:
+                    kv[item] = val
+            result.update({
+                "name": str(kv.get("股票简称", code)),
+                "industry": str(kv.get("行业", "") or ""),
+                "total_cap": _parse_cap(kv.get("总市值")),
+                "float_cap": _parse_cap(kv.get("流通市值")),
+                "listed_date": str(kv.get("上市时间", "") or ""),
+                "total_shares": _parse_cap(kv.get("总股本")),
+                "float_shares": _parse_cap(kv.get("流通股")),
+            })
+            return result
+        except Exception as e:
+            logger.debug(f"获取 {code} 基本信息失败: {e}")
+            result["_error"] = str(e)
+            return result
+
     # ========== 日线行情 ==========
     
     def get_daily_kline(
@@ -939,21 +1007,53 @@ class DataFetcher:
                     result.append(buckets[pfx][i])
         return result
     
+    # 少于这个数量就不认为「抓到了行业映射」——多半是接口被限流/代理拦截，
+    # 只拿到零散几条。用它来决定要不要落盘，避免空结果把缓存"投毒"。
+    _MIN_INDUSTRY_CODES = 20
+    # 空缓存的负缓存窗口（小时）：这段时间里不再重试，否则每次预测都要白跑
+    # 上百个必然失败的请求，把选股流程拖死。
+    _INDUSTRY_NEG_TTL_H = 6.0
+
     def get_industry_map(self, force_refresh: bool = False) -> Dict[str, str]:
-        """获取股票代码→行业映射（内存缓存）"""
+        """获取股票代码→行业映射（内存缓存）。
+
+        两条容易踩的坑，这里都堵上了：
+          1) **空结果不许落盘**。历史上接口被代理拦截时会拿到 ``{}``，又被原样
+             写进 ``industry_map.json``；此后每次调用都直接返回这个空缓存，
+             即使网络恢复也**永远不会自愈**（2026-10-19 实测：东财
+             ``17.push2.eastmoney.com`` 直接 ProxyError）。
+          2) **空缓存要当负缓存用**。既然抓不到，就得记住"刚失败过"，六小时内
+             不再重试；否则一次选股要串行打上百个注定失败的请求。
+        """
+        import json as _json
+        import time as _time
+
         if self._industry_map is not None and not force_refresh:
             return self._industry_map
-        
+
         cache_file = self.cache_dir / "industry_map.json"
         # 尝试缓存
         if cache_file.exists() and not force_refresh:
             try:
-                import json
-                self._industry_map = json.loads(cache_file.read_text())
-                return self._industry_map
+                cached = _json.loads(cache_file.read_text(encoding="utf-8"))
             except Exception:
-                pass
-        
+                cached = None
+            if cached:
+                self._industry_map = cached
+                return self._industry_map
+            # 空缓存 = 上次抓取失败。窗口内直接认命，别再打网络。
+            try:
+                age_h = (_time.time() - cache_file.stat().st_mtime) / 3600.0
+            except OSError:
+                age_h = self._INDUSTRY_NEG_TTL_H + 1
+            if age_h < self._INDUSTRY_NEG_TTL_H:
+                logger.debug(
+                    f"行业映射为空缓存（{age_h:.1f}h 前失败），"
+                    f"{self._INDUSTRY_NEG_TTL_H:.0f}h 内不再重试"
+                )
+                self._industry_map = {}
+                return {}
+
         logger.info("从 AKShare 获取行业分类数据…")
         self._industry_map = {}
         try:
@@ -962,7 +1062,7 @@ class DataFetcher:
             if len(industry_df) > 0:
                 # 遍历每个行业获取成分股
                 industries = industry_df.head(100)["板块名称"].tolist()  # 取前100个行业
-                for ind in industries:
+                for _i, ind in enumerate(industries):
                     try:
                         cons = _ak().stock_board_industry_cons_em(symbol=ind)
                         if len(cons) > 0:
@@ -972,13 +1072,27 @@ class DataFetcher:
                                     self._industry_map[code] = ind
                     except Exception:
                         continue
+                    # 接口"看起来通、其实全空"时要尽早止损：连试 10 个行业
+                    # 一个成分股都没有，再跑下去只是浪费 90 次请求。
+                    if _i >= 9 and not self._industry_map:
+                        logger.warning("连续 10 个行业板块都拿不到成分股，判定接口不可用，提前放弃")
+                        break
         except Exception as e:
             logger.warning(f"行业映射获取失败: {e}")
-        
-        # 缓存
-        import json
-        cache_file.write_text(json.dumps(self._industry_map, ensure_ascii=False), encoding='utf-8')
-        logger.info(f"行业映射获取完成: {len(self._industry_map)} 只")
+
+        # 缓存：只有拿到可信规模才覆盖，否则保留旧值（或仅刷新"失败时间戳"）
+        _n = len(self._industry_map)
+        try:
+            if _n >= self._MIN_INDUSTRY_CODES:
+                cache_file.write_text(
+                    _json.dumps(self._industry_map, ensure_ascii=False), encoding="utf-8")
+            elif not cache_file.exists():
+                cache_file.write_text("{}", encoding="utf-8")   # 负缓存：记下"抓不到"
+            else:
+                cache_file.touch()      # 保留旧内容，只刷新负缓存窗口
+        except OSError as e:
+            logger.debug(f"行业映射缓存写入失败（已忽略）: {e}")
+        logger.info(f"行业映射获取完成: {_n} 只")
         return self._industry_map
     
     def filter_by_board(self, codes: List[str], boards: List[str]) -> List[str]:

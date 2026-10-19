@@ -33,6 +33,12 @@ REM Derive the project root from this script's own location (works in the dev
 REM tree and in a packaged copy alike). %~dp0 ends with a backslash.
 for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 set "PYW=C:\Users\49447\AppData\Local\Programs\Python\Python312\pythonw.exe"
+REM Force UTF-8 stdio. Without this, pythonw + ">> log" leaves stdout on the
+REM OEM code page (936/GBK on zh-CN) and run_loop.py's emoji output dies with
+REM UnicodeEncodeError -> exit code 1 -> 5 retries -> the trading loop silently
+REM never runs. run_loop.py reconfigures stdio itself too; this is belt+braces.
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
 set "LOG=%ROOT%\logs\run_loop.log"
 set "LLOG=%ROOT%\logs\launcher.log"
 

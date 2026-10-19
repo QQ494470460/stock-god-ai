@@ -242,23 +242,28 @@ def tag_css() -> str:
 # ==================== 带涨跌色的指标卡 ====================
 
 def html_metric(label: str, value: str, chg: Optional[float] = None,
-                chg_text: str = "", bg: str = "#f8fafc") -> str:
+                chg_text: str = "", bg: str = "") -> str:
     """自绘指标卡 HTML。
 
     st.metric 的 delta_color 只有 "normal"(涨绿跌红，欧美习惯) 和 "off",
     都无法表达 A 股的红涨绿跌 —— 涨跌类指标一律用这个。
+
+    视觉走全局设计系统的 ``.mini-card``（顶部一条渐变色带随涨跌变色），
+    不再内联硬编码灰底，保证和 KPI 卡/概览卡同一档质感。
     """
     if chg is None:
+        tone = "plain"
         tail = f'<span style="color:#64748b;font-size:0.78rem;">{chg_text}</span>' if chg_text else ""
     else:
+        tone = "up" if chg > 0 else ("down" if chg < 0 else "plain")
         tail = (f'<span style="color:{chg_color(chg)};font-weight:600;font-size:0.82rem;">'
                 f'{chg_arrow(chg)} {chg_text or fmt_pct(chg)}</span>')
+    style = f"background:{bg};" if bg else ""
     return (
-        f'<div style="background:{bg};border:1px solid #e2e8f0;border-radius:10px;'
-        f'padding:.55rem .7rem;">'
-        f'<div style="font-size:0.72rem;color:#64748b;margin-bottom:2px;">{label}</div>'
-        f'<div style="font-size:1.05rem;font-weight:700;color:#0f172a;">{value}</div>'
-        f'<div style="margin-top:2px;">{tail}</div>'
+        f'<div class="mini-card {tone}" style="{style}text-align:left;">'
+        f'<div class="label" style="text-transform:none;letter-spacing:0;">{label}</div>'
+        f'<div class="val">{value}</div>'
+        f'<div class="sub">{tail}</div>'
         f'</div>'
     )
 
@@ -267,6 +272,86 @@ def metric_card(label: str, value: str, chg: Optional[float] = None,
                 chg_text: str = "") -> None:
     """直接渲染一个带涨跌色的指标卡"""
     st.markdown(html_metric(label, value, chg, chg_text), unsafe_allow_html=True)
+
+
+# ==================== 版式组件（统一各页"头部/卡片"观感） ====================
+
+def page_hero(title: str, sub: str = "", icon: str = "📈",
+              badges: Optional[Sequence[str]] = None) -> str:
+    """页面大标题 —— 统一 Hero 条（渐变卡片 + 图标砖 + 徽标）。
+
+    取代各页散落的 ``<p class="main-header">``：图标、标题、副标题、
+    右侧状态徽标一次成型，全站 9 个页面视觉一致。
+
+    badges: 形如 ``[("violet","集成已启用"), ("up","IC 0.23")]``，
+            也可只传字符串（默认灰底）。
+    """
+    badges_html = ""
+    for b in (badges or []):
+        if isinstance(b, (tuple, list)) and len(b) == 2:
+            tone, text = b
+        else:
+            tone, text = "gray", str(b)
+        badges_html += f'<span class="pill {tone}">{text}</span>'
+
+    sub_html = f'<div class="hero-sub">{sub}</div>' if sub else ""
+    badges_block = f'<div class="hero-badges">{badges_html}</div>' if badges_html else ""
+    return (
+        '<div class="hero">'
+        f'<div class="hero-icon">{icon}</div>'
+        '<div class="hero-text">'
+        f'<div class="hero-title">{title}</div>'
+        f'{sub_html}'
+        '</div>'
+        f'{badges_block}'
+        '</div>'
+    )
+
+
+def render_hero(title: str, sub: str = "", icon: str = "📈",
+                badges: Optional[Sequence[str]] = None) -> None:
+    """直接渲染页面 Hero（page_hero 的便捷版）"""
+    st.markdown(page_hero(title, sub, icon, badges), unsafe_allow_html=True)
+
+
+def kpi_row(items: Sequence[dict]) -> None:
+    """一行 KPI 卡。
+
+    items: ``[{"label": "📊 股票池", "value": "5123", "sub": "全市场",
+               "tone": ""}]``
+           tone 可选 up / down / warn / plain，控制卡片顶部色带。
+    """
+    if not items:
+        return
+    cards = []
+    for it in items:
+        tone = it.get("tone", "") or ""
+        sub = it.get("sub", "")
+        sub_html = f'<div class="sub">{sub}</div>' if sub else ""
+        cards.append(
+            f'<div class="mini-card {tone}">'
+            f'<div class="label">{it.get("label","")}</div>'
+            f'<div class="val">{it.get("value","—")}</div>'
+            f'{sub_html}'
+            f'</div>'
+        )
+    st.markdown(f'<div class="card-row">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def panel(title: str = "", body: str = "", icon: str = "") -> str:
+    """通用白卡面板（返回 HTML，调用方自行 st.markdown）"""
+    head = f'<div class="panel-title">{icon} {title}</div>' if title else ""
+    return f'<div class="panel">{head}{body}</div>'
+
+
+def empty_block(msg: str, icon: str = "📭", hint: str = "") -> None:
+    """空状态占位（比 st.info 更贴版式，用于"还没数据"的场景）"""
+    hint_html = f'<div style="font-size:.75rem;color:#94a3b8;">{hint}</div>' if hint else ""
+    st.markdown(
+        f'<div class="empty"><div class="empty-icon">{icon}</div>'
+        f'<div>{msg}</div>{hint_html}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ==================== 表格渲染 ====================

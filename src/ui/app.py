@@ -7,6 +7,7 @@ Streamlit 可视化看板
 import sys
 import os
 import re
+import json
 import time
 from pathlib import Path
 
@@ -71,9 +72,27 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from loguru import logger
+
+
+# ---- 全局图表主题：统一字体 / 网格 / 配色序列 ----
+# 只影响**没有显式传 template=** 的图表；显式传了的仍以页面为准。
+# 目的：消除"同一份看板里每张图风格都不一样"的廉价感。
+try:
+    pio.templates.default = "plotly_white"
+    _tpl = pio.templates.default.layout
+    _tpl.font.family = "Inter, PingFang SC, Microsoft YaHei, sans-serif"
+    _tpl.font.size = 12
+    _tpl.colorway = ["#5b21b6", "#7c3aed", "#dc2626", "#059669",
+                     "#d97706", "#3b82f6", "#64748b", "#a78bfa"]
+    _tpl.paper_bgcolor = "rgba(0,0,0,0)"
+    _tpl.plot_bgcolor = "rgba(0,0,0,0)"
+    _tpl.margin = dict(l=8, r=8, t=8, b=8)
+except Exception:  # noqa: BLE001  主题设置失败不影响看板主流程
+    pass
 
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
@@ -111,6 +130,8 @@ from src.ui.common import (
     calc_rsi, calc_macd, calc_kdj, calc_boll, calc_ma, boll_position,
     score_color, score_label, empty_state, require, signal_tag, tag_css,
     metric_card, html_metric,
+    # v2 版式组件：统一页头 / KPI 行 / 白卡面板 / 空状态
+    page_hero, render_hero, kpi_row, panel, empty_block,
 )
 
 # ========== 缓存层 ==========
@@ -161,6 +182,157 @@ def _cached_batch_kline(codes: tuple, start: str = "2015-01-01", end: str = ""):
 def _cached_name_map() -> dict:
     """code -> name 映射（5分钟）。各页面共用，避免重复构建全表。"""
     return build_name_map(_cached_stock_list())
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_benchmark(index_code: str = "000300.SH", start: str = "2015-01-01"):
+    """缓存基准指数（默认沪深300）日线，用于个股相对强弱比较。"""
+    return fetcher.get_benchmark_kline(index_code, start_date=start)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_stock_info(code: str):
+    """缓存单只股票实时基本信息（1小时）。
+
+    优先用 ``fetcher.get_stock_info``；若当前运行的 fetcher（如打包后的冻结副本）
+    缺少该接口，则回退到本文件内置的 ``_fetch_stock_info_local``，避免
+    ``AttributeError`` 导致基本面信息永远空白。
+    """
+    if hasattr(fetcher, "get_stock_info"):
+        try:
+            r = fetcher.get_stock_info(code)
+            if r is not None:
+                return r
+        except Exception:
+            pass
+    return _fetch_stock_info_local(code)
+
+
+def _parse_cap_local(val):
+    """把市值/股本解析成「亿」为单位（兼容 元量级数值 / 亿 / 万 三种返回）。"""
+    if val is None:
+        return 0.0
+    try:
+        if isinstance(val, (int, float)):
+            num = float(val)
+        else:
+            s = str(val).strip()
+            if not s:
+                return 0.0
+            unit = 1.0
+            if "亿" in s:
+                s = s.replace("亿", "")
+            elif "万" in s:
+                unit = 1e-4
+                s = s.replace("万", "")
+            num = float(s.replace(",", ""))
+            num *= unit
+        if num > 1e6:
+            num = num / 1e8
+        return float(num)
+    except Exception:
+        return 0.0
+
+
+def _sina_symbol(code: str):
+    """把 6 位代码转成新浪要求的带市场前缀格式（sh/sz/bj）。
+
+    注意：akshare 1.18 的 ``stock_zh_a_hist`` 实际走的是东方财富 push2his，
+    并非新浪；真正的新浪接口是 ``stock_zh_a_daily``，需要带前缀的 symbol。
+    """
+    c = str(code).strip().zfill(6)
+    if c[0] == "6":
+        return "sh" + c
+    if c[0] in ("4", "8"):
+        return "bj" + c
+    return "sz" + c
+
+
+def _fetch_stock_info_local(code: str):
+    """多源兜底获取个股基本信息（不依赖 fetcher 版本）。
+
+    数据源优先级：
+      1) 东方财富 ``stock_individual_info_em`` —— 最全（行业/总市值/流通市值/上市日期）。
+         但部分网络下 ``push2.eastmoney.com`` 不可达（RemoteDisconnected / ProxyError）。
+      2) 备用源（东方财富不可达时启用，尽力补齐，避免基本面整块空白）：
+         - 总市值   ← 百度 ``stock_zh_valuation_baidu(indicator="总市值")``（单位：亿）
+         - 上市日期 ← 新浪 ``stock_zh_a_daily`` 首行日期（即上市首日）
+         - 流通市值 ← 新浪 ``outstanding_share``(流通股本) × 最新收盘价
+         - 行业 备用源取不到 → 记入 ``_missing``，由 UI 低调标注。
+    """
+    # 注意：name 初始必须为 ""，不能回填 code —— UI 会 `if _ri.get("name")` 覆盖
+    # base["name"]，若这里塞了代码，会把静态列表里的真实名称（如「平安银行」）冲掉。
+    result = {
+        "code": code, "name": "", "industry": "", "total_cap": 0.0,
+        "float_cap": 0.0, "listed_date": "", "_source": "", "_missing": [],
+    }
+    em_err = None
+
+    # 1) 东方财富：信息最全，优先
+    try:
+        import akshare as ak
+        raw = ak.stock_individual_info_em(symbol=code)
+        if raw is not None and len(raw) > 0:
+            kv = {}
+            for _, r in raw.iterrows():
+                item = str(r.get("item", "")).strip()
+                if item:
+                    kv[item] = r.get("value")
+            result.update({
+                "name": str(kv.get("股票简称", "") or ""),
+                "industry": str(kv.get("行业", "") or ""),
+                "total_cap": _parse_cap_local(kv.get("总市值")),
+                "float_cap": _parse_cap_local(kv.get("流通市值")),
+                "listed_date": str(kv.get("上市时间", "") or ""),
+                "_source": "东方财富",
+            })
+            return result
+    except Exception as e:
+        em_err = str(e)
+
+    # 2) 备用源 A：百度估值 → 总市值（返回已是「亿」）
+    try:
+        import akshare as ak
+        b = ak.stock_zh_valuation_baidu(symbol=code, indicator="总市值", period="近一年")
+        if b is not None and len(b) > 0:
+            v = b["value"].iloc[-1]
+            if v is not None and v == v:
+                result["total_cap"] = _parse_cap_local(v)
+                result["_source"] = "百度(总市值)"
+    except Exception:
+        pass
+
+    # 3) 备用源 B：新浪日线 stock_zh_a_daily（非东方财富）
+    #    - 首行日期                              = 上市日期
+    #    - outstanding_share(流通股本) × 收盘价   = 流通市值
+    try:
+        import akshare as ak
+        h = ak.stock_zh_a_daily(symbol=_sina_symbol(code), start_date="19800101",
+                                end_date=datetime.now().strftime("%Y%m%d"), adjust="")
+        if h is not None and len(h) > 0:
+            result["listed_date"] = str(h["date"].iloc[0])[:10]
+            try:
+                _os = float(h["outstanding_share"].iloc[-1])
+                _cl = float(h["close"].iloc[-1])
+                if _os > 0 and _cl > 0:
+                    result["float_cap"] = round(_os * _cl / 1e8, 2)
+            except Exception:
+                pass
+            result["_source"] = (result["_source"] + "+新浪(上市日/流通市值)").lstrip("+")
+    except Exception:
+        pass
+
+    # 缺失字段标注（供 UI 低调提示，不再整块空白）
+    for k, label in (("industry", "行业"), ("float_cap", "流通市值"),
+                     ("total_cap", "总市值"), ("listed_date", "上市日期")):
+        if not result.get(k):
+            result["_missing"].append(label)
+
+    if result["total_cap"] or result["listed_date"]:
+        return result
+
+    result["_error"] = em_err or "东方财富返回空数据"
+    return result
 
 
 def clear_predictor_cache():
@@ -566,8 +738,8 @@ def render_market_ticker():
     """
     mk = st.session_state.get("_mk_overview")
     if mk is None:
-        # 首屏不阻塞：留一行轻量提示，用户按需加载
-        st.caption("📊 大盘行情：侧边栏「大盘速览」→ 点击加载（默认不自动请求，加快首屏）")
+        # 首屏不阻塞：只留一行极轻的提示（长句会变成噪音，压掉视觉重心）
+        st.caption("📊 大盘行情未加载 · 侧边栏「大盘速览」可加载")
         return
 
     idx: pd.DataFrame = mk.get("indices", pd.DataFrame())
@@ -606,22 +778,18 @@ def render_market_ticker():
         pct = float(it.涨跌幅)
         chg = float(it.涨跌额)
         price = float(it.最新价)
-        # A股习惯：红涨绿跌
+        # A股习惯：红涨绿跌（色带与文字同步，走 .mini-card 统一卡片观感）
         up_flag = pct >= 0
-        bg = "#fff1f2" if up_flag else "#ecfdf5"
-        bd = "#fecdd3" if up_flag else "#a7f3d0"
         clr = "#dc2626" if up_flag else "#059669"
         arrow = "▲" if up_flag else "▼"
         col.markdown(
-            f'<div style="text-align:center;padding:.55rem .3rem;border-radius:10px;'
-            f'background:{bg};border:1px solid {bd};min-width:0;">'
-            f'<div style="font-size:.78rem;color:#475569;font-weight:600;white-space:nowrap;'
-            f'overflow:hidden;text-overflow:ellipsis;">{it.名称}</div>'
-            f'<div style="font-size:1.15rem;font-weight:700;color:{clr};margin:.15rem 0;'
-            f'line-height:1.2;">{price:,.2f}</div>'
-            f'<div style="font-size:.82rem;font-weight:700;color:{clr};">'
+            f'<div class="mini-card {"up" if up_flag else "down"}" '
+            f'style="padding:.75rem .5rem;">'
+            f'<div class="label" style="text-transform:none;letter-spacing:0;">{it.名称}</div>'
+            f'<div class="val" style="color:{clr};">{price:,.2f}</div>'
+            f'<div class="sub" style="color:{clr};font-weight:700;">'
             f'{arrow} {pct:+.2f}%</div>'
-            f'<div style="font-size:.68rem;color:#94a3b8;">{chg:+.2f}</div>'
+            f'<div class="sub">{chg:+.2f}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -667,10 +835,9 @@ def render_market_ticker():
     with b2:
         # 之前 mood_clr 算好了却没传给任何组件，情绪一直是默认黑字
         st.markdown(
-            f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
-            f'padding:.55rem .7rem;">'
-            f'<div style="font-size:0.72rem;color:#64748b;margin-bottom:2px;">🌡️ 市场情绪</div>'
-            f'<div style="font-size:1.05rem;font-weight:700;color:{mood_clr};">{mood}</div>'
+            f'<div class="mini-card plain" style="padding:.7rem .8rem;">'
+            f'<div class="label" style="text-transform:none;letter-spacing:0;">🌡️ 市场情绪</div>'
+            f'<div class="val" style="color:{mood_clr};">{mood}</div>'
             f'</div>', unsafe_allow_html=True)
     b3.metric(
         "🚀 涨停 / 跌停",
@@ -690,6 +857,185 @@ def render_market_ticker():
     st.markdown('<div style="height:.4rem;"></div>', unsafe_allow_html=True)
 
 
+# ========== 今日状态条（纯本地文件，零联网） ==========
+#
+# 为什么要有这块：首屏的「大盘行情」「热点板块」为了性能都改成了手动加载，
+# 结果打开看板第一屏几乎没有数字，只有两行"请点击加载" —— 这是"简陋感"的
+# 主要来源之一。这里把本来就在磁盘上的运营快照（计划/账户/闭环心跳/预测/IC）
+# 直接摊在首屏：不联网、不触发数据源、毫秒级。
+#
+# 副产品（很重要）：把「交易闭环心跳」放到首屏最显眼处。
+# 2026-10-18 出过一整天的静默事故——run_loop 因 GBK 编码崩溃秒退，但心跳只是
+# "停在昨天"，页面上完全看不出来。现在停机会变成一条黄色警示条。
+
+_DATE_FMT = "%Y-%m-%d"
+
+
+def _status_read_json(path: Path):
+    """读 JSON，失败返回 None（首屏装饰性数据，绝不能因此抛异常）"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _today_status_data() -> dict:
+    """汇总首屏运营快照。全部读本地文件，TTL 60 秒。"""
+    root = Path(__file__).parent.parent.parent
+    out: dict = {"plan": None, "acct": None, "loop": None,
+                 "pred": None, "ic": None}
+
+    # --- 交易计划：取 plan_date 最大的一份（通常是"下一个交易日"） ---
+    try:
+        best, best_date = None, ""
+        files = sorted((root / "data" / "trade_plans").glob("trade_plan_*.json"))[-8:]
+        for f in files:
+            d = _status_read_json(f) or {}
+            dt = str(d.get("plan_date") or "")
+            if dt >= best_date:
+                best, best_date = d, dt
+        if best:
+            tg = best.get("targets") or []
+            out["plan"] = {
+                "date": best_date,
+                "n": len(tg),
+                "weight": sum(float(t.get("weight") or 0) for t in tg),
+                "pool": best.get("pool") or "",
+                "regime": best.get("regime") or "",
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- 纸账户 ---
+    acc = _status_read_json(root / "data" / "paper_account.json")
+    if isinstance(acc, dict):
+        try:
+            hold = acc.get("holdings") or {}
+            mv = sum(float(h.get("market_value") or 0) for h in hold.values())
+            cash = float(acc.get("cash") or 0)
+            init = float(acc.get("initial_cash") or 0) or (cash + mv)
+            out["acct"] = {
+                "equity": cash + mv,
+                "n_pos": len(hold),
+                "pnl": float(acc.get("today_pnl") or 0),
+                "ret": ((cash + mv) / init - 1.0) if init else 0.0,
+            }
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- 闭环心跳（停机在这里暴露） ---
+    hb = _status_read_json(root / "data" / "loop_heartbeat.json")
+    if isinstance(hb, dict):
+        try:
+            ts = datetime.fromisoformat(str(hb.get("ts")))
+            out["loop"] = {
+                "age_min": (datetime.now() - ts).total_seconds() / 60.0,
+                "state": hb.get("state") or "",
+                "mode": hb.get("guard_mode") or "",
+                "n_pos": hb.get("n_positions"),
+                "ts": str(hb.get("ts") or "").replace("T", " ")[:16],
+            }
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- 最近一次扫描批次 ---
+    recs = _status_read_json(root / "data" / "prediction_history.json")
+    if isinstance(recs, list) and recs:
+        try:
+            latest = max(recs, key=lambda r: str(r.get("scan_date") or ""))
+            out["pred"] = {"date": str(latest.get("scan_date") or ""),
+                           "n": int(latest.get("n_predictions") or 0)}
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- 滚动 IC ---
+    ic = _status_read_json(root / "data" / "rolling_ic_status.json")
+    if isinstance(ic, dict):
+        out["ic"] = {"mean_ic": ic.get("mean_ic"), "ir": ic.get("ir_mean_std"),
+                     "last": ic.get("last_date"), "n": ic.get("total")}
+
+    return out
+
+
+def _fmt_wan(v: float) -> str:
+    """元 → 万元（首屏空间有限）"""
+    return f"¥{v / 1e4:,.1f}万"
+
+
+def render_today_status() -> None:
+    """渲染首屏「今日状态」卡片行 + 闭环停机警示"""
+    d = _today_status_data()
+    cards: list = []
+    stale_min = None
+
+    if d.get("plan"):
+        p = d["plan"]
+        cards.append({
+            "label": "📅 交易计划",
+            "value": p["date"][5:] if p["date"] else "—",
+            "sub": f"{p['n']} 只 · 目标仓位 {p['weight'] * 100:.0f}%"
+                   + (f" · {p['pool']}" if p["pool"] else ""),
+            "tone": "plain",
+        })
+
+    if d.get("acct"):
+        a = d["acct"]
+        cards.append({
+            "label": "💰 纸账户权益",
+            "value": _fmt_wan(a["equity"]),
+            "sub": f"持仓 {a['n_pos']} 只 · 累计 {a['ret'] * 100:+.2f}%",
+            "tone": "up" if a["ret"] >= 0 else "down",
+        })
+
+    if d.get("loop"):
+        lp = d["loop"]
+        stale_min = lp["age_min"]
+        # value 尽量短（定宽卡片单行显示）：明细放 sub
+        if stale_min <= 30:
+            val, tone = "运行中", "up"
+        elif stale_min <= 24 * 60:
+            val, tone = f"停 {stale_min / 60:.1f}h", "warn"
+        else:
+            val, tone = f"停 {stale_min / 60 / 24:.1f}天", "down"
+        cards.append({
+            "label": "🔁 交易闭环",
+            "value": val,
+            "sub": f"心跳 {str(lp.get('ts') or '')[5:]} · {lp['mode'] or '—'}",
+            "tone": tone,
+        })
+
+    if d.get("pred"):
+        pr = d["pred"]
+        cards.append({
+            "label": "🎯 最新预测",
+            "value": pr["date"][5:] if pr["date"] else "—",
+            "sub": f"{pr['n']} 只已入库",
+            "tone": "plain",
+        })
+
+    if d.get("ic") and d["ic"].get("mean_ic") is not None:
+        ic = d["ic"]
+        cards.append({
+            "label": "📈 滚动 IC",
+            "value": f"{float(ic['mean_ic']):.3f}",
+            "sub": f"IR {float(ic['ir'] or 0):.2f} · 截至 {str(ic['last'] or '')[5:]}",
+            "tone": "up" if float(ic["mean_ic"]) > 0 else "down",
+        })
+
+    if cards:
+        kpi_row(cards)
+
+    # 停机警示：把"静默失效"变成看得见的一行
+    if stale_min is not None and stale_min > 30:
+        st.markdown(
+            f'<div class="notice warn">⚠️ <b>交易闭环已停 {stale_min / 60:.1f} 小时</b>'
+            f'（最后心跳 {d["loop"].get("ts") or "—"}）—— 期间不会自动下单，'
+            f'请确认常驻进程（开机自启或手动 run_loop）是否在跑。</div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ========== 页面配置 ==========
 st.set_page_config(
     page_title="选股神 AI",
@@ -698,143 +1044,599 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ========== 全局样式 ==========
-st.markdown("""
+# ========== 全局样式（Design System v2） ==========
+# 设计原则：
+#   1) 一套色板/圆角/阴影/间距贯穿全部页面，杜绝各页自绘风格。
+#   2) 背景色/文字色尽量走 Streamlit 主题变量（--background-color / --text-color），
+#      这样用户把看板切到深色主题时卡片不会变成刺眼的白底黑字。
+#   3) 品牌色（紫）与涨跌色（红涨绿跌）**硬编码** —— 涨跌配色是 A 股铁律，
+#      绝不能跟主题走，也不能用 st.metric 默认的欧美配色。
+#   4) 类名全部向后兼容：.main-header / .sub-header / .section-title / .card-row /
+#      .mini-card / .tag / .chart-box / .text-sub / .red|.green|.amber|.purple|.gray
+#      均保留，老页面不改一行代码也能吃到新样式。
+_THEME_CSS = """
 <style>
-    /* ====== 纯色大标题（不用渐变偷懒，避免透明字） ====== */
-    .main-header {
-        font-size: 2.4rem;
-        font-weight: 800;
-        color: #5b21b6;
-        margin-bottom: 0.2rem;
-        letter-spacing: -0.02em;
-    }
-    .sub-header {
-        font-size: 1rem;
-        color: #6b7280;
-        margin-bottom: 1rem;
-    }
+/* ==================== 0. 设计令牌 ==================== */
+:root{
+    --brand:      #5b21b6;   /* 主品牌：深紫 */
+    --brand-2:    #7c3aed;
+    --brand-soft: #f5f3ff;
+    --brand-line: #ddd6fe;
 
-    /* ====== 节标题 ====== */
-    .section-title {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #1f2937;
-        margin: 1.2rem 0 0.5rem 0;
-        padding-bottom: 0.35rem;
-        border-bottom: 2px solid #e5e7eb;
-    }
+    --ink-1: var(--text-color, #0f172a);
+    --ink-2: #475569;
+    --ink-3: #64748b;
+    --ink-4: #94a3b8;
 
-    /* ====== 卡片组通用 ====== */
-    .card-row {
-        display: flex;
-        gap: 0.75rem;
-        flex-wrap: wrap;
-        margin: 0.8rem 0;
-    }
-    .mini-card {
-        flex: 1;
-        min-width: 120px;
-        background: #ffffff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 0.9rem 1rem;
-        text-align: center;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }
-    .mini-card .label {
-        font-size: 0.72rem;
-        font-weight: 500;
-        color: #9ca3af;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-    }
-    .mini-card .val {
-        font-size: 1.2rem;
-        font-weight: 700;
-        color: #1f2937;
-        margin-top: 0.2rem;
-    }
+    --surface:   var(--background-color, #ffffff);
+    --surface-2: var(--secondary-background-color, #f8fafc);
+    --line:      #e6e8f0;
+    --line-soft: #f1f3f8;
 
-    /* ====== 信号标签 ====== */
-    /* A 股习惯：看多=红、看空=绿。类名与 signal_tag() 输出保持一致。 */
-    .tag-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.4rem;
-        margin: 0.5rem 0;
-    }
-    .tag {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.3rem;
-        padding: 0.35rem 0.7rem;
-        border-radius: 18px;
-        font-size: 0.8rem;
-        font-weight: 500;
-        white-space: nowrap;
-    }
-    .tag.bullish { background: #fee2e2; border: 1px solid #fca5a5; color: #b91c1c; }
-    .tag.bearish { background: #d1fae5; border: 1px solid #6ee7b7; color: #047857; }
-    .tag.warn    { background: #fef3c7; border: 1px solid #fcd34d; color: #b45309; }
-    .tag.info    { background: #dbeafe; border: 1px solid #93c5fd; color: #1d4ed8; }
-    /* 兼容历史写法 bull/bear（语义同上） */
-    .tag.bull { background: #fee2e2; border: 1px solid #fca5a5; color: #b91c1c; }
-    .tag.bear { background: #d1fae5; border: 1px solid #6ee7b7; color: #047857; }
+    --up:   #dc2626;   /* A股：涨=红 */
+    --down: #059669;   /* A股：跌=绿 */
+    --warn: #d97706;
+    --info: #3b82f6;
 
-    /* ====== 侧边栏 ====== */
-    section[data-testid="stSidebar"] {
-        background: #f9fafb;
-    }
+    --r-lg: 18px;
+    --r-md: 14px;
+    --r-sm: 10px;
 
-    /* ====== 颜色快捷类 ====== */
-    .red   { color: #dc2626; font-weight: 600; }
-    .green { color: #059669; font-weight: 600; }
-    .amber { color: #d97706; font-weight: 600; }
-    .purple{ color: #7c3aed; font-weight: 600; }
-    .gray  { color: #6b7280; }
+    --sh-1: 0 1px 2px rgba(15,23,42,.05);
+    --sh-2: 0 4px 16px rgba(15,23,42,.07);
+    --sh-3: 0 10px 30px rgba(91,33,182,.14);
 
-    /* ====== 补充此前被引用但从未定义的类 ====== */
-    /* 代码里一直在用 .text-sub / .chart-box，但全局样式里没有它们，
-       等于 no-op，样式全靠同标签的 inline style 撑着。这里补齐。 */
-    .text-sub {
-        font-size: 0.78rem;
-        color: #64748b;
-        font-weight: 500;
-        line-height: 1.4;
-    }
-    .chart-box {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 0.9rem 1rem;
-        margin: 0.6rem 0;
-    }
-    .chart-box h3 {
-        font-size: 0.95rem;
-        font-weight: 600;
-        color: #1e293b;
-        margin: 0 0 0.5rem 0;
-    }
+    --font: "Inter", -apple-system, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+/* ==================== 1. 页面底色与字体 ==================== */
+html, body, [data-testid="stAppViewContainer"]{
+    font-family: var(--font);
+    -webkit-font-smoothing: antialiased;
+}
+[data-testid="stAppViewContainer"]{
+    /* 两团极淡的氛围光，纯装饰，不干扰任何内容可读性 */
+    background:
+        radial-gradient(900px 420px at 8% -8%,  rgba(124,58,237,.07), transparent 60%),
+        radial-gradient(760px 380px at 102% 4%, rgba(59,130,246,.06), transparent 62%),
+        var(--surface-2);
+}
+/* 顶栏：半透明毛玻璃，避免和氛围底色割裂 */
+header[data-testid="stHeader"]{
+    background: rgba(255,255,255,.72);
+    backdrop-filter: saturate(160%) blur(10px);
+    border-bottom: 1px solid var(--line-soft);
+}
+/* 隐藏 Streamlit 顶部那条默认彩色装饰线 */
+div[data-testid="stDecoration"]{ display:none; }
+/* 本地单机看板不需要 Deploy / "Made with Streamlit" 这些产品化尾巴 */
+[data-testid="stAppDeployButton"]{ display:none !important; }
+footer{ display:none !important; }
+
+/* 主内容区：限宽 + 收紧纵向间距
+   宽屏（≥1600px）下 Streamlit 默认铺满整屏，卡片会被拉成很长的横条，
+   内容又只有两行字 → 满屏留白，这就是"简陋感"的主要来源。 */
+div[data-testid="stMainBlockContainer"]{
+    max-width: 1360px;
+    margin: 0 auto;
+    /* ⚠️ 顶部必须给 Streamlit 固定顶栏留位（默认约 6rem）。
+       曾把它改成 1.1rem，结果 hero 被半透明顶栏压住、标题上半截被切 ——
+       页面一打开就是"坏的"。4rem 是实测能露出完整页头的最小安全值。 */
+    padding-top: 4rem;
+}
+div[data-testid="stVerticalBlock"]{ gap: .8rem; }
+/* ⚠️ 这里**刻意不做入场动画**：Streamlit 每次交互都会重跑脚本并重建容器，
+   任何 fade/slide 动画都会跟着重放一次 —— 看着像整页在闪。
+   动效只保留 :hover 过渡（见 .mini-card / 按钮），那些不会重放。 */
+/* 数字统一等宽，避免跳动 */
+body, div[data-testid="stMarkdownContainer"]{
+    font-variant-numeric: tabular-nums;
+}
+hr{ border:none; border-top:1px solid var(--line-soft); margin:1.1rem 0; }
+
+/* ==================== 2. 页头 Hero ==================== */
+.hero{
+    position:relative; display:flex; align-items:center; gap:.9rem;
+    flex-wrap:wrap;              /* 徽标多/窗口窄时换行，别溢出卡片 */
+    padding:.8rem 1.1rem; margin:.1rem 0 .95rem;
+    border-radius:var(--r-lg);
+    border:1px solid var(--brand-line);
+    background:linear-gradient(115deg,#f6f4ff 0%,#ffffff 46%,#f3f8ff 100%);
+    box-shadow:var(--sh-2);
+    overflow:hidden;
+}
+.hero::after{
+    content:""; position:absolute; right:-46px; top:-70px;
+    width:230px; height:230px; border-radius:50%;
+    background:radial-gradient(circle, rgba(124,58,237,.16), transparent 70%);
+}
+.hero-icon{
+    width:46px; height:46px; flex:0 0 46px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:1.5rem; border-radius:13px;
+    background:linear-gradient(135deg,var(--brand),var(--brand-2));
+    box-shadow:0 6px 16px rgba(91,33,182,.26);
+}
+.hero-text{ min-width:0; z-index:1; }
+.hero-title{
+    font-size:1.3rem; font-weight:800; color:#1e1b4b;
+    letter-spacing:-.02em; line-height:1.25;
+}
+.hero-sub{
+    font-size:.8rem; color:var(--ink-3); margin-top:.15rem; line-height:1.4;
+}
+.hero-badges{
+    margin-left:auto; display:flex; gap:.35rem; flex-wrap:wrap;
+    justify-content:flex-end; z-index:1;
+    max-width:100%;
+}
+/* 兼容仍用旧写法的页面 */
+.main-header{
+    font-size:1.5rem !important; font-weight:800; color:#1e1b4b;
+    margin:.1rem 0 .15rem; letter-spacing:-.02em;
+}
+.sub-header{ font-size:.85rem; color:var(--ink-3); margin-bottom:.9rem; }
+
+/* ==================== 3. 胶囊徽标 ==================== */
+.pill{
+    display:inline-flex; align-items:center; gap:.3rem;
+    padding:.3rem .68rem; border-radius:999px;
+    font-size:.74rem; font-weight:600; line-height:1.2;
+    border:1px solid; background:var(--surface);
+    white-space:nowrap;
+}
+.pill.violet{ color:var(--brand);   border-color:var(--brand-line); background:var(--brand-soft); }
+.pill.up    { color:#b91c1c;        border-color:#fecdd3;          background:#fff1f2; }
+.pill.down  { color:#047857;        border-color:#a7f3d0;          background:#ecfdf5; }
+.pill.gray  { color:var(--ink-2);   border-color:var(--line);       background:var(--surface-2); }
+.pill.warn  { color:#b45309;        border-color:#fcd34d;          background:#fffbeb; }
+.pill.info  { color:#1d4ed8;        border-color:#bfdbfe;          background:#eff6ff; }
+
+/* ==================== 4. 节标题 ==================== */
+.section-title{
+    position:relative;
+    font-size:1.02rem; font-weight:800; color:#1e293b;
+    margin:1.35rem 0 .7rem; padding:0 0 .5rem .8rem;
+    border-bottom:1px solid var(--line-soft);
+    letter-spacing:-.01em;
+}
+.section-title::before{
+    content:""; position:absolute; left:0; top:.12rem; bottom:.6rem;
+    width:4px; border-radius:4px;
+    background:linear-gradient(180deg,var(--brand),var(--brand-2));
+}
+
+/* ==================== 5. 卡片 ==================== */
+/* 卡片组：**定宽网格**，不是 flex 平分。
+   之前用 flex:1 让卡片平分整行，1680px 下每张 ~300px 宽、内容只有两行字，
+   一片空旷 —— 看着"简陋"的根源就在这。现在限制单卡 172~228px，左对齐铺开。 */
+.card-row{
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(172px, 228px));
+    gap:.7rem;
+    margin:.8rem 0;
+    justify-content:start;
+}
+.mini-card{
+    position:relative; min-width:0;
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:.9rem 1rem .85rem;
+    text-align:left; box-shadow:var(--sh-1); overflow:hidden;
+    transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+/* 左侧 3px 语义色条，比顶部色带更"仪表盘"，也不会和 hover 抬升打架 */
+.mini-card::before{
+    content:""; position:absolute; left:0; top:.85rem; bottom:.85rem; width:3px;
+    border-radius:0 3px 3px 0;
+    background:linear-gradient(180deg,var(--brand),var(--brand-2));
+}
+.mini-card:hover{
+    transform:translateY(-2px); box-shadow:var(--sh-2);
+    border-color:var(--brand-line);
+}
+.mini-card.up::before   { background:linear-gradient(180deg,#dc2626,#f87171); }
+.mini-card.down::before { background:linear-gradient(180deg,#059669,#34d399); }
+.mini-card.warn::before { background:linear-gradient(180deg,#d97706,#fbbf24); }
+.mini-card.plain::before{ background:var(--line); }
+.mini-card .label{
+    font-size:.75rem; font-weight:600; color:var(--ink-3);
+    letter-spacing:.02em;
+}
+.mini-card .val{
+    font-size:1.5rem; font-weight:800; color:var(--ink-1);
+    margin-top:.2rem; letter-spacing:-.03em; line-height:1.15;
+    /* 单行不折行：定宽卡片里长文本折成两行会撑高整排、破坏对齐 */
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.mini-card .sub{ font-size:.73rem; color:var(--ink-3); margin-top:.22rem; line-height:1.3; }
+
+/* 通用面板 */
+.panel{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:1rem 1.1rem;
+    box-shadow:var(--sh-1); margin:.6rem 0;
+}
+.panel-title{
+    font-size:.9rem; font-weight:700; color:#1e293b;
+    margin:0 0 .55rem; display:flex; align-items:center; gap:.4rem;
+}
+/* st.container(border=True) 生成的容器：套上同一套白卡样式，
+   避免"一行控件裸奔在灰底上"的半成品感 */
+div[data-testid="stVerticalBlockBorderWrapper"]:has(> div > div[data-testid="stVerticalBlock"]){
+    background:var(--surface);
+    border:1px solid var(--line) !important;
+    border-radius:var(--r-md);
+    box-shadow:var(--sh-1);
+    padding:.6rem .75rem;
+}
+/* 图表标题：只做标题，不再自己当白卡。
+   ⚠️ 历史写法是「st.markdown 开 <div class="chart-box"> + 后面 st.markdown 关 </div>」，
+   但两次 markdown 是两个独立 DOM 块，浏览器会把未闭合的 div 当场自动闭合 →
+   结果只包住了 <h3>，图本身落在盒子外面，变成「标题一张卡 + 图一张卡」的框中框。
+   真正的白卡由 stPlotlyChart 自己提供（见下方规则），这里只负责标题排版。 */
+.chart-box{
+    background:transparent; border:none; box-shadow:none;
+    border-radius:0; padding:0; margin:.9rem 0 .35rem;
+}
+.chart-box h3{
+    font-size:.92rem; font-weight:700; color:#1e293b;
+    margin:0; padding-left:.6rem; line-height:1.4;
+    border-left:3px solid var(--brand);
+}
+.text-sub{ font-size:.78rem; color:var(--ink-3); font-weight:500; line-height:1.45; }
+
+/* 状态提示条（比 st.warning 更贴版式，用在本地面板） */
+/* 用 block 而非 flex：flex 会把整段文字当一个可压缩的 flex item，
+   中文长句会被拆成"停 23.9 小 / 时"这种断行。 */
+.notice{
+    display:block;
+    padding:.62rem .9rem; margin:.45rem 0;
+    border-radius:var(--r-sm); border:1px solid;
+    font-size:.82rem; font-weight:500; line-height:1.55;
+    word-break:normal; overflow-wrap:anywhere;
+}
+.notice.warn{ background:#fffbeb; border-color:#fde68a; color:#92400e; }
+.notice.ok  { background:#ecfdf5; border-color:#a7f3d0; color:#065f46; }
+.notice.info{ background:var(--brand-soft); border-color:var(--brand-line); color:#4c1d95; }
+
+/* 空状态 */
+.empty{
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:.3rem; padding:1.1rem 1rem; text-align:center;
+    background:var(--surface-2); border:1px dashed var(--line);
+    border-radius:var(--r-md); color:var(--ink-3); font-size:.85rem;
+}
+.empty .empty-icon{ font-size:1.8rem; opacity:.85; }
+
+/* ==================== 6. 信号标签 ==================== */
+/* A 股习惯：看多=红、看空=绿。类名与 signal_tag() 输出保持一致。 */
+.tag-row{ display:flex; flex-wrap:wrap; gap:.4rem; margin:.5rem 0; }
+.tag{
+    display:inline-flex; align-items:center; gap:.3rem;
+    padding:.34rem .72rem; border-radius:999px;
+    font-size:.78rem; font-weight:600; white-space:nowrap;
+    box-shadow:var(--sh-1);
+}
+.tag.bullish{ background:#fff1f2; border:1px solid #fecdd3; color:#b91c1c; }
+.tag.bearish{ background:#ecfdf5; border:1px solid #a7f3d0; color:#047857; }
+.tag.warn   { background:#fffbeb; border:1px solid #fcd34d; color:#b45309; }
+.tag.info   { background:#eff6ff; border:1px solid #bfdbfe; color:#1d4ed8; }
+/* 兼容历史写法 bull/bear（语义同上） */
+.tag.bull{ background:#fff1f2; border:1px solid #fecdd3; color:#b91c1c; }
+.tag.bear{ background:#ecfdf5; border:1px solid #a7f3d0; color:#047857; }
+
+/* ==================== 6.5 个股分析仪表盘组件 ==================== */
+/* 标的头：名称/代码 + 行业徽标 + 现价涨跌，一整条横向信息带，
+   取代原来那行「名称 (代码) · 收盘 xx +0.12」的裸 section-title。 */
+.stock-head{
+    display:flex; align-items:center; gap:.75rem; flex-wrap:wrap;
+    background:linear-gradient(135deg,#faf5ff 0%,#f5f3ff 55%,#ffffff 100%);
+    border:1px solid var(--brand-line);
+    border-radius:var(--r-md); padding:.8rem 1.05rem; margin:.2rem 0 .7rem;
+    box-shadow:var(--sh-1);
+}
+.stock-head .sh-main{ min-width:0; }
+.stock-head .sh-name{
+    font-size:1.12rem; font-weight:800; color:var(--ink-1);
+    letter-spacing:-.02em; line-height:1.25; white-space:nowrap;
+}
+.stock-head .sh-code{
+    font-size:.73rem; color:var(--ink-3); margin-top:1px;
+    font-variant-numeric:tabular-nums; white-space:nowrap;
+}
+.stock-head .sh-quote{
+    margin-left:auto; display:flex; align-items:baseline; gap:.55rem;
+    white-space:nowrap;
+}
+.stock-head .sh-price{
+    font-size:1.5rem; font-weight:800; letter-spacing:-.03em;
+    font-variant-numeric:tabular-nums;
+}
+.stock-head .sh-chg{ font-size:.85rem; font-weight:700; font-variant-numeric:tabular-nums; }
+
+/* 评分面板：环形分 + 三条概率条 */
+.score{ display:flex; align-items:center; gap:1.05rem; margin:.15rem 0 .1rem; }
+.ring{
+    --p:50; --c:var(--brand);
+    position:relative; flex:0 0 96px; width:96px; height:96px; border-radius:50%;
+    background:conic-gradient(var(--c) calc(var(--p) * 1%), #eaedf3 0);
+    display:grid; place-items:center;
+}
+.ring::before{
+    content:""; position:absolute; inset:8px; border-radius:50%;
+    background:var(--surface);
+}
+.ring-in{ position:relative; text-align:center; line-height:1; }
+.ring .num{
+    display:block; font-size:1.65rem; font-weight:800;
+    letter-spacing:-.04em; color:var(--c); font-variant-numeric:tabular-nums;
+}
+.ring .cap{ display:block; font-size:.62rem; color:var(--ink-3); margin-top:3px; }
+.bars{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:.42rem; }
+.bar .bar-head{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:.74rem; color:var(--ink-2); margin-bottom:3px;
+}
+.bar .bar-track{ height:7px; border-radius:999px; background:#eaedf3; overflow:hidden; }
+.bar .bar-fill{ height:100%; border-radius:999px; transition:width .4s ease; }
+.score-foot{
+    font-size:.74rem; color:var(--ink-3); margin-top:.55rem;
+    padding-top:.5rem; border-top:1px dashed var(--line);
+    overflow-wrap:anywhere;
+}
+
+/* 紧凑 KV 小格网格：基本面/风险指标都用它，取代一行行裸文本。
+   最小宽 96px 是实测值：左列（st.columns 半分 + panel 内边距）约 535px，
+   用 112px 只会排 4 列，5 个指标被挤成 4+1；96px 正好排到 5 列排满一行。 */
+.kv{ display:grid; grid-template-columns:repeat(auto-fill, minmax(96px, 1fr)); gap:.42rem .5rem; }
+.kv-i{
+    background:var(--surface-2); border:1px solid var(--line);
+    border-radius:var(--r-sm); padding:.42rem .55rem; min-width:0;
+}
+.kv-i .k{ font-size:.67rem; color:var(--ink-3); white-space:nowrap; }
+.kv-i .v{
+    font-size:.9rem; font-weight:700; color:var(--ink-1); margin-top:1px;
+    font-variant-numeric:tabular-nums; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis;
+}
+
+/* 交易建议：纵向行块，比横排 5 个等宽格更好扫 */
+.trade-list{ display:flex; flex-direction:column; gap:.32rem; }
+.trade-row{
+    display:flex; justify-content:space-between; align-items:baseline;
+    padding:.4rem .62rem; border-radius:8px; background:var(--surface-2);
+    font-size:.8rem;
+}
+.trade-row .k{ color:var(--ink-3); white-space:nowrap; }
+.trade-row .v{ font-weight:700; color:var(--ink-1); font-variant-numeric:tabular-nums; text-align:right; }
+
+/* 紧凑小表：多周期统计 / 相对强弱。同行横向比较靠它，比铺 20 张卡片清楚得多 */
+.mini-table{ width:100%; border-collapse:collapse; font-size:.79rem; }
+.mini-table th{
+    text-align:right; font-weight:600; color:var(--ink-3);
+    font-size:.68rem; padding:.3rem .5rem; border-bottom:1px solid var(--line);
+    white-space:nowrap;
+}
+.mini-table th:first-child, .mini-table td:first-child{ text-align:left; }
+.mini-table td{
+    text-align:right; padding:.4rem .5rem; border-bottom:1px dashed #eef1f6;
+    font-variant-numeric:tabular-nums; color:var(--ink-1); white-space:nowrap;
+}
+.mini-table tbody tr:last-child td{ border-bottom:none; }
+.mini-table tbody tr:hover td{ background:#fafaff; }
+
+/* ==================== 7. 按钮 ==================== */
+button[data-testid="stBaseButton-primary"],
+button[kind="primary"]{
+    background:linear-gradient(135deg,var(--brand),var(--brand-2)) !important;
+    border:none !important; border-radius:var(--r-sm) !important;
+    color:#fff !important; font-weight:600 !important;
+    box-shadow:0 4px 14px rgba(91,33,182,.28);
+    transition:transform .16s ease, box-shadow .16s ease, filter .16s ease;
+}
+button[data-testid="stBaseButton-primary"]:hover,
+button[kind="primary"]:hover{
+    transform:translateY(-1px); filter:brightness(1.06);
+    box-shadow:0 8px 20px rgba(91,33,182,.34);
+}
+button[data-testid="stBaseButton-secondary"],
+button[kind="secondary"]{
+    background:var(--surface) !important;
+    border:1px solid var(--line) !important;
+    border-radius:var(--r-sm) !important;
+    color:var(--ink-2) !important; font-weight:500 !important;
+    box-shadow:var(--sh-1);
+    transition:transform .16s ease, border-color .16s ease, color .16s ease;
+}
+button[data-testid="stBaseButton-secondary"]:hover,
+button[kind="secondary"]:hover{
+    transform:translateY(-1px);
+    border-color:var(--brand-line) !important;
+    color:var(--brand) !important;
+    background:var(--brand-soft) !important;
+}
+
+/* ==================== 8. 页签 / 指标 / 表格 ==================== */
+div[data-testid="stTabs"] button[data-testid="stTab"]{
+    border-radius:var(--r-sm) var(--r-sm) 0 0;
+    padding:.5rem .9rem; font-weight:600; color:var(--ink-3);
+    transition:color .15s ease, background .15s ease;
+}
+div[data-testid="stTabs"] button[data-testid="stTab"]:hover{ color:var(--brand); background:var(--brand-soft); }
+div[data-testid="stTabs"] button[data-testid="stTab"][aria-selected="true"]{ color:var(--brand); }
+div[data-testid="stTabs"] div[data-baseweb="tab-highlight"],
+div[data-testid="stTabs"] div[role="tablist"] div[aria-hidden="true"]{
+    background-color:var(--brand) !important;
+}
+
+div[data-testid="stMetric"]{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:.7rem .9rem; box-shadow:var(--sh-1);
+}
+div[data-testid="stMetric"] label{
+    font-size:.75rem !important; color:var(--ink-3) !important; font-weight:600;
+}
+div[data-testid="stMetric"] div[data-testid="stMetricValue"]{
+    font-size:1.22rem !important; font-weight:800 !important; color:var(--ink-1);
+    letter-spacing:-.02em;
+}
+
+div[data-testid="stDataFrame"], div[data-testid="stTable"]{
+    border:1px solid var(--line); border-radius:var(--r-md);
+    overflow:hidden; box-shadow:var(--sh-1); background:var(--surface);
+}
+table{ border-collapse:separate; border-spacing:0; }
+table thead th{
+    background:var(--brand-soft) !important; color:#4c1d95 !important;
+    font-weight:700 !important; font-size:.78rem !important;
+    border-bottom:1px solid var(--brand-line) !important;
+}
+table tbody tr:nth-child(even){ background:var(--surface-2); }
+table tbody tr:hover{ background:var(--brand-soft); }
+
+/* 图表容器统一"白卡"化：只留一层圆角+边框，不加内边距
+   （plotly 自己已有边距，再加 padding 会出现"框中框"） */
+div[data-testid="stPlotlyChart"], .stPlotlyChart{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:0; box-shadow:var(--sh-1);
+    overflow:hidden;
+}
+
+/* 提示条：圆角 + 柔和 */
+div[data-testid="stAlert"]{
+    border-radius:var(--r-sm); border:1px solid rgba(15,23,42,.06);
+    box-shadow:var(--sh-1); font-size:.86rem;
+}
+div[data-testid="stExpander"]{
+    border:1px solid var(--line) !important; border-radius:var(--r-md) !important;
+    background:var(--surface); box-shadow:var(--sh-1); overflow:hidden;
+}
+
+/* 表单控件强调色 */
+input[type="radio"], input[type="checkbox"]{ accent-color:var(--brand); }
+div[data-baseweb="select"] > div{ border-radius:var(--r-sm) !important; }
+
+/* ==================== 9. 侧边栏 ==================== */
+section[data-testid="stSidebar"]{
+    background:linear-gradient(180deg,#ffffff 0%,#fbfaff 55%,#f6f4ff 100%);
+    border-right:1px solid var(--line);
+}
+section[data-testid="stSidebar"] > div{ padding-top:.9rem; }
+.brand{
+    display:flex; align-items:center; gap:.7rem;
+    padding:.85rem .95rem; border-radius:var(--r-md);
+    background:linear-gradient(135deg,#5b21b6,#7c3aed);
+    box-shadow:0 8px 22px rgba(91,33,182,.26);
+    margin-bottom:.35rem;
+}
+.brand-logo{
+    width:40px; height:40px; flex:0 0 40px; border-radius:12px;
+    display:flex; align-items:center; justify-content:center; font-size:1.35rem;
+    background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.3);
+}
+.brand-name{ color:#fff; font-size:1.08rem; font-weight:800; letter-spacing:-.01em; line-height:1.15; }
+.brand-tag{ color:rgba(255,255,255,.78); font-size:.7rem; font-weight:500; margin-top:2px; }
+.nav-hint{
+    font-size:.68rem; font-weight:700; letter-spacing:.12em;
+    color:var(--ink-4); text-transform:uppercase; margin:.85rem 0 .35rem .2rem;
+}
+/* Streamlit 即便 label_visibility="collapsed" 仍会把「导航」渲染成可见文本，
+   跟下面自绘的 .nav-hint 重复成两个"导航" —— 这里直接隐掉控件自带 label。
+   （实测 DOM：label[data-testid="stWidgetLabel"] > span > p） */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] > label[data-testid="stWidgetLabel"]{
+    display:none !important;
+}
+/* 导航项：只命中真正的选项 label（data-baseweb="radio"），
+   否则上面的控件 label 也会被当导航项排版。 */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"]{
+    position:relative;
+    display:flex; align-items:center; gap:.5rem;
+    padding:.5rem .7rem; margin:2px 0; border-radius:var(--r-sm);
+    border:1px solid transparent; cursor:pointer;
+    font-size:.88rem; color:var(--ink-2); font-weight:500;
+    transition:background .15s ease, color .15s ease, border-color .15s ease;
+}
+/* 隐掉原生圆点：一列大圆圈很像老式表单，选中态改用底色+左侧色条表达 */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"] > div:first-child{
+    display:none;
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"]:hover{
+    background:var(--brand-soft); border-color:var(--brand-line); color:var(--brand);
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked){
+    background:linear-gradient(90deg,#f2eeff,#ffffff 92%);
+    border-color:var(--brand-line); color:var(--brand); font-weight:700;
+    box-shadow:var(--sh-1);
+}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked)::before{
+    content:""; position:absolute; left:0; top:.35rem; bottom:.35rem; width:3px;
+    border-radius:0 3px 3px 0;
+    background:linear-gradient(180deg,var(--brand),var(--brand-2));
+}
+/* 选项文字统一行高，避免 emoji 撑高 */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"] p{
+    margin:0; line-height:1.4;
+}
+.side-card{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:.65rem .8rem; box-shadow:var(--sh-1);
+    margin:.5rem 0;
+}
+.side-row{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:.5rem; font-size:.78rem; padding:2px 0; color:var(--ink-2);
+}
+.side-foot{
+    font-size:.68rem; color:var(--ink-4); text-align:center;
+    padding:.5rem 0 .2rem; line-height:1.5;
+}
+
+/* ==================== 10. 滚动条 ==================== */
+::-webkit-scrollbar{ width:10px; height:10px; }
+::-webkit-scrollbar-track{ background:transparent; }
+::-webkit-scrollbar-thumb{
+    background:#cbd5e1; border-radius:8px;
+    border:2px solid transparent; background-clip:padding-box;
+}
+::-webkit-scrollbar-thumb:hover{ background:#94a3b8; background-clip:padding-box; }
+
+/* ==================== 11. 颜色快捷类 ==================== */
+.red   { color:#dc2626; font-weight:600; }
+.green { color:#059669; font-weight:600; }
+.amber { color:#d97706; font-weight:600; }
+.purple{ color:#7c3aed; font-weight:600; }
+.gray  { color:#6b7280; }
+.mono  { font-variant-numeric: tabular-nums; }
 </style>
-""", unsafe_allow_html=True)
+"""
+
+st.markdown(_THEME_CSS, unsafe_allow_html=True)
 
 # ========== 侧边栏 ==========
 with st.sidebar:
-    st.markdown("""
-    <div style="display:flex; align-items:center; gap:10px; margin-bottom:0.5rem;">
-        <span style="font-size:2.2rem;">📈</span>
-        <span style="font-size:1.3rem; font-weight:700; color:#1e293b;">选股神 AI</span>
+    # 预测口径 / 调度开关：在侧边栏里算一次，全局所有页面（含页头徽标）复用。
+    # 必须**如实反映运行配置**，不写死"集成"，否则又是"开关开着其实没生效"那类静默失效。
+    _ens = bool(getattr(getattr(app_config, "ml", None), "use_ensemble", False))
+    _sched_on = bool(getattr(getattr(app_config, "scheduler", None), "enabled", False))
+    _engine_tag = "XGBoost + Alpha + LSTM 超级集成" if _ens else "XGBoost 单模型引擎"
+
+    st.markdown(f"""
+    <div class="brand">
+        <div class="brand-logo">📈</div>
+        <div>
+            <div class="brand-name">选股神 AI</div>
+            <div class="brand-tag">{_engine_tag}</div>
+        </div>
     </div>
-    <p style="color:#94a3b8; font-size:0.78rem; margin-top:-0.3rem;">XGBoost 单模型引擎</p>
     """, unsafe_allow_html=True)
-    st.markdown("---")
 
     if "page" not in st.session_state:
         st.session_state.page = "🏠 概览"
 
     page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📐 量化模型", "📈 模型稳定性", "⚙️ 设置"]
 
+    st.markdown('<div class="nav-hint">导航</div>', unsafe_allow_html=True)
     page = st.radio(
         "导航",
         page_options,
@@ -849,14 +1651,20 @@ with st.sidebar:
     # 短路而无开销。详见模块级 _ensure_scheduler_running()。
     _ensure_scheduler_running()
 
-    st.markdown("---")
     ready = predictor.is_ready
     s_cls = "green" if ready else "red"
     dot_clr = "#10b981" if ready else "#ef4444"
     st.markdown(f"""
-    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
-        <span style="width:8px; height:8px; border-radius:50%; background:{dot_clr}; display:inline-block;"></span>
-        <span style="font-size:0.82rem; color:#64748b;">模型: <b class="{s_cls}">{'就绪' if ready else '未训练'}</b></span>
+    <div class="side-card">
+        <div class="side-row">
+            <span style="display:flex;align-items:center;gap:6px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:{dot_clr};display:inline-block;"></span>
+                模型引擎
+            </span>
+            <b class="{s_cls}">{'就绪' if ready else '未训练'}</b>
+        </div>
+        <div class="side-row"><span>⚡ 预测口径</span>
+            <b>{'超级集成' if _ens else '单模型 XGBoost'}</b></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -909,44 +1717,38 @@ with st.sidebar:
                 st.session_state.pop("_mk_overview", None)
                 st.rerun()
 
-    st.caption(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.markdown(
+        f'<div class="side-foot">⏰ {datetime.now().strftime("%Y-%m-%d %H:%M")}'
+        f'<br>选股神 AI · v2 界面</div>',
+        unsafe_allow_html=True,
+    )
 
 # ========== 🏠 概览页 ==========
 if page == "🏠 概览":
-    st.markdown('<p class="main-header">📈 选股神 AI Dashboard</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">AI驱动的A股智能选股系统 — XGBoost 单模型</p>', unsafe_allow_html=True)
+    # 徽标如实反映运行时状态（不做假：未就绪就显示未就绪）
+    _pool_n = len(_cached_stock_list())
+    render_hero(
+        "选股神 AI 决策看板",
+        "AI 驱动的 A 股智能选股系统 — 选股 · 计划 · 交易 · 进化 全链路闭环",
+        icon="📈",
+        badges=[
+            ("violet", f"股票池 {_pool_n}"),
+            # 状态徽标用中性紫/灰，不用红绿 —— 红色 pill 在 A 股语境里容易被读成"涨/看多"
+            ("violet" if predictor.is_ready else "gray",
+             "模型就绪" if predictor.is_ready else "模型未训练"),
+            ("violet", "超级集成" if _ens else "单模型"),
+            ("info" if _sched_on else "gray", "调度启用" if _sched_on else "调度停用"),
+        ],
+    )
+
+    # ===== 今日状态（本地实数据：计划/账户/闭环心跳/预测/IC）=====
+    # 这里刻意取代了原来那排"股票池/模型状态/预测口径/决策树/调度"静态卡：
+    # 那些信息在页头徽标里已经有了，重复占一屏只会稀释重点；
+    # 换成真实运营数字后，首屏才有"仪表盘"的密度。
+    render_today_status()
 
     # ===== 大盘实时涨跌（主界面顶部）=====
     render_market_ticker()
-
-    # KPI卡片
-    st.markdown("""
-    <div class="card-row">
-        <div class="mini-card">
-            <div class="label">📊 股票池</div>
-            <div class="val">{pool} 只</div>
-        </div>
-        <div class="mini-card">
-            <div class="label">🧠 模型状态</div>
-            <div class="val">{ready_txt}</div>
-        </div>
-        <div class="mini-card">
-            <div class="label">⚡ 预测引擎</div>
-            <div class="val">XGBoost</div>
-        </div>
-        <div class="mini-card">
-            <div class="label">🎯 决策树数量</div>
-            <div class="val">{trees}</div>
-        </div>
-    </div>
-    """.format(
-        pool=len(_cached_stock_list()),
-        ready_txt="✅ 就绪" if predictor.is_ready else "❌ 未训练",
-        # 注意：这里必须用内部字段 _xgb_model，不能用 xgb_model property ——
-        # property 会触发 _ensure_loaded()，等于首屏就把模型反序列化一遍
-        # （涉及 xgboost / sklearn 等重库，耗时明显）。未加载时显示 "—" 即可。
-        trees=predictor._xgb_model.n_estimators if predictor._xgb_model else "—",
-    ), unsafe_allow_html=True)
 
     # 市场热点
     st.markdown('<div class="section-title">🔥 市场热点板块</div>', unsafe_allow_html=True)
@@ -954,7 +1756,17 @@ if page == "🏠 概览":
     # 性能关键：热点板块同样要联网（含 akshare 导入 ~1.9s）。
     # 首屏先不拉，给一个加载按钮；点过一次后结果缓存在 session_state。
     if st.session_state.get("_hotspots") is None:
-        st.caption("点击加载市场热点板块（默认不自动请求，加快首屏）")
+        # 空状态也要"有内容"：说清楚为什么空、点了会发生什么，
+        # 而不是甩一行灰字 caption（那正是"简陋"的来源）。
+        st.markdown(
+            '<div class="empty">'
+            '<div class="empty-icon">🔥</div>'
+            '<div>板块行情需要联网拉取（首次约 2 秒），默认不自动加载以免拖慢首屏</div>'
+            '<div style="font-size:.75rem;color:#94a3b8;">'
+            '加载一次后本会话内复用缓存，不会重复请求</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         if st.button("🔥 加载市场热点", key="hotspots_load_btn"):
             with st.spinner("获取板块行情…"):
                 try:
@@ -1091,32 +1903,54 @@ if page == "🏠 概览":
     st.markdown("---")
     st.markdown('<div class="section-title">🚀 快速开始</div>', unsafe_allow_html=True)
 
+    # 三张同规格白卡：之前是「一张 HTML 卡 + 两个裸按钮」，高度参差、看着散。
+    _ready = predictor.is_ready
     q1, q2, q3 = st.columns(3)
     with q1:
-        st.markdown('<div class="text-sub" style="text-align:center; margin-bottom:4px;">① 模型就绪</div>', unsafe_allow_html=True)
-        ready = predictor.is_ready
-        st.markdown(f'''<div style="text-align:center; font-size:2rem; margin-bottom:4px;">{'✅' if ready else '⚠️'}</div>''', unsafe_allow_html=True)
-        st.markdown(f'<div class="{'green' if ready else 'red'}" style="text-align:center; font-size:0.8rem;">{'已训练，可直接预测' if ready else '需要先训练'}</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="panel-title">🧠 模型状态</div>'
+                f'<div class="text-sub" style="margin-bottom:.5rem;">'
+                f'{"已训练，可直接预测" if _ready else "尚未训练，需先训练模型"}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="pill {"violet" if _ready else "warn"}" '
+                f'style="width:100%;justify-content:center;padding:.45rem .6rem;">'
+                f'{"✅ 就绪" if _ready else "⚠️ 未就绪"}</div>',
+                unsafe_allow_html=True,
+            )
 
     with q2:
-        if st.button("🤖 AI 选股", type="primary", use_container_width=True, key="quick_pick"):
-            st.session_state.page = "🔍 AI选股"
-            st.session_state.auto_scan = True
-            del st.session_state._nav_radio  # 清 radio 缓存，下次用 index
-            st.rerun()
-        st.markdown('<div class="text-sub" style="text-align:center; cursor:pointer;">获取智能推荐</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown('<div class="panel-title">🤖 AI 选股</div>', unsafe_allow_html=True)
+            st.markdown('<div class="text-sub" style="margin-bottom:.5rem;">'
+                        '全市场扫描，按阈值筛出候选池</div>', unsafe_allow_html=True)
+            if st.button("开始选股", type="primary", use_container_width=True, key="quick_pick"):
+                st.session_state.page = "🔍 AI选股"
+                st.session_state.auto_scan = True
+                del st.session_state._nav_radio  # 清 radio 缓存，下次用 index
+                st.rerun()
 
     with q3:
-        if st.button("📊 个股分析", use_container_width=True, key="quick_analyze"):
-            st.session_state.page = "📊 个股分析"
-            st.session_state.auto_analyze_code = "000001"
-            del st.session_state._nav_radio  # 清 radio 缓存，下次用 index
-            st.rerun()
-        st.markdown('<div class="text-sub" style="text-align:center; cursor:pointer;">深度研判走势</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown('<div class="panel-title">📊 个股分析</div>', unsafe_allow_html=True)
+            st.markdown('<div class="text-sub" style="margin-bottom:.5rem;">'
+                        'K 线 · 技术指标 · 集成分与建议</div>', unsafe_allow_html=True)
+            if st.button("开始分析", use_container_width=True, key="quick_analyze"):
+                st.session_state.page = "📊 个股分析"
+                st.session_state.auto_analyze_code = "000001"
+                del st.session_state._nav_radio  # 清 radio 缓存，下次用 index
+                st.rerun()
 
 # ========== 🔍 AI选股页 ==========
 elif page == "🔍 AI选股":
-    st.markdown('<p class="main-header">🤖 AI 智能选股</p>', unsafe_allow_html=True)
+    render_hero(
+        "AI 智能选股",
+        "全市场扫描 → 多因子打分 → 按阈值筛出候选池，口径与个股分析页一致",
+        icon="🤖",
+        badges=[("violet", "超级集成" if _ens else "单模型")],
+    )
 
     # 快速开始：首页按钮触发的自动扫描
     auto_scan = st.session_state.pop("auto_scan", False)
@@ -1519,21 +2353,36 @@ elif page == "🔍 AI选股":
 
 # ========== 📊 个股分析页 ==========
 elif page == "📊 个股分析":
-    st.markdown('<p class="main-header">📊 个股深度分析</p>', unsafe_allow_html=True)
+    render_hero(
+        "个股深度分析",
+        "K 线 · 技术指标 · 基本面 · AI 评分一屏看全，评分口径与选股页一致",
+        icon="📊",
+        badges=[("violet", "超级集成" if _ens else "单模型")],
+    )
 
     # 快开始：首页按钮触发的自动分析
     auto_analyze_code = st.session_state.pop("auto_analyze_code", None)
 
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-    with col1:
-        stock_code = st.text_input("股票代码", value=auto_analyze_code if auto_analyze_code else "000001", key="input_stock_code", placeholder="6位代码")
-    with col2:
-        days = st.slider("回看天数", 60, 500, 250, 30)
-    with col3:
-        use_fund = st.checkbox("基本面", value=True, help="加载PE/PB/ROE等财务数据")
-    with col4:
-        st.markdown("<br>", unsafe_allow_html=True)
-        analyze_btn = st.button("🔍 开始分析", type="primary", use_container_width=True) or auto_analyze_code
+    # 参数行收进白卡：之前四个控件直接浮在灰底上，松散得像半成品
+    with st.container(border=True):
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        with col1:
+            stock_code = st.text_input("股票代码", value=auto_analyze_code if auto_analyze_code else "000001", key="input_stock_code", placeholder="6位代码")
+        with col2:
+            days = st.slider("回看天数", 60, 500, 250, 30)
+        with col3:
+            use_fund = st.checkbox("基本面", value=True, help="加载PE/PB/ROE等财务数据")
+        with col4:
+            st.markdown("<br>", unsafe_allow_html=True)
+            analyze_btn = st.button("🔍 开始分析", type="primary", use_container_width=True) or auto_analyze_code
+
+    # 未分析时给一个有内容的空状态，而不是留半屏白 —— 空白是最"简陋"的观感来源
+    if not analyze_btn:
+        empty_block(
+            "输入 6 位代码，点「开始分析」",
+            icon="📊",
+            hint="会拉取日线行情 + 基本面，并给出超级集成分、交易建议与相对强弱",
+        )
 
     if analyze_btn:
         with st.spinner(f"正在深度分析 {stock_code}…"):
@@ -1549,111 +2398,315 @@ elif page == "📊 个股分析":
             prev_close = float(close.iloc[-2])
             returns = close.pct_change().dropna()
 
-            # 股票信息
+            def _err_box(_title: str, _err, _keep: int = 80) -> str:
+                """把网络异常压成一行提示条。
+
+                直接 f-string 塞 requests 的原始异常会渲染成一个十几行的巨型红黄块
+                （含整条 URL 编码串），把整页视觉都压垮了；这里只留最有辨识度的
+                前半段，剩下的让人自己去看日志。
+                """
+                _t = re.sub(r"\s+", " ", str(_err)).strip()
+                for _a, _b in (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;")):
+                    _t = _t.replace(_a, _b)
+                if len(_t) > _keep:
+                    _t = _t[:_keep] + "…"
+                return (f'<div class="notice warn">⚠️ <b>{_title}</b><br>'
+                        f'<span style="font-weight:400;">{_t}</span><br>'
+                        '<span style="font-weight:400;">不影响行情与 AI 评分；'
+                        '行业/市值等字段暂缺。</span></div>')
+
+            # 股票信息：静态列表（code→name 兜底） + 东方财富实时基本信息（行业/市值/上市日）
             stock_info = None
+            base = {"name": stock_code, "industry": "", "total_cap": 0.0,
+                    "float_cap": 0.0, "listed_date": ""}
             try:
                 slist = _cached_stock_list()
                 stock_info = slist[slist["code"] == stock_code]
-                stock_name = stock_info["name"].iloc[0] if len(stock_info) > 0 else stock_code
+                if len(stock_info) > 0:
+                    _r = stock_info.iloc[0]
+                    base["name"] = str(_r.get("name", stock_code) or stock_code)
+                    base["industry"] = str(_r.get("industry", "") or "")
+                    base["total_cap"] = float(_r.get("total_cap") or 0)
+                    base["float_cap"] = float(_r.get("float_cap") or 0)
+                    base["listed_date"] = str(_r.get("listed_date", "") or "")
             except Exception:
-                stock_name = stock_code
+                pass
+            # 叠加东方财富实时基本信息（更全：行业/总市值/流通市值/上市日期）
+            try:
+                _ri = _cached_stock_info(stock_code)
+                if _ri and "_error" not in _ri:
+                    if _ri.get("name"):
+                        base["name"] = _ri["name"]
+                    if _ri.get("industry"):
+                        base["industry"] = _ri["industry"]
+                    if _ri.get("total_cap"):
+                        base["total_cap"] = _ri["total_cap"]
+                    if _ri.get("float_cap"):
+                        base["float_cap"] = _ri["float_cap"]
+                    if _ri.get("listed_date"):
+                        base["listed_date"] = _ri["listed_date"]
+                    # 东方财富不可达但备用源补齐了部分字段 → 低调标注，不再整块空白
+                    if _ri.get("_missing"):
+                        st.caption(
+                            f"ℹ️ 东方财富接口不可达，已用备用源（{_ri.get('_source') or '备用'}）"
+                            f"补齐；{('、'.join(_ri['_missing']))} 暂缺"
+                        )
+                elif _ri and "_error" in _ri:
+                    st.markdown(_err_box("个股基本信息获取失败（东方财富接口受限）", _ri["_error"]),
+                                unsafe_allow_html=True)
+            except Exception as _e:
+                st.markdown(_err_box("个股基本信息获取异常", _e), unsafe_allow_html=True)
+            stock_name = base["name"]
 
-            st.markdown(f'<div class="section-title">{stock_name} ({stock_code}) · 收盘 {last_close:.2f} <span class="{("red" if last_close >= prev_close else "green")}">{(last_close-prev_close):+.2f}</span></div>', unsafe_allow_html=True)
+            # ====== 页面级小工具（评分环 / 概率条 / KV 网格）======
+            def _ana_bar(_label: str, _pct: float, _color: str) -> str:
+                _w = max(0.0, min(100.0, float(_pct)))
+                return (
+                    '<div class="bar">'
+                    f'<div class="bar-head"><span>{_label}</span>'
+                    f'<b style="color:{_color};">{_w:.1f}%</b></div>'
+                    f'<div class="bar-track"><div class="bar-fill" '
+                    f'style="width:{_w:.1f}%;background:{_color};"></div></div>'
+                    '</div>'
+                )
 
-            # ====== Row 1: AI 预测 + 基本面 ======
-            ai_col, fund_col = st.columns([3, 2])
+            def _ana_kv(_items) -> str:
+                """(标签, 数值, 颜色) 列表 → 定宽小格网格，取代一行行裸文本。"""
+                _cells = ""
+                for _l, _v, _c in _items:
+                    _st = f' style="color:{_c};"' if _c else ""
+                    _cells += (
+                        '<div class="kv-i">'
+                        f'<div class="k">{_l}</div>'
+                        f'<div class="v"{_st}>{_v}</div>'
+                        '</div>'
+                    )
+                return f'<div class="kv">{_cells}</div>'
 
-            with ai_col:
-                if predictor.is_ready:
+            def _ret_n(_s: pd.Series, _n: int) -> float:
+                """近 N 个交易日涨跌幅（不足 N 根时退化为全区间）。"""
+                if len(_s) < 2:
+                    return 0.0
+                if len(_s) <= _n:
+                    return float(_s.iloc[-1] / _s.iloc[0] - 1) * 100
+                return float(_s.iloc[-1] / _s.iloc[-1 - _n] - 1) * 100
+
+            # ====== ① 标的头：名称 / 代码 / 行业 / 现价 / 涨跌 ======
+            _chg = last_close - prev_close
+            _chg_pct = (last_close / prev_close - 1) * 100 if prev_close else 0.0
+            _cls_chg = "red" if _chg > 0 else ("green" if _chg < 0 else "gray")
+            _ind_txt = (base.get("industry") or "").strip()
+            _ind_html = (
+                f'<span class="pill gray">{_ind_txt[:8]}</span>'
+                if _ind_txt and _ind_txt not in ("未知", "—") else ""
+            )
+            st.markdown(
+                '<div class="stock-head">'
+                '<div class="sh-main">'
+                f'<div class="sh-name">{stock_name}</div>'
+                f'<div class="sh-code">{stock_code} · 共 {len(df)} 根日线 · 图形近 180 日</div>'
+                '</div>'
+                f'{_ind_html}'
+                '<div class="sh-quote">'
+                f'<span class="sh-price {_cls_chg}">{last_close:.2f}</span>'
+                f'<span class="sh-chg {_cls_chg}">{_chg:+.2f} ({_chg_pct:+.2f}%)</span>'
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ====== ② 多周期 KPI 条 ======
+            # 技术指标先算一遍：KPI 条要量比，右侧技术信号要 BOLL/KDJ。
+            boll_mid, boll_upper, boll_lower = calc_boll(close)
+            k, d, j = calc_kdj(df_plot)
+            vol_ma5 = df_plot["volume"].rolling(5).mean()
+            vol_ratio = float(df_plot["volume"].iloc[-1] / (vol_ma5.iloc[-1] + 1e-10))
+            # 用 st.columns(5) 而不是 kpi_row 的 auto-fill 网格：网格按最小宽度 172px
+            # 会排到 6 列，5 张卡只填 5 列、右侧留一整列空白，看着像没对齐。
+            _kpi_items = [
+                (f"{'📈' if _chg_pct > 0 else ('📉' if _chg_pct < 0 else '➡️')} 今日",
+                 f"{_chg_pct:+.2f}%", _chg_pct,
+                 f"{_chg:+.2f} 元"),
+            ]
+            for _lb, _vv in [("近 5 日", _ret_n(close, 5)),
+                             ("近 20 日", _ret_n(close, 20)),
+                             ("近 60 日", _ret_n(close, 60))]:
+                _kpi_items.append(
+                    (f"🗓️ {_lb}", f"{_vv:+.2f}%", _vv,
+                     "短线动能" if _lb == "近 5 日" else ("月度趋势" if _lb == "近 20 日" else "季度趋势"))
+                )
+            _kpi_items.append(
+                ("🔥 量比", f"{vol_ratio:.2f}x", None,
+                 "放量" if vol_ratio > 1.5 else ("缩量" if vol_ratio < 0.7 else "量能正常"))
+            )
+            _kpi_cols = st.columns(len(_kpi_items))
+            for _i, (_lb, _val, _sig, _sub) in enumerate(_kpi_items):
+                with _kpi_cols[_i]:
+                    st.markdown(html_metric(_lb, _val, _sig, _sub), unsafe_allow_html=True)
+
+            # ====== ③ 计算 AI 预测与交易建议（只算不画，供下面两列共用）======
+            pred = None
+            score = 0.0
+            s_cls = "gray"
+            _mode = "single"
+            _det = {}
+            th_red, th_amber, th_caution, th_bear = 55.0, 49.0, 51.0, 45.0
+            action, action_cls = "⚪ 观望为主", ""
+            entry_range, stop_loss, target, rr_txt = "—", "—", "—", "—"
+            agree_str = "➡️ 模型观望"
+            if predictor.is_ready:
+                # 显式走超级集成，与「选股」批量打分口径一致（共用 blend_one）。
+                # 此前本页恒走单模型，而单模型实测 mean IC 0.0575 / t=1.40 统计不显著。
+                try:
+                    pred = predictor.predict_single(df, stock_code, stock_name, apply_ensemble=True)
+                except TypeError:
+                    # 冻结包里的 predictor 可能是旧版，没有 apply_ensemble 参数 →
+                    # 退回老签名，绝不让页面崩。
                     pred = predictor.predict_single(df, stock_code, stock_name)
-                    score = pred.score
-                    # 分档按 2026-10-10 单模型化后实测分布（38~60，mean 47.3）校准；
-                    # 旧值 80/65 在新分布下恒为 green，高分股永远不高亮
-                    s_cls = "red" if score >= 55 else ("amber" if score >= 49 else "green")
-                    # 单模型化后 agreement 恒为 1.0，再显示「一致/分歧」没有信息量，
-                    # 改为展示 XGBoost 的方向信号
-                    agree_str = "📈 模型看多" if pred.xgb_signal == 1 else ("📉 模型看空" if pred.xgb_signal == -1 else "➡️ 模型观望")
-                    xgb_sig = "📈 买入" if pred.xgb_signal == 1 else ("📉 卖出" if pred.xgb_signal == -1 else "➡️ 持有")
+                score = pred.score
+                # 标注本次评分**实际**走的口径，避免把不显著的单模型分当成集成分来下单
+                _mode = getattr(pred, "model_mode", "single")
+                _det = getattr(pred, "ensemble_detail", {}) or {}
+                # ===== 分档阈值：必须按「实际口径」分别校准，绝不能混用 =====
+                # · 单模型（2026-10-10 实测 38~60，mean 47.3）→ 红55 / 黄49 / 谨慎51 / 看空45
+                # · 集成分（2026-10-18 实测，scripts/calibrate_ensemble_thresholds.py，
+                #   228 只样本且 228/228 全部融合成功）
+                #   min 35.2 / p25 44.4 / median 46.5 / p75 49.7 / p90 51.9 / max 58.4
+                #   → 红51(约前 11%) / 黄47(约前 42%) / 谨慎48 / 看空43(约后 15%)
+                # ⚠️ 千万别拿 prediction_history.json 校准：它只记「上榜票」
+                # （先按 min_score=50 过滤再取 TOP-N），是**截断样本**，分布虚高到 55~88。
+                if _mode == "ensemble":
+                    th_red, th_amber, th_caution, th_bear = 51.0, 47.0, 48.0, 43.0
+                else:
+                    th_red, th_amber, th_caution, th_bear = 55.0, 49.0, 51.0, 45.0
+                s_cls = "red" if score >= th_red else ("amber" if score >= th_amber else "green")
+                agree_str = ("📈 模型看多" if pred.xgb_signal == 1
+                             else ("📉 模型看空" if pred.xgb_signal == -1 else "➡️ 模型观望"))
 
-                    # 交易建议（单模型：仅依据 XGBoost 信号）
-                    if score >= 55 and pred.xgb_signal == 1:
-                        action = "🟢 强烈看多"
-                        action_cls = "red"
-                        entry_range = f"{last_close*0.98:.2f}~{last_close:.2f}"
-                        stop_loss = f"{last_close*0.93:.2f}"
-                        target = f"{last_close*1.08:.2f} ({last_close*1.15:.2f})"
-                    elif score >= 51 and pred.xgb_signal == 1:
-                        action = "🟡 谨慎看多"
-                        action_cls = "amber"
-                        entry_range = f"{last_close*0.97:.2f}~{last_close:.2f}"
-                        stop_loss = f"{last_close*0.94:.2f}"
-                        target = f"{last_close*1.06:.2f}"
-                    elif score < 45 and pred.xgb_signal == -1:
-                        action = "🔴 明确看空"
-                        action_cls = "green"
-                        entry_range = "—"
-                        stop_loss = "—"
-                        target = "—"
-                    else:
-                        action = "⚪ 观望为主"
-                        action_cls = ""
-                        entry_range = "—"
-                        stop_loss = "—"
-                        target = "—"
+                # 交易建议：方向取 XGBoost 主腿，档位阈值随当前口径切换。
+                # 风报比改成按入场/止损/目标真实算出，不再写死 1:2/1:1.5（
+                # 那两个分支要求 score>=60/70，实际分布 43~58 永远命中不到，恒显示「—」）。
+                if score >= th_red and pred.xgb_signal == 1:
+                    action, action_cls = "🟢 强烈看多", "red"
+                    _lo, _hi, _sl, _tp = last_close * 0.98, last_close, last_close * 0.93, last_close * 1.08
+                    _tp2 = last_close * 1.15
+                elif score >= th_caution and pred.xgb_signal == 1:
+                    action, action_cls = "🟡 谨慎看多", "amber"
+                    _lo, _hi, _sl, _tp = last_close * 0.97, last_close, last_close * 0.94, last_close * 1.06
+                    _tp2 = None
+                elif score < th_bear and pred.xgb_signal == -1:
+                    action, action_cls = "🔴 明确看空", "green"
+                    _lo = _hi = _sl = _tp = None
+                    _tp2 = None
+                else:
+                    action, action_cls = "⚪ 观望为主", ""
+                    _lo = _hi = _sl = _tp = None
+                    _tp2 = None
 
-                    st.markdown(f"""
-                    <div class="card-row">
-                        <div class="mini-card" style="background:#f5f3ff;border-color:#ddd6fe;">
-                            <div class="label">🤖 AI评分</div>
-                            <div class="val {s_cls}">{score:.0f}</div>
-                            <div style="font-size:0.65rem;color:#94a3b8;">{agree_str}</div>
-                        </div>
-                        <div class="mini-card" style="background:#fef2f2;border-color:#fecaca;">
-                            <div class="label">📈 上涨概率</div>
-                            <div class="val red">{pred.prob_up*100:.1f}%</div>
-                        </div>
-                        <div class="mini-card" style="background:#fffbeb;border-color:#fde68a;">
-                            <div class="label">➡️ 震荡概率</div>
-                            <div class="val amber">{pred.prob_neutral*100:.1f}%</div>
-                        </div>
-                        <div class="mini-card" style="background:#ecfdf5;border-color:#a7f3d0;">
-                            <div class="label">📉 下跌概率</div>
-                            <div class="val green">{pred.prob_down*100:.1f}%</div>
-                        </div>
-                        <div class="mini-card">
-                            <div class="label">🔮 模型信号</div>
-                            <div class="val" style="font-size:0.8rem;line-height:1.5;">
-                                确信度: {pred.confidence*100:.0f}%<br>波动率: {pred.volatility*100:.1f}%
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                if _lo is not None:
+                    entry_range = f"{_lo:.2f} ~ {_hi:.2f}"
+                    stop_loss = f"{_sl:.2f}"
+                    target = f"{_tp:.2f}" + (f" / {_tp2:.2f}" if _tp2 else "")
+                    _risk = last_close - _sl
+                    rr_txt = f"1 : {(_tp - last_close) / _risk:.1f}" if _risk > 1e-9 else "—"
 
-                    # 交易建议卡
-                    st.markdown(f"""
-                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 16px;margin-bottom:10px;">
-                        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;">
-                            <div style="min-width:100px;"><span style="font-size:0.7rem;color:#64748b;">交易建议</span><br><b class="{action_cls}" style="font-size:1.1rem;">{action}</b></div>
-                            <div style="min-width:100px;"><span style="font-size:0.7rem;color:#64748b;">建议入场</span><br><b style="color:#1e293b;">{entry_range}</b></div>
-                            <div style="min-width:100px;"><span style="font-size:0.7rem;color:#64748b;">止损位</span><br><b style="color:#ef4444;">{stop_loss}</b></div>
-                            <div style="min-width:100px;"><span style="font-size:0.7rem;color:#64748b;">目标位</span><br><b style="color:#059669;">{target}</b></div>
-                            <div style="min-width:80px;"><span style="font-size:0.7rem;color:#64748b;">风险收益比</span><br><b style="color:#1e293b;">{('1:2' if score>=70 else ('1:1.5' if score>=60 else '—'))}</b></div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+            # ====== ④ 双列：AI 评分 / 交易建议 ======
+            _c1, _c2 = st.columns([3, 2])
 
-            # 基本面
-            with fund_col:
-                st.markdown('<div style="font-weight:600;color:#475569;font-size:0.85rem;margin-bottom:6px;">📋 基本面概况</div>', unsafe_allow_html=True)
+            with _c1:
+                if pred is not None:
+                    _ring_p = max(0.0, min(100.0, float(score)))
+                    _ring_c = {"red": "#dc2626", "amber": "#d97706",
+                               "green": "#059669"}.get(s_cls, "#5b21b6")
+                    _level = ("强多头" if score >= th_red else ("偏多" if score >= th_amber
+                              else ("中性偏弱" if score >= th_bear else "偏空")))
+                    _legs = " + ".join((_det.get("scores") or {}).keys()) or "XGBoost"
+                    _spread = float(_det.get("spread", 0.0) or 0.0)
+                    _meta = (f'分歧度 {_spread:.1f}｜确信度 {pred.confidence*100:.0f}%'
+                             f'｜波动率 {pred.volatility*100:.1f}%') if _mode == "ensemble" else \
+                            (f'确信度 {pred.confidence*100:.0f}%｜波动率 {pred.volatility*100:.1f}%')
+                    _src = ("🧩 超级集成" if _mode == "ensemble" else "⚠️ 单模型 XGBoost")
+                    st.markdown(
+                        '<div class="panel"><div class="panel-title">🤖 AI 评分 · '
+                        f'{_src}<span class="text-sub" style="font-weight:500;margin-left:.3rem;">'
+                        f'（{_legs}）</span></div>'
+                        '<div class="score">'
+                        f'<div class="ring" style="--p:{_ring_p:.1f};--c:{_ring_c};">'
+                        f'<div class="ring-in"><span class="num">{score:.0f}</span>'
+                        f'<span class="cap">{_level}</span></div></div>'
+                        '<div class="bars">'
+                        + _ana_bar("📈 上涨概率", pred.prob_up * 100, "#dc2626")
+                        + _ana_bar("➡️ 震荡概率", pred.prob_neutral * 100, "#d97706")
+                        + _ana_bar("📉 下跌概率", pred.prob_down * 100, "#059669")
+                        + '</div></div>'
+                        f'<div class="score-foot">{agree_str} · {_meta}</div>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(panel(
+                        "🤖 AI 评分",
+                        '<div class="text-sub">模型未就绪，本页仅展示行情与技术面。'
+                        '到「⚙️ 设置」页检查模型文件后即可获得评分。</div>',
+                        icon="",
+                    ), unsafe_allow_html=True)
+
+            with _c2:
+                if pred is not None:
+                    _rows = [
+                        ("交易建议", f'<b class="{action_cls}">{action}</b>'),
+                        ("建议入场", f'<b>{entry_range}</b>'),
+                        ("止损位", f'<b class="green">{stop_loss}</b>'),
+                        ("目标位", f'<b class="red">{target}</b>'),
+                        ("风险收益比", f'<b>{rr_txt}</b>'),
+                    ]
+                    _body = '<div class="trade-list">' + "".join(
+                        f'<div class="trade-row"><span class="k">{_k}</span>'
+                        f'<span class="v">{_v}</span></div>' for _k, _v in _rows
+                    ) + '</div>'
+                    if pred.reasons:
+                        _body += ('<div class="tag-row" style="margin-top:.6rem;">'
+                                  '<span class="text-sub" style="margin-right:.2rem;">研判</span>'
+                                  + "".join(f'<span class="tag info">{_r}</span>'
+                                            for _r in pred.reasons[:4])
+                                  + '</div>')
+                    st.markdown(panel("🎯 交易建议", _body),
+                                unsafe_allow_html=True)
+                    st.markdown(
+                        '<div class="notice info" style="margin-top:-.2rem;">'
+                        '⚠️ 建议价由当日收盘价按档位比例推算，非盯盘实时价；'
+                        '实盘前请到「量化自动交易」页走风控闸门。</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(panel(
+                        "🎯 交易建议",
+                        '<div class="text-sub">无模型评分，不给入场/止损建议。'
+                        '技术面信号见右下方。</div>',
+                    ), unsafe_allow_html=True)
+
+            # ====== ⑤ 双列：基本面 / 技术信号 ======
+            _d1, _d2 = st.columns([1, 1])
+
+            with _d1:
+                # 基本面：改为小格网格（原来一行行「标签 …… 数值」，十条下来极像半成品）
                 fund_items = []
-                if stock_info is not None and len(stock_info) > 0:
-                    info = stock_info.iloc[0]
+                if base:
+                    _ind = base.get("industry", "") or "—"
+                    _ind = "—" if _ind in ("未知", "", "—") else _ind[:8]
+                    _tc = base.get("total_cap") or 0.0
+                    _fc = base.get("float_cap") or 0.0
+                    _ld = base.get("listed_date", "") or "—"
                     fund_items.extend([
-                        ("行业", info.get("industry", "—")[:8], "purple"),
-                        ("总市值", f"{info.get('total_cap',0):.0f}亿", ""),
-                        ("流通市值", f"{info.get('float_cap',0):.0f}亿", ""),
-                        ("上市日期", str(info.get("listed_date","—"))[:10], ""),
+                        ("行业", _ind, "#7c3aed"),
+                        ("总市值", f"{_tc:.0f} 亿" if _tc else "—", ""),
+                        ("流通市值", f"{_fc:.0f} 亿" if _fc else "—", ""),
+                        ("上市日期", str(_ld)[:10], ""),
+                        # 行情起点是本地一定能算出来的事实 —— 补齐第 5 格，
+                        # 否则离线时 4 格 + 1 空位，网格看着像塌了一角。
+                        ("数据起点", str(df["date"].iloc[0])[:10] if "date" in df.columns else "—", ""),
                     ])
+                fin = None
                 try:
                     fin = fetcher.get_financial_indicators(stock_code)
                     if fin is not None and len(fin) > 0:
@@ -1668,9 +2721,9 @@ elif page == "📊 个股分析":
                             val = latest.get(key)
                             if val is not None and val == val:
                                 if key == "roe":
-                                    c = "red" if val > 15 else ("amber" if val > 8 else "green")
+                                    c = "#dc2626" if val > 15 else ("#d97706" if val > 8 else "#059669")
                                 elif key == "profit_growth":
-                                    c = "red" if val > 20 else ("amber" if val > 0 else "green")
+                                    c = "#dc2626" if val > 20 else ("#d97706" if val > 0 else "#059669")
                                 else:
                                     c = ""
                                 fund_items.append((label, f"{val:{fmt}}{unit}", c))
@@ -1680,266 +2733,580 @@ elif page == "📊 个股分析":
                 # 行业热度
                 try:
                     sectors = _cached_hotspots()
-                    if stock_info is not None and len(stock_info) > 0:
-                        ind = stock_info.iloc[0].get("industry", "")
-                        if ind:
-                            match = sectors[sectors["板块"].str.contains(ind[:2], na=False)]
-                            if len(match) > 0:
-                                s = match.iloc[0]
-                                spct = s["涨跌幅"]
-                                fund_items.append(("板块涨跌", f"{spct:+.2f}%", "red" if spct>0 else "green"))
+                    ind = base.get("industry", "")
+                    if ind and ind != "未知":
+                        match = sectors[sectors["板块"].str.contains(ind[:2], na=False)]
+                        if len(match) > 0:
+                            s = match.iloc[0]
+                            spct = s["涨跌幅"]
+                            fund_items.append(("板块涨跌", f"{spct:+.2f}%",
+                                               "#dc2626" if spct > 0 else "#059669"))
                 except Exception:
                     pass
 
-                for label, val, cls in fund_items:
-                    c_style = f"color:#ef4444" if cls == "red" else (f"color:#059669" if cls == "green" else (f"color:#8b5cf6" if cls == "purple" else "color:#1e293b"))
-                    st.markdown(f'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #f1f5f9;font-size:0.8rem;"><span style="color:#64748b;">{label}</span><span style="{c_style};font-weight:600;">{val}</span></div>', unsafe_allow_html=True)
+                _miss = sum(1 for _, _v, _ in fund_items if _v == "—")
+                _hint = (f'<div class="text-sub" style="margin-top:.45rem;">'
+                         f'⚠️ {_miss} 项缺失：本地无离线缓存，联网后重新分析可补齐</div>'
+                         if _miss else "")
+                st.markdown(panel("📋 基本面概况", _ana_kv(fund_items) + _hint),
+                            unsafe_allow_html=True)
 
-            # ====== K线 + 支撑压力 ======
-            st.markdown('<div class="chart-box"><h3>📈 K线图 · 布林带 · 支撑压力位</h3>', unsafe_allow_html=True)
+            with _d2:
+                st.markdown(
+                    '<div class="panel"><div class="panel-title">🧠 技术信号 · K线形态</div>',
+                    unsafe_allow_html=True,
+                )
+                ma5_now = float(close.rolling(5).mean().iloc[-1])
+                ma20_now = float(close.rolling(20).mean().iloc[-1])
+                ma60_now = float(close.rolling(60).mean().iloc[-1])
+                rsi14_now = float(calc_rsi(close).iloc[-1])
+                k_now, d_now, j_now = float(k.iloc[-1]), float(d.iloc[-1]), float(j.iloc[-1])
+                boll_pos = float((last_close - boll_lower.iloc[-1]) / (boll_upper.iloc[-1] - boll_lower.iloc[-1] + 1e-10))
+                vol_ratio = float(df_plot["volume"].iloc[-1] / (vol_ma5.iloc[-1] + 1e-10))
 
-            # 计算支撑压力
-            hl20 = df_plot.iloc[-20:]
-            support1 = float(hl20["low"].min())
-            resistance1 = float(hl20["high"].max())
-            hl60 = df.iloc[-60:]
-            support2 = float(hl60["low"].min())
-            resistance2 = float(hl60["high"].max())
-            pivot = (hl20["high"].max() + hl20["low"].min() + hl20["close"].iloc[-1]) / 3
+                # K线形态识别
+                latest = df_plot.iloc[-1]
+                prev1 = df_plot.iloc[-2]
+                o, c, h, l = float(latest["open"]), float(latest["close"]), float(latest["high"]), float(latest["low"])
+                o2, c2, h2, l2 = float(prev1["open"]), float(prev1["close"]), float(prev1["high"]), float(prev1["low"])
+                body = abs(c - o)
+                upper_shadow = h - max(c, o)
+                lower_shadow = min(c, o) - l
+                total_range = h - l
+                body_ratio = body / (total_range + 1e-10)
 
-            fig1 = go.Figure()
-            fig1.add_trace(go.Candlestick(
-                x=df_plot["date"], open=df_plot["open"], high=df_plot["high"],
-                low=df_plot["low"], close=df_plot["close"],
-                name="K线", increasing_line_color="#ef4444", decreasing_line_color="#10b981",
-                increasing_fillcolor="#ef4444", decreasing_fillcolor="#10b981"
-            ))
-            for p, color in [(5, "#3b82f6"), (20, "#f59e0b"), (60, "#8b5cf6")]:
-                ma = close.rolling(p).mean()
-                fig1.add_trace(go.Scatter(x=df_plot["date"], y=ma, name=f"MA{p}",
-                                          line=dict(color=color, width=1.5)))
-            boll_mid, boll_upper, boll_lower = calc_boll(close)
-            boll_fill = pd.DataFrame({
-                "x": list(df_plot["date"]) + list(df_plot["date"])[::-1],
-                "y": list(boll_upper.iloc[-180:]) + list(boll_lower.iloc[-180:])[::-1]
-            })
-            fig1.add_trace(go.Scatter(x=boll_fill["x"], y=boll_fill["y"], fill="toself",
-                                      fillcolor="rgba(100,116,139,0.08)", line=dict(width=0),
-                                      name="BOLL通道", showlegend=True))
+                candle_patterns = []
+                # 十字星
+                if body_ratio < 0.1 and total_range > body * 3:
+                    candle_patterns.append(("info", "✝️ 十字星", "多空平衡，即将变盘"))
+                # 锤子线
+                if body_ratio < 0.35 and lower_shadow > body * 2 and upper_shadow < body * 0.5:
+                    candle_patterns.append(("bullish", "🔨 锤子线", "底部反转信号"))
+                # 倒锤子
+                if body_ratio < 0.35 and upper_shadow > body * 2 and lower_shadow < body * 0.5:
+                    candle_patterns.append(("warn", "🔃 倒锤子", "顶部反转警示"))
+                # 吞没形态
+                if c > o > 0 and c2 < o2:  # 阳包阴
+                    if c > o2 and o < c2:
+                        candle_patterns.append(("bullish", "📈 看涨吞没", "阳线吞没前阴线"))
+                elif c < o < 0 and c2 > o2:  # 阴包阳
+                    if c < o2 and o > c2:
+                        candle_patterns.append(("bearish", "📉 看跌吞没", "阴线吞没前阳线"))
+                # 三连阳/三连阴
+                if len(df_plot) >= 4:
+                    if all(df_plot["close"].iloc[-3:].values > df_plot["open"].iloc[-3:].values):
+                        candle_patterns.append(("bullish", "🔥 三连阳", "强势上攻"))
+                    elif all(df_plot["close"].iloc[-3:].values < df_plot["open"].iloc[-3:].values):
+                        candle_patterns.append(("bearish", "💧 三连阴", "持续走弱"))
 
-            # 支撑压力线
-            for val, label, color in [
-                (support1, f"支撑1(20日低:{support1:.2f})", "#059669"),
-                (support2, f"支撑2(60日低:{support2:.2f})", "#047857"),
-                (resistance1, f"压力1(20日高:{resistance1:.2f})", "#ef4444"),
-                (resistance2, f"压力2(60日高:{resistance2:.2f})", "#b91c1c"),
-                (pivot, f"枢轴点({pivot:.2f})", "#8b5cf6"),
-            ]:
-                fig1.add_hline(y=val, line_dash="dash", line_color=color, opacity=0.5,
-                               annotation_text=label.split("(")[0], annotation_position="right")
+                signals = []
+                # 均线排列
+                if last_close > ma5_now > ma20_now > ma60_now:
+                    signals.append(("bullish", "📈 多头排列", "MA5>MA20>MA60 上升趋势"))
+                elif last_close < ma5_now < ma20_now < ma60_now:
+                    signals.append(("bearish", "📉 空头排列", "均线全面下行"))
+                else:
+                    signals.append(("warn", "⚠️ 均线交织", "方向不明"))
+                # MA金叉死叉
+                ma5_prev = float(close.rolling(5).mean().iloc[-2])
+                ma20_prev = float(close.rolling(20).mean().iloc[-2])
+                if ma5_now > ma20_now and ma5_prev <= ma20_prev:
+                    signals.append(("bullish", "🔺 MA金叉", "MA5上穿MA20"))
+                elif ma5_now < ma20_now and ma5_prev >= ma20_prev:
+                    signals.append(("bearish", "🔻 MA死叉", "MA5下穿MA20"))
+                # RSI
+                if rsi14_now > 70:
+                    signals.append(("warn", f"⚠️ RSI超买({rsi14_now:.0f})", "注意回调风险"))
+                elif rsi14_now < 30:
+                    signals.append(("bullish", f"💡 RSI超卖({rsi14_now:.0f})", "可能反弹"))
+                else:
+                    signals.append(("info", f"✅ RSI({rsi14_now:.0f})", "合理区间"))
+                # KDJ
+                if j_now < 0:
+                    signals.append(("bullish", "💡 KDJ极度超卖", f"J={j_now:.0f}"))
+                elif j_now > 100:
+                    signals.append(("warn", "⚠️ KDJ极度超买", f"J={j_now:.0f}"))
+                elif k_now > d_now:
+                    signals.append(("bullish", "🔺 KDJ金叉", f"K({k_now:.0f})>D({d_now:.0f})"))
+                else:
+                    signals.append(("bearish", "🔻 KDJ死叉", f"K({k_now:.0f})<D({d_now:.0f})"))
+                # BOLL
+                if boll_pos > 0.95:
+                    signals.append(("warn", "⚠️ 触及BOLL上轨", "强压力位"))
+                elif boll_pos < 0.05:
+                    signals.append(("bullish", "💡 触及BOLL下轨", "强支撑位"))
+                else:
+                    signals.append(("info", f"✅ BOLL({boll_pos*100:.0f}%)", "通道内运行"))
+                # 量能
+                if vol_ratio > 2:
+                    signals.append(("info", f"🔥 大幅放量({vol_ratio:.1f}x)", "资金活跃"))
+                elif vol_ratio < 0.5:
+                    signals.append(("warn", f"💤 极度缩量({vol_ratio:.1f}x)", "交投冷清"))
 
-            fig1.update_layout(height=500, template="plotly_white", hovermode="x unified",
-                               xaxis_rangeslider_visible=True, legend=dict(orientation="h", y=1.15),
-                               margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(fig1, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+                # 渲染 K线形态 + 技术信号
+                # ⚠️ 必须拼成一个 markdown 一次性输出：每个 st.markdown 都会生成独立的
+                # block 容器，逐个输出会让每颗 tag 各占一行，右侧一列变成竖排清单。
+                _tags_html = ""
+                if candle_patterns:
+                    _tags_html += ('<div class="tag-row">'
+                                   '<span class="text-sub" style="margin-right:.2rem;">🕯️ 形态</span>')
+                    for tag_cls, title, desc in candle_patterns:
+                        _tags_html += f'<span class="tag {tag_cls}"><b>{title}</b> {desc}</span>'
+                    _tags_html += '</div>'
+                _tags_html += ('<div class="tag-row">'
+                               '<span class="text-sub" style="margin-right:.2rem;">🧠 信号</span>')
+                for tag_cls, title, desc in signals:
+                    _tags_html += f'<span class="tag {tag_cls}"><b>{title}</b> {desc}</span>'
+                _tags_html += '</div>'
+                st.markdown(_tags_html, unsafe_allow_html=True)
 
-            # ====== 成交分布 + MACD ======
-            st.markdown('<div class="chart-box"><h3>📊 成交量 · MACD(12,26,9)</h3>', unsafe_allow_html=True)
-
-            fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                                 row_heights=[0.3, 0.7])
-            vol_colors = ["#ef4444" if c >= o else "#10b981" for c, o in zip(df_plot["close"], df_plot["open"])]
-            fig2.add_trace(go.Bar(x=df_plot["date"], y=df_plot["volume"], name="成交量",
-                                  marker_color=vol_colors, opacity=0.7), row=1, col=1)
-            vol_ma5 = df_plot["volume"].rolling(5).mean()
-            fig2.add_trace(go.Scatter(x=df_plot["date"], y=vol_ma5, name="量MA5",
-                                      line=dict(color="#f59e0b", width=1.5)), row=1, col=1)
-            vol_ma20 = df_plot["volume"].rolling(20).mean()
-            fig2.add_trace(go.Scatter(x=df_plot["date"], y=vol_ma20, name="量MA20",
-                                      line=dict(color="#94a3b8", width=1, dash="dot")), row=1, col=1)
-
-            dif, dea, macd_bar = calc_macd(close)
-            macd_colors = ["#ef4444" if v >= 0 else "#10b981" for v in macd_bar.iloc[-180:]]
-            fig2.add_trace(go.Scatter(x=df_plot["date"], y=dif.iloc[-180:], name="DIF",
-                                      line=dict(color="#ef4444", width=1.8)), row=2, col=1)
-            fig2.add_trace(go.Scatter(x=df_plot["date"], y=dea.iloc[-180:], name="DEA",
-                                      line=dict(color="#3b82f6", width=1.8)), row=2, col=1)
-            fig2.add_trace(go.Bar(x=df_plot["date"], y=macd_bar.iloc[-180:], name="柱",
-                                  marker_color=macd_colors, opacity=0.5), row=2, col=1)
-            fig2.add_hline(y=0, line_color="#94a3b8", line_width=0.5, row=2, col=1)
-            fig2.update_layout(height=400, template="plotly_white", hovermode="x unified",
-                               legend=dict(orientation="h", y=1.12),
-                               margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(fig2, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            # ====== RSI + KDJ ======
-            st.markdown('<div class="chart-box"><h3>🎯 RSI(6,14) + KDJ(9,3,3)</h3>', unsafe_allow_html=True)
-
-            fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                                 row_heights=[0.5, 0.5])
-            for p, color in [(6, "#ef4444"), (14, "#3b82f6")]:
-                rsi = calc_rsi(close, period=p)
-                fig3.add_trace(go.Scatter(x=df_plot["date"], y=rsi.iloc[-180:], name=f"RSI{p}",
-                                          line=dict(color=color, width=1.8)), row=1, col=1)
-            for y, lbl in [(70, "超买"), (50, "中轴"), (30, "超卖")]:
-                fig3.add_hline(y=y, line_dash="dash", line_color="#94a3b8", opacity=0.4,
-                               annotation_text=lbl, annotation_position="right", row=1, col=1)
-
-            k, d, j = calc_kdj(df_plot)
-            fig3.add_trace(go.Scatter(x=df_plot["date"], y=k.iloc[-180:], name="K",
-                                      line=dict(color="#ef4444", width=1.8)), row=2, col=1)
-            fig3.add_trace(go.Scatter(x=df_plot["date"], y=d.iloc[-180:], name="D",
-                                      line=dict(color="#3b82f6", width=1.8)), row=2, col=1)
-            fig3.add_trace(go.Scatter(x=df_plot["date"], y=j.iloc[-180:], name="J",
-                                      line=dict(color="#8b5cf6", width=1.2, dash="dot")), row=2, col=1)
-            for y, lbl in [(80, "超买"), (20, "超卖")]:
-                fig3.add_hline(y=y, line_dash="dash", line_color="#94a3b8", opacity=0.4,
-                               annotation_text=lbl, annotation_position="right", row=2, col=1)
-            fig3.update_layout(height=400, template="plotly_white", hovermode="x unified",
-                               legend=dict(orientation="h", y=1.12),
-                               margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(fig3, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            # ====== 技术信号 + K线形态 ======
-            st.markdown('<div class="section-title">🧠 技术信号 + K线形态</div>', unsafe_allow_html=True)
-
-            ma5_now = float(close.rolling(5).mean().iloc[-1])
-            ma20_now = float(close.rolling(20).mean().iloc[-1])
-            ma60_now = float(close.rolling(60).mean().iloc[-1])
-            rsi14_now = float(calc_rsi(close).iloc[-1])
-            k_now, d_now, j_now = float(k.iloc[-1]), float(d.iloc[-1]), float(j.iloc[-1])
-            boll_pos = float((last_close - boll_lower.iloc[-1]) / (boll_upper.iloc[-1] - boll_lower.iloc[-1] + 1e-10))
-            vol_ratio = float(df_plot["volume"].iloc[-1] / (vol_ma5.iloc[-1] + 1e-10))
-
-            # K线形态识别
-            latest = df_plot.iloc[-1]
-            prev1 = df_plot.iloc[-2]
-            o, c, h, l = float(latest["open"]), float(latest["close"]), float(latest["high"]), float(latest["low"])
-            o2, c2, h2, l2 = float(prev1["open"]), float(prev1["close"]), float(prev1["high"]), float(prev1["low"])
-            body = abs(c - o)
-            upper_shadow = h - max(c, o)
-            lower_shadow = min(c, o) - l
-            total_range = h - l
-            body_ratio = body / (total_range + 1e-10)
-
-            candle_patterns = []
-            # 十字星
-            if body_ratio < 0.1 and total_range > body * 3:
-                candle_patterns.append(("info", "✝️ 十字星", "多空平衡，即将变盘"))
-            # 锤子线
-            if body_ratio < 0.35 and lower_shadow > body * 2 and upper_shadow < body * 0.5:
-                candle_patterns.append(("bullish", "🔨 锤子线", "底部反转信号"))
-            # 倒锤子
-            if body_ratio < 0.35 and upper_shadow > body * 2 and lower_shadow < body * 0.5:
-                candle_patterns.append(("warn", "🔃 倒锤子", "顶部反转警示"))
-            # 吞没形态
-            if c > o > 0 and c2 < o2:  # 阳包阴
-                if c > o2 and o < c2:
-                    candle_patterns.append(("bullish", "📈 看涨吞没", "阳线吞没前阴线"))
-            elif c < o < 0 and c2 > o2:  # 阴包阳
-                if c < o2 and o > c2:
-                    candle_patterns.append(("bearish", "📉 看跌吞没", "阴线吞没前阳线"))
-            # 三连阳/三连阴
-            if len(df_plot) >= 4:
-                if all(df_plot["close"].iloc[-3:].values > df_plot["open"].iloc[-3:].values):
-                    candle_patterns.append(("bullish", "🔥 三连阳", "强势上攻"))
-                elif all(df_plot["close"].iloc[-3:].values < df_plot["open"].iloc[-3:].values):
-                    candle_patterns.append(("bearish", "💧 三连阴", "持续走弱"))
-
-            signals = []
-            # 均线排列
-            if last_close > ma5_now > ma20_now > ma60_now:
-                signals.append(("bullish", "📈 多头排列", "MA5>MA20>MA60 上升趋势"))
-            elif last_close < ma5_now < ma20_now < ma60_now:
-                signals.append(("bearish", "📉 空头排列", "均线全面下行"))
-            else:
-                signals.append(("warn", "⚠️ 均线交织", "方向不明"))
-            # MA金叉死叉
-            ma5_prev = float(close.rolling(5).mean().iloc[-2])
-            ma20_prev = float(close.rolling(20).mean().iloc[-2])
-            if ma5_now > ma20_now and ma5_prev <= ma20_prev:
-                signals.append(("bullish", "🔺 MA金叉", "MA5上穿MA20"))
-            elif ma5_now < ma20_now and ma5_prev >= ma20_prev:
-                signals.append(("bearish", "🔻 MA死叉", "MA5下穿MA20"))
-            # RSI
-            if rsi14_now > 70:
-                signals.append(("warn", f"⚠️ RSI超买({rsi14_now:.0f})", "注意回调风险"))
-            elif rsi14_now < 30:
-                signals.append(("bullish", f"💡 RSI超卖({rsi14_now:.0f})", "可能反弹"))
-            else:
-                signals.append(("info", f"✅ RSI({rsi14_now:.0f})", "合理区间"))
-            # KDJ
-            if j_now < 0:
-                signals.append(("bullish", "💡 KDJ极度超卖", f"J={j_now:.0f}"))
-            elif j_now > 100:
-                signals.append(("warn", "⚠️ KDJ极度超买", f"J={j_now:.0f}"))
-            elif k_now > d_now:
-                signals.append(("bullish", "🔺 KDJ金叉", f"K({k_now:.0f})>D({d_now:.0f})"))
-            else:
-                signals.append(("bearish", "🔻 KDJ死叉", f"K({k_now:.0f})<D({d_now:.0f})"))
-            # BOLL
-            if boll_pos > 0.95:
-                signals.append(("warn", "⚠️ 触及BOLL上轨", "强压力位"))
-            elif boll_pos < 0.05:
-                signals.append(("bullish", "💡 触及BOLL下轨", "强支撑位"))
-            else:
-                signals.append(("info", f"✅ BOLL({boll_pos*100:.0f}%)", "通道内运行"))
-            # 量能
-            if vol_ratio > 2:
-                signals.append(("info", f"🔥 大幅放量({vol_ratio:.1f}x)", "资金活跃"))
-            elif vol_ratio < 0.5:
-                signals.append(("warn", f"💤 极度缩量({vol_ratio:.1f}x)", "交投冷清"))
-
-            # 渲染 K线形态
-            if candle_patterns:
-                st.markdown('<div class="tag-row" style="margin-bottom:8px;"><span style="color:#64748b;font-size:0.75rem;margin-right:8px;">🕯️ K线形态:</span>', unsafe_allow_html=True)
-                for tag_cls, title, desc in candle_patterns:
-                    st.markdown(f'<span class="tag {tag_cls}"><b>{title}</b> {desc}</span>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            # 渲染技术信号
-            st.markdown('<div class="tag-row">', unsafe_allow_html=True)
-            for tag_cls, title, desc in signals:
-                st.markdown(f'<span class="tag {tag_cls}"><b>{title}</b> {desc}</span>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            _tab_main, _tab_ind, _tab_chip, _tab_fin, _tab_rs, _tab_sig = st.tabs(
+                ["📈 主图 · 量能", "🎯 RSI / KDJ", "🧊 筹码分布",
+                 "📊 财务趋势", "📡 相对强弱", "🎲 信号回测"]
+            )
 
-            # ====== 风险评估 ======
-            risk_col, stats_col = st.columns([1, 1])
+            with _tab_main:
+                # ====== K线 + 支撑压力 ======
+                st.markdown('<div class="chart-box"><h3>📈 K线图 · 布林带 · 支撑压力位</h3>', unsafe_allow_html=True)
 
-            with risk_col:
-                st.markdown('<div class="section-title">⚠️ 风险评估</div>', unsafe_allow_html=True)
-                # VaR (95%)
-                var95 = float(np.percentile(returns.tail(60), 5)) * 100
-                # 最大回撤
-                peak = close.expanding().max()
-                drawdown = (close - peak) / peak
-                max_dd = float(drawdown.min()) * 100
-                # 夏普比率
-                rf_daily = 0.02 / 252
-                excess = returns.tail(60) - rf_daily
-                sharpe = float(excess.mean() / (excess.std() + 1e-10) * np.sqrt(252))
-                # 波动率
-                ann_vol = float(returns.tail(60).std() * np.sqrt(252) * 100)
-                # 胜率
-                win_rate = float((returns.tail(60) > 0).mean()) * 100
+                # 计算支撑压力
+                hl20 = df_plot.iloc[-20:]
+                support1 = float(hl20["low"].min())
+                resistance1 = float(hl20["high"].max())
+                hl60 = df.iloc[-60:]
+                support2 = float(hl60["low"].min())
+                resistance2 = float(hl60["high"].max())
+                pivot = (hl20["high"].max() + hl20["low"].min() + hl20["close"].iloc[-1]) / 3
 
-                risk_metrics = [
-                    ("VaR(95%)", f"{var95:.2f}%", "当日最大亏损估计", "red" if var95 < -3 else ("amber" if var95 < -1.5 else "green")),
-                    ("最大回撤", f"{max_dd:.1f}%", "历史最大跌幅", "red" if max_dd < -25 else ("amber" if max_dd < -10 else "green")),
-                    ("夏普比率", f"{sharpe:.2f}", "风险调整后收益", "red" if sharpe > 1 else ("amber" if sharpe > 0 else "green")),
-                    ("年化波动", f"{ann_vol:.1f}%", "价格波动程度", ""),
-                    ("60日胜率", f"{win_rate:.0f}%", "阳线占比", "red" if win_rate > 55 else ("amber" if win_rate > 45 else "green")),
+                fig1 = go.Figure()
+                fig1.add_trace(go.Candlestick(
+                    x=df_plot["date"], open=df_plot["open"], high=df_plot["high"],
+                    low=df_plot["low"], close=df_plot["close"],
+                    name="K线", increasing_line_color="#ef4444", decreasing_line_color="#10b981",
+                    increasing_fillcolor="#ef4444", decreasing_fillcolor="#10b981"
+                ))
+                for p, color in [(5, "#3b82f6"), (20, "#f59e0b"), (60, "#8b5cf6")]:
+                    ma = close.rolling(p).mean()
+                    fig1.add_trace(go.Scatter(x=df_plot["date"], y=ma, name=f"MA{p}",
+                                              line=dict(color=color, width=1.5)))
+                boll_mid, boll_upper, boll_lower = calc_boll(close)
+                boll_fill = pd.DataFrame({
+                    "x": list(df_plot["date"]) + list(df_plot["date"])[::-1],
+                    "y": list(boll_upper.iloc[-180:]) + list(boll_lower.iloc[-180:])[::-1]
+                })
+                fig1.add_trace(go.Scatter(x=boll_fill["x"], y=boll_fill["y"], fill="toself",
+                                          fillcolor="rgba(100,116,139,0.08)", line=dict(width=0),
+                                          name="BOLL通道", showlegend=True))
+
+                # 支撑压力线
+                for val, label, color in [
+                    (support1, f"支撑1(20日低:{support1:.2f})", "#059669"),
+                    (support2, f"支撑2(60日低:{support2:.2f})", "#047857"),
+                    (resistance1, f"压力1(20日高:{resistance1:.2f})", "#ef4444"),
+                    (resistance2, f"压力2(60日高:{resistance2:.2f})", "#b91c1c"),
+                    (pivot, f"枢轴点({pivot:.2f})", "#8b5cf6"),
+                ]:
+                    # 交替上下摆放：压力1(20日高) 和 压力2(60日高) 常常只差几分钱，
+                    # 同侧标注会叠成一团。
+                    _pos = ("top right", "bottom right")[_i % 2]
+                    fig1.add_hline(y=val, line_dash="dash", line_color=color, opacity=0.5,
+                                   annotation_text=label.split("(")[0], annotation_position=_pos)
+
+                # 右侧给支撑/压力标注留位置：annotation_position="right" 是画在
+                # 绘图区外侧的 margin 里，r=10 会把「支撑1」切成「支」。
+                fig1.update_layout(height=500, template="plotly_white", hovermode="x unified",
+                                   xaxis_rangeslider_visible=True, legend=dict(orientation="h", y=1.15),
+                                   margin=dict(l=10, r=48, t=20, b=10))
+                st.plotly_chart(fig1, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+
+                # ====== 成交分布 + MACD ======
+                st.markdown('<div class="chart-box"><h3>📊 成交量 · MACD(12,26,9)</h3>', unsafe_allow_html=True)
+
+                fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                                     row_heights=[0.3, 0.7])
+                vol_colors = ["#ef4444" if c >= o else "#10b981" for c, o in zip(df_plot["close"], df_plot["open"])]
+                fig2.add_trace(go.Bar(x=df_plot["date"], y=df_plot["volume"], name="成交量",
+                                      marker_color=vol_colors, opacity=0.7), row=1, col=1)
+                vol_ma5 = df_plot["volume"].rolling(5).mean()
+                fig2.add_trace(go.Scatter(x=df_plot["date"], y=vol_ma5, name="量MA5",
+                                          line=dict(color="#f59e0b", width=1.5)), row=1, col=1)
+                vol_ma20 = df_plot["volume"].rolling(20).mean()
+                fig2.add_trace(go.Scatter(x=df_plot["date"], y=vol_ma20, name="量MA20",
+                                          line=dict(color="#94a3b8", width=1, dash="dot")), row=1, col=1)
+
+                dif, dea, macd_bar = calc_macd(close)
+                macd_colors = ["#ef4444" if v >= 0 else "#10b981" for v in macd_bar.iloc[-180:]]
+                fig2.add_trace(go.Scatter(x=df_plot["date"], y=dif.iloc[-180:], name="DIF",
+                                          line=dict(color="#ef4444", width=1.8)), row=2, col=1)
+                fig2.add_trace(go.Scatter(x=df_plot["date"], y=dea.iloc[-180:], name="DEA",
+                                          line=dict(color="#3b82f6", width=1.8)), row=2, col=1)
+                fig2.add_trace(go.Bar(x=df_plot["date"], y=macd_bar.iloc[-180:], name="柱",
+                                      marker_color=macd_colors, opacity=0.5), row=2, col=1)
+                fig2.add_hline(y=0, line_color="#94a3b8", line_width=0.5, row=2, col=1)
+                fig2.update_layout(height=400, template="plotly_white", hovermode="x unified",
+                                   legend=dict(orientation="h", y=1.12),
+                                   margin=dict(l=10, r=10, t=20, b=10))
+                st.plotly_chart(fig2, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+
+            with _tab_ind:
+                # ====== RSI + KDJ ======
+                st.markdown('<div class="chart-box"><h3>🎯 RSI(6,14) + KDJ(9,3,3)</h3>', unsafe_allow_html=True)
+
+                fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                                     row_heights=[0.5, 0.5])
+                for p, color in [(6, "#ef4444"), (14, "#3b82f6")]:
+                    rsi = calc_rsi(close, period=p)
+                    fig3.add_trace(go.Scatter(x=df_plot["date"], y=rsi.iloc[-180:], name=f"RSI{p}",
+                                              line=dict(color=color, width=1.8)), row=1, col=1)
+                for y, lbl in [(70, "超买"), (50, "中轴"), (30, "超卖")]:
+                    fig3.add_hline(y=y, line_dash="dash", line_color="#94a3b8", opacity=0.4,
+                                   annotation_text=lbl, annotation_position="right", row=1, col=1)
+
+                k, d, j = calc_kdj(df_plot)
+                fig3.add_trace(go.Scatter(x=df_plot["date"], y=k.iloc[-180:], name="K",
+                                          line=dict(color="#ef4444", width=1.8)), row=2, col=1)
+                fig3.add_trace(go.Scatter(x=df_plot["date"], y=d.iloc[-180:], name="D",
+                                          line=dict(color="#3b82f6", width=1.8)), row=2, col=1)
+                fig3.add_trace(go.Scatter(x=df_plot["date"], y=j.iloc[-180:], name="J",
+                                          line=dict(color="#8b5cf6", width=1.2, dash="dot")), row=2, col=1)
+                for y, lbl in [(80, "超买"), (20, "超卖")]:
+                    fig3.add_hline(y=y, line_dash="dash", line_color="#94a3b8", opacity=0.4,
+                                   annotation_text=lbl, annotation_position="right", row=2, col=1)
+                fig3.update_layout(height=400, template="plotly_white", hovermode="x unified",
+                                   legend=dict(orientation="h", y=1.12),
+                                   margin=dict(l=10, r=36, t=20, b=10))
+                st.plotly_chart(fig3, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+
+            with _tab_chip:
+                # ====== 🧊 筹码分布（成本分布） ======
+                try:
+                    _cn = min(120, len(df))
+                    _cd = df.tail(_cn).copy()
+                    _pmin = float(_cd["low"].min())
+                    _pmax = float(_cd["high"].max())
+                    if _pmax <= _pmin:
+                        _pmax = _pmin + 1e-3
+                    _nb = 50
+                    _edges = np.linspace(_pmin, _pmax, _nb + 1)
+                    _centers = (_edges[:-1] + _edges[1:]) / 2
+                    _vol = np.zeros(_nb)
+                    for _, _row in _cd.iterrows():
+                        _lo, _hi, _v = float(_row["low"]), float(_row["high"]), float(_row["volume"])
+                        if _v <= 0:
+                            continue
+                        if _hi <= _lo:
+                            _hi = _lo + 1e-3
+                        _ia = int(np.searchsorted(_edges, _lo, side="right") - 1)
+                        _ib = int(np.searchsorted(_edges, _hi, side="right") - 1)
+                        _ia = max(0, min(_nb - 1, _ia))
+                        _ib = max(0, min(_nb - 1, _ib))
+                        if _ib < _ia:
+                            _ib = _ia
+                        _seg = np.zeros(_nb)
+                        _seg[_ia:_ib + 1] = 1.0
+                        _vol += _seg * _v / (_ib - _ia + 1)
+                    _tot = _vol.sum()
+                    if _tot > 0:
+                        _pdf = _vol / _tot
+                        _lastc = float(df["close"].iloc[-1])
+                        _avg_cost = float((_pdf * _centers).sum())
+                        _profit = float(_pdf[_centers < _lastc].sum())
+                        _cum = np.cumsum(_pdf)
+                        _lo90 = float(_centers[min(_nb - 1, int(np.searchsorted(_cum, 0.05)))])
+                        _hi90 = float(_centers[min(_nb - 1, int(np.searchsorted(_cum, 0.95)))])
+                        _lo70 = float(_centers[min(_nb - 1, int(np.searchsorted(_cum, 0.15)))])
+                        _hi70 = float(_centers[min(_nb - 1, int(np.searchsorted(_cum, 0.85)))])
+                        _conc90 = (_hi90 - _lo90) / (_hi90 + _lo90) * 100 if (_hi90 + _lo90) > 0 else 0
+                        _conc70 = (_hi70 - _lo70) / (_hi70 + _lo70) * 100 if (_hi70 + _lo70) > 0 else 0
+                        st.markdown('<div class="chart-box"><h3>🧊 筹码分布（近 120 日成本）</h3>',
+                                    unsafe_allow_html=True)
+                        _cols = ["#ef4444" if c < _lastc else "#10b981" for c in _centers]
+                        fig_chip = go.Figure()
+                        fig_chip.add_trace(go.Bar(y=_centers, x=_pdf * 100, orientation="h",
+                                                 marker_color=_cols, opacity=0.75))
+                        fig_chip.add_hline(y=_lastc, line_dash="dash", line_color="#1e293b", opacity=0.8,
+                                           annotation_text=f"现价 {_lastc:.2f}",
+                                           annotation_position="top right")
+                        fig_chip.add_hline(y=_avg_cost, line_dash="dot", line_color="#8b5cf6", opacity=0.8,
+                                           annotation_text=f"平均成本 {_avg_cost:.2f}",
+                                           annotation_position="bottom left")
+                        # 标注落在绘图区内会压住筹码柱，加不透明底衬才读得出来
+                        for _an in fig_chip.layout.annotations:
+                            _an.update(bgcolor="rgba(255,255,255,.9)", borderpad=2)
+                        fig_chip.update_layout(height=360, template="plotly_white",
+                                               margin=dict(l=10, r=14, t=10, b=10),
+                                               xaxis_title="筹码占比(%)", yaxis_title="价格")
+                        st.plotly_chart(fig_chip, use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        # 四行裸文本 → 定宽小格，和基本面/风险指标同一套观感
+                        st.markdown(panel("🎯 筹码摘要", _ana_kv([
+                            ("平均成本", f"{_avg_cost:.2f}", "#8b5cf6"),
+                            ("获利盘", f"{_profit*100:.1f}%", "#dc2626"),
+                            ("90% 成本区间", f"{_lo90:.2f} ~ {_hi90:.2f}", ""),
+                            ("90% 集中度", f"{_conc90:.1f}%", ""),
+                            ("70% 成本区间", f"{_lo70:.2f} ~ {_hi70:.2f}", ""),
+                            ("70% 集中度", f"{_conc70:.1f}%", ""),
+                        ])), unsafe_allow_html=True)
+                    else:
+                        st.caption("⚠️ 成交量数据不足，无法绘制筹码分布")
+                except Exception as _e:
+                    st.caption(f"⚠️ 筹码分布绘制失败: {_e}")
+
+
+            with _tab_fin:
+                # ====== 📈 财务趋势 ======
+                if use_fund and "fin" in dir() and fin is not None and len(fin) > 1:
+                    try:
+                        _f = fin.copy()
+                        if "日期" in _f.columns:
+                            _f = _f.sort_values("日期")
+                        _periods = _f.tail(8)
+                        _x = _periods["日期"].astype(str).tolist() if "日期" in _f.columns else [str(i) for i in range(len(_periods))]
+
+                        def _ser(key):
+                            if key in _periods.columns:
+                                return pd.to_numeric(_periods[key], errors="coerce")
+                            return None
+
+                        _pe = _ser("pe_ttm")
+                        _pb = _ser("pb")
+                        _roe = _ser("roe")
+                        _pg = _ser("profit_growth")
+                        _rg = _ser("revenue_growth")
+
+                        st.markdown('<div class="chart-box"><h3>📈 财务趋势（近 8 期）</h3>', unsafe_allow_html=True)
+                        fig_fin = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+                                                subplot_titles=("估值 PE(TTM) / PB", "盈利 ROE / 增速(%)"),
+                                                row_heights=[0.5, 0.5])
+                        if _pe is not None and _pb is not None:
+                            fig_fin.add_trace(go.Scatter(x=_x, y=_pe.fillna(0), name="PE(TTM)", line=dict(color="#ef4444", width=1.8)), row=1, col=1)
+                            fig_fin.add_trace(go.Scatter(x=_x, y=_pb.fillna(0), name="PB", line=dict(color="#3b82f6", width=1.8)), row=1, col=1)
+                        if _roe is not None:
+                            fig_fin.add_trace(go.Scatter(x=_x, y=_roe.fillna(0), name="ROE%", line=dict(color="#8b5cf6", width=1.8)), row=2, col=1)
+                        if _pg is not None:
+                            fig_fin.add_trace(go.Scatter(x=_x, y=_pg.fillna(0), name="净利增速%", line=dict(color="#059669", width=1.5)), row=2, col=1)
+                        if _rg is not None:
+                            fig_fin.add_trace(go.Scatter(x=_x, y=_rg.fillna(0), name="营收增速%", line=dict(color="#f59e0b", width=1.5)), row=2, col=1)
+                        fig_fin.update_layout(height=360, template="plotly_white", hovermode="x unified",
+                                              legend=dict(orientation="h", y=1.18), margin=dict(l=10, r=10, t=30, b=10))
+                        st.plotly_chart(fig_fin, use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    except Exception as _e:
+                        st.caption(f"⚠️ 财务趋势绘制失败: {_e}")
+
+
+            with _tab_rs:
+                # ====== 个股 vs 大盘 vs 行业 相对强弱 ======
+                try:
+                    _bench = _cached_benchmark("000300.SH", (datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
+                    if len(_bench) > 5:
+                        _bclose = _bench["close"]
+
+                        def _ret(s, n):
+                            if len(s) <= n:
+                                return float(s.iloc[-1] / s.iloc[0] - 1) * 100
+                            return float(s.iloc[-1] / s.iloc[-1 - n] - 1) * 100
+
+                        _stock_ret = {n: _ret(close, n) for n in (5, 20, 60, 120)}
+                        _bench_ret = {n: _ret(_bclose, n) for n in (5, 20, 60, 120)}
+                        # 行业板块涨跌幅
+                        _ind_chg = None
+                        try:
+                            _secs = _cached_hotspots()
+                            _ind = base.get("industry", "")
+                            if _ind and _ind != "未知":
+                                _m = _secs[_secs["板块"].str.contains(_ind[:2], na=False)]
+                                if len(_m) > 0:
+                                    _ind_chg = float(_m.iloc[0]["涨跌幅"])
+                        except Exception:
+                            _ind_chg = None
+
+                        # 原来一行行「个股 xx% · 沪深300 xx% · 相对 xx%」拼字符串，列不对齐、
+                        # 数字宽度不统一，读起来很费劲；改成同宽表格，一眼横向比。
+                        _rs_rows = ""
+                        for n in (5, 20, 60, 120):
+                            sr = _stock_ret[n]
+                            br = _bench_ret[n]
+                            rs = sr - br
+                            ic = f"{_ind_chg:+.2f}%" if _ind_chg is not None else "—"
+                            _cc = lambda _v: "#dc2626" if _v > 0 else "#059669"
+                            _rs_rows += (
+                                f'<tr><td><b>近 {n} 日</b></td>'
+                                f'<td style="color:{_cc(sr)};font-weight:700;">{sr:+.2f}%</td>'
+                                f'<td style="color:{_cc(br)};">{br:+.2f}%</td>'
+                                f'<td style="color:{_cc(rs)};font-weight:700;">{rs:+.2f}%</td>'
+                                f'<td>{ic}</td></tr>'
+                            )
+                        st.markdown(
+                            '<div class="panel"><div class="panel-title">📡 相对强弱 · 个股 vs 沪深300 vs 行业</div>'
+                            '<table class="mini-table"><thead><tr>'
+                            '<th>区间</th><th>个股</th><th>沪深300</th><th>超额</th><th>行业</th>'
+                            f'</tr></thead><tbody>{_rs_rows}</tbody></table></div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # 相对强弱曲线（归一化到 100）
+                        try:
+                            _bn = min(len(close), len(_bclose))
+                            _snorm = (close.iloc[-_bn:].values / close.iloc[-_bn:].iloc[0]) * 100
+                            _bnorm = (_bclose.iloc[-_bn:].values / _bclose.iloc[-_bn:].iloc[0]) * 100
+                            _bx = list(_bench["date"].iloc[-_bn:])
+                            fig_rs = go.Figure()
+                            fig_rs.add_trace(go.Scatter(x=_bx, y=_snorm, name=stock_name, line=dict(color="#ef4444", width=1.8)))
+                            fig_rs.add_trace(go.Scatter(x=_bx, y=_bnorm, name="沪深300", line=dict(color="#3b82f6", width=1.8)))
+                            fig_rs.update_layout(height=300, template="plotly_white", hovermode="x unified",
+                                                 legend=dict(orientation="h", y=1.12), margin=dict(l=10, r=10, t=20, b=10),
+                                                 yaxis_title="归一化(起点=100)")
+                            # 裸 plotly 图直接落在灰底上会显得"没装修"，套一层白卡
+                            st.markdown('<div class="chart-box"><h3>📡 归一化走势（区间起点 = 100）</h3>',
+                                        unsafe_allow_html=True)
+                            st.plotly_chart(fig_rs, use_container_width=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                        except Exception:
+                            pass
+                    else:
+                        st.caption("⚠️ 基准指数数据不足，跳过相对强弱比较")
+                except Exception as _e:
+                    st.caption(f"⚠️ 相对强弱比较失败: {_e}")
+
+
+            with _tab_sig:
+                # ====== 🎯 相似信号历史回测 ======
+                try:
+                    _bc = min(len(df), 250)
+                    _sub = df.iloc[-_bc:].copy()
+                    _c = _sub["close"]
+                    _ma5 = _c.rolling(5).mean()
+                    _ma20 = _c.rolling(20).mean()
+                    _ma60 = _c.rolling(60).mean()
+                    _rsi = calc_rsi(_c, 14)
+                    _k, _d, _j = calc_kdj(_sub)
+                    _bm, _bu, _bl = calc_boll(_c)
+                    _bpos = (_c - _bl) / (_bu - _bl + 1e-10)
+                    _f5 = (_c.shift(-5) / _c - 1) * 100
+                    _f10 = (_c.shift(-10) / _c - 1) * 100
+                    _f20 = (_c.shift(-20) / _c - 1) * 100
+
+                    def _stats(mask):
+                        m = mask.fillna(False) & _f5.notna() & _f10.notna() & _f20.notna()
+                        if int(m.sum()) < 5:
+                            return None
+                        r5 = _f5[m]
+                        r10 = _f10[m]
+                        r20 = _f20[m]
+                        return dict(n=int(m.sum()),
+                                    r5=float(r5.mean()), r10=float(r10.mean()), r20=float(r20.mean()),
+                                    w5=float((r5 > 0).mean() * 100))
+
+                    _conds = {
+                        "多头排列": (_c > _ma5) & (_ma5 > _ma20) & (_ma20 > _ma60),
+                        "空头排列": (_c < _ma5) & (_ma5 < _ma20) & (_ma20 < _ma60),
+                        "RSI超卖(<30)": _rsi < 30,
+                        "RSI超买(>70)": _rsi > 70,
+                        "MA5金叉MA20": (_ma5 > _ma20) & (_ma5.shift(1) <= _ma20.shift(1)),
+                        "MA5死叉MA20": (_ma5 < _ma20) & (_ma5.shift(1) >= _ma20.shift(1)),
+                        "KDJ金叉": (_k > _d) & (_k.shift(1) <= _d.shift(1)),
+                        "触及BOLL下轨": _bpos < 0.05,
+                        "触及BOLL上轨": _bpos > 0.95,
+                    }
+                    _active = {k: bool(v.iloc[-1]) for k, v in _conds.items()}
+                    _rows = []
+                    for k, v in _conds.items():
+                        s = _stats(v)
+                        if s is None:
+                            continue
+                        mark = "★" if _active.get(k) else ""
+                        _rows.append((f"{mark}{k}", s["n"], s["r5"], s["r10"], s["r20"], s["w5"]))
+                    if _rows:
+                        # markdown 管道表在 Streamlit 里是通用样式（无对齐、无 hover），
+                        # 换成和其他地方同一套 .mini-table，数字右对齐才看得清。
+                        _bt_rows = ""
+                        for r in _rows:
+                            _cur = str(r[0]).startswith("★")
+                            _sig = str(r[0])
+                            _c5 = "#dc2626" if r[2] > 0 else "#059669"
+                            _c10 = "#dc2626" if r[3] > 0 else "#059669"
+                            _c20 = "#dc2626" if r[4] > 0 else "#059669"
+                            _cw = "#dc2626" if r[5] >= 50 else "#059669"
+                            _bg = ' style="background:#faf5ff;"' if _cur else ""
+                            _bt_rows += (
+                                f'<tr{_bg}><td>{_sig}</td>'
+                                f'<td>{r[1]}</td>'
+                                f'<td style="color:{_c5};font-weight:600;">{r[2]:+.2f}%</td>'
+                                f'<td style="color:{_c10};">{r[3]:+.2f}%</td>'
+                                f'<td style="color:{_c20};">{r[4]:+.2f}%</td>'
+                                f'<td style="color:{_cw};font-weight:600;">{r[5]:.0f}%</td></tr>'
+                            )
+                        st.markdown(
+                            '<div class="panel"><div class="panel-title">'
+                            '🎯 历史相似技术信号回测（近 250 日）</div>'
+                            '<div class="text-sub" style="margin-bottom:.4rem;">'
+                            '统计该信号出现后未来 N 日的平均涨跌与胜率；高亮行 = 当前正满足。</div>'
+                            '<table class="mini-table"><thead><tr>'
+                            '<th>信号</th><th>样本</th><th>未来5日</th><th>未来10日</th>'
+                            '<th>未来20日</th><th>5日胜率</th>'
+                            f'</tr></thead><tbody>{_bt_rows}</tbody></table></div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.caption("⚠️ 样本不足，无法回测")
+                except Exception as _e:
+                    st.caption(f"⚠️ 相似信号回测失败: {_e}")
+
+
+
+            # ====== 风险评估 / 多周期统计（双列卡片）======
+            # VaR (95%)
+            var95 = float(np.percentile(returns.tail(60), 5)) * 100
+            # 最大回撤
+            peak = close.expanding().max()
+            drawdown = (close - peak) / peak
+            max_dd = float(drawdown.min()) * 100
+            # 夏普比率
+            rf_daily = 0.02 / 252
+            excess = returns.tail(60) - rf_daily
+            sharpe = float(excess.mean() / (excess.std() + 1e-10) * np.sqrt(252))
+            # 波动率
+            ann_vol = float(returns.tail(60).std() * np.sqrt(252) * 100)
+            # 胜率
+            win_rate = float((returns.tail(60) > 0).mean()) * 100
+
+            _rk, _st = st.columns([1, 1])
+
+            with _rk:
+                _risk_items = [
+                    ("VaR(95%)", f"{var95:.2f}%",
+                     "#dc2626" if var95 < -3 else ("#d97706" if var95 < -1.5 else "#059669")),
+                    ("最大回撤", f"{max_dd:.1f}%",
+                     "#dc2626" if max_dd < -25 else ("#d97706" if max_dd < -10 else "#059669")),
+                    ("夏普比率", f"{sharpe:.2f}",
+                     "#dc2626" if sharpe > 1 else ("#d97706" if sharpe > 0 else "#059669")),
+                    ("年化波动", f"{ann_vol:.1f}%", ""),
+                    ("60日胜率", f"{win_rate:.0f}%",
+                     "#dc2626" if win_rate > 55 else ("#d97706" if win_rate > 45 else "#059669")),
                 ]
-                for label, val, desc, cls in risk_metrics:
-                    c = "color:#ef4444" if cls == "red" else ("color:#059669" if cls == "green" else ("color:#f59e0b" if cls == "amber" else "color:#1e293b"))
-                    st.markdown(f'<div style="display:flex;justify-content:space-between;padding:4px 12px;border-bottom:1px solid #f1f5f9;font-size:0.8rem;"><span style="color:#64748b;">{label}</span><div style="text-align:right;"><span style="{c};font-weight:600;">{val}</span><br><span style="color:#94a3b8;font-size:0.65rem;">{desc}</span></div></div>', unsafe_allow_html=True)
+                st.markdown(
+                    panel("⚠️ 风险评估", _ana_kv(_risk_items)
+                          + '<div class="text-sub" style="margin-top:.45rem;">'
+                            'VaR/波动/胜率取近 60 个交易日；夏普按无风险利率 2% 年化。</div>'),
+                    unsafe_allow_html=True,
+                )
 
-            with stats_col:
-                st.markdown('<div class="section-title">📊 多周期统计</div>', unsafe_allow_html=True)
-                for label, period_data in [("近 5 日", df.tail(5)), ("近 20 日", df.tail(20)), ("近 60 日", df.tail(60))]:
+            with _st:
+                # 多周期统计：原来每个周期平铺 7 张卡（3×7=21 张），满屏色块反而看不清，
+                # 改成一张 3 行的紧凑表 —— 同行横向比较才是这里真正要读的东西。
+                _head = ("周期", "涨跌幅", "最高", "最低", "振幅", "波动率", "胜率")
+                _rows_html = ""
+                for label, period_data in [("近 5 日", df.tail(5)), ("近 20 日", df.tail(20)),
+                                           ("近 60 日", df.tail(60))]:
                     cd = period_data["close"]
                     ret = (cd.iloc[-1] / cd.iloc[0] - 1) * 100
                     high_p = cd.max()
@@ -1947,27 +3314,49 @@ elif page == "📊 个股分析":
                     amp = (period_data["high"].max() - period_data["low"].min()) / cd.iloc[0] * 100
                     vol_price = cd.pct_change().std() * 100
                     win = (cd.pct_change().dropna() > 0).mean() * 100
-                    rc_cls = "red" if ret > 0 else "green"
-
-                    st.markdown(f"""
-                    <div class="card-row">
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">周期</div><div class="val purple" style="font-size:0.85rem;">{label}</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">涨跌幅</div><div class="val {rc_cls}" style="font-size:0.85rem;">{ret:+.2f}%</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">最高</div><div class="val red" style="font-size:0.85rem;">{high_p:.2f}</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">最低</div><div class="val green" style="font-size:0.85rem;">{low_p:.2f}</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">波动率</div><div class="val" style="font-size:0.85rem;">{vol_price:.2f}%</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">振幅</div><div class="val" style="font-size:0.85rem;">{amp:.2f}%</div></div>
-                        <div class="mini-card" style="padding:6px 8px;"><div class="label" style="font-size:0.6rem;">胜率</div><div class="val {('red' if win>50 else 'green')}" style="font-size:0.85rem;">{win:.0f}%</div></div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    _rc = "#dc2626" if ret > 0 else "#059669"
+                    _wc = "#dc2626" if win > 50 else "#059669"
+                    _rows_html += (
+                        f'<tr><td><b>{label}</b></td>'
+                        f'<td style="color:{_rc};font-weight:700;">{ret:+.2f}%</td>'
+                        f'<td style="color:#dc2626;">{high_p:.2f}</td>'
+                        f'<td style="color:#059669;">{low_p:.2f}</td>'
+                        f'<td>{amp:.2f}%</td><td>{vol_price:.2f}%</td>'
+                        f'<td style="color:{_wc};font-weight:600;">{win:.0f}%</td></tr>'
+                    )
+                _th = "".join(f"<th>{h}</th>" for h in _head)
+                st.markdown(
+                    panel("📊 多周期统计",
+                          f'<table class="mini-table"><thead><tr>{_th}</tr></thead>'
+                          f'<tbody>{_rows_html}</tbody></table>'),
+                    unsafe_allow_html=True,
+                )
 
             # ====== AI特征贡献 ======
             if predictor.is_ready and pred.features_snapshot:
-                st.markdown('<div class="section-title">🧬 AI 特征快照 Top 15</div>', unsafe_allow_html=True)
-                st.caption("💡 正值(红)=看涨贡献 负值(绿)=看跌贡献 | 绝对值越大对AI决策影响越大")
-
                 feat = pred.features_snapshot
-                meaningful = {kv: v for kv, v in feat.items() if abs(v) > 1e-6}
+                meaningful = {k: v for k, v in feat.items() if abs(v) > 1e-6}
+                # 特征量纲差异极大（vol_change 可到 90 万，kdj_j 只有几十），
+                # 直接画原始值会被单个离群特征压成一根横线，其余 14 根全是 0 长度。
+                # 这里按「中位数的 20 倍」截断离群点，并在图下注明剔除了几个。
+                _dropped = 0
+                if len(meaningful) > 4:
+                    _med = float(np.median([abs(v) for v in meaningful.values()]))
+                    if _med > 0:
+                        _cap = _med * 20.0
+                        _kept = {k: v for k, v in meaningful.items() if abs(v) <= _cap}
+                        if len(_kept) >= 5:
+                            _dropped = len(meaningful) - len(_kept)
+                            meaningful = _kept
+                st.markdown('<div class="chart-box"><h3>🧬 AI 特征快照 Top 15</h3>',
+                            unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="text-sub" style="margin-bottom:.4rem;">'
+                    '红=看涨方向，绿=看跌方向；绝对值越大的特征对本次评分影响越强。'
+                    + (f'（已隐藏 {_dropped} 个量纲离群、会压扁坐标轴的特征）' if _dropped else '')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
                 feat_df = pd.DataFrame(
                     sorted(meaningful.items(), key=lambda x: abs(x[1]), reverse=True)[:15],
                     columns=["特征", "当前值"]
@@ -1978,13 +3367,17 @@ elif page == "📊 个股分析":
                     x=feat_df["当前值"], y=feat_df["特征"], orientation="h",
                     marker_color=feat_df["方向"],
                     text=feat_df["当前值"].round(3), textposition="outside",
-                    textfont=dict(color="#1e293b", size=11)
+                    textfont=dict(color="#1e293b", size=11),
+                    cliponaxis=False,
                 )])
                 fig4.update_layout(height=420, template="plotly_white",
                                    xaxis_title="特征值 (红=看涨, 绿=看跌)",
                                    xaxis=dict(zeroline=True, zerolinecolor="#94a3b8"),
-                                   margin=dict(l=10, r=50, t=10, b=10))
+                                   # 倒序 y 轴：影响最大的特征排在最上面，不用往下找
+                                   yaxis=dict(autorange="reversed", tickfont=dict(size=11)),
+                                   margin=dict(l=10, r=60, t=10, b=10))
                 st.plotly_chart(fig4, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
             # ====== 🤖 AI 分析报告 ======
             # 同上：模型来源动态显示，避免本地模式下仍写「DeepSeek」造成误解。
@@ -2033,7 +3426,12 @@ elif page == "📊 个股分析":
 # ========== 📡 实时监控页 ==========
 elif page == "📡 实时监控":
     import time
-    st.markdown('<p class="main-header">📡 AI 实时监控</p>', unsafe_allow_html=True)
+    render_hero(
+        "AI 实时监控",
+        "盯盘片段原地刷新：实时价 · 均线 · AI 评分联动，无需整页重跑",
+        icon="📡",
+        badges=[("info", "盘中每 60 秒")],
+    )
 
     # 交易时间判断
     now = datetime.now()
@@ -2458,8 +3856,12 @@ elif page == "💹 自动交易":
 
 # ========== 📐 量化模型页 ==========
 elif page == "📐 量化模型":
-    st.markdown('<p class="main-header">📐 量化策略模型</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">多因子量化评分 · 均值回归回测 · 风险平价配置</p>', unsafe_allow_html=True)
+    render_hero(
+        "量化策略模型",
+        "多因子量化评分 · 均值回归回测 · 风险平价配置",
+        icon="📐",
+        badges=[("violet", "Quant Engine")],
+    )
 
     quant_tab1, quant_tab2, quant_tab3 = st.tabs(["📊 多因子评分", "🔄 均值回归", "⚖️ 风险平价"])
 
@@ -2958,8 +4360,12 @@ def render_safety_panel():
 
 # ========== 📈 模型稳定性页 ==========
 if page == "📈 模型稳定性":
-    st.markdown('<p class="main-header">📈 模型稳定性（RankIC 滚动监控）</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">逐日横截面 RankIC 稳定性曲线 · 由收盘后自动回填累积</p>', unsafe_allow_html=True)
+    render_hero(
+        "模型稳定性 · RankIC 滚动监控",
+        "逐日横截面 RankIC 稳定性曲线 · 由收盘后自动回填累积",
+        icon="📈",
+        badges=[("violet", "IC / IR 双轨")],
+    )
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -3016,7 +4422,12 @@ if page == "📈 模型稳定性":
 
 
 if page == "⚙️ 设置":
-    st.markdown('<p class="main-header">⚙️ 系统设置</p>', unsafe_allow_html=True)
+    render_hero(
+        "系统设置",
+        "模型开关 · 风控参数 · 调度与数据源配置（改动即时落盘）",
+        icon="⚙️",
+        badges=[("gray", f"调度 {'启用' if _sched_on else '停用'}")],
+    )
 
     st.markdown('<div class="section-title">🤖 AI 大模型配置</div>', unsafe_allow_html=True)
     st.info("💡 用于生成个股分析报告和选股组合推荐理由。可接云端 DeepSeek，也可接本机推理服务。")

@@ -67,3 +67,11 @@ config/broker.yaml.template
 QClaw.lnk
 # WorkBuddy 自动化/会话产物（含根 .workbuddy/memory，自动化 68bba355 每天 16:00 写）
 .workbuddy/
+
+# Windows 保留设备名误建的空文件（`> nul` 写错目录时产生）。
+# 注意：它是保留名，资源管理器/常规删除都会报"指定的设备名无效"，
+# 需要 `del \\?\C:\完整路径\nul` 才能真删；这里先让 git 别把它当新增文件。
+/nul
+
+# 盯盘面板的最近查看记录（本机运行态，非源码）
+config/watch_last.json

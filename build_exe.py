@@ -237,6 +237,9 @@ def build(with_data: bool, clean: bool) -> int:
         # 用户改风控参数（回撤线/单票上限/下单频率等）无需重新打包。
         "--add-data", f"{ROOT / 'config' / 'trading_guard.yaml'};config",
         "--add-data", f"{ROOT / 'scripts'};scripts",
+        # Streamlit 主题（品牌紫主色）。不打包这个目录，打包版会用默认西瓜红主色，
+        # 和源码版观感不一致 —— 排查起来还以为是 CSS 没生效。
+        "--add-data", f"{ROOT / '.streamlit'};.streamlit",
         # 依赖库动态资源：下方按导入闭包自动收集（--collect-all / --collect-data /
         # --add-data），不再在此硬编码。
     ]
