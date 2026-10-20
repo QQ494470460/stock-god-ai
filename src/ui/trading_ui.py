@@ -348,10 +348,18 @@ def _render_loop():
 
     loop = _ensure_loop(broker, guard)
 
+    # 看板 in-process 线程之外的「常驻 run_loop.py」是否也在跑？
+    # 两者抢同一把锁，所以看板点启动会被拒；这里先探明真相，避免给用户一个
+    # 永远点不动的「启动闭环」按钮（实为防双开保护，不是故障）。
+    from src.trading.loop import is_resident_loop_running
+    resident = is_resident_loop_running()
+    # 真正"在跑" = 看板 in-process 线程 或 常驻进程
+    loop_alive = bool(loop.is_running) or bool(resident["running"])
+
     # ---------- 启停控制 ----------
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        if not loop.is_running:
+        if not loop_alive:
             if st.button("▶️ 启动闭环", type="primary", use_container_width=True,
                          key="btn_loop_start"):
                 if loop.start():
@@ -366,16 +374,30 @@ def _render_loop():
                     )
                 st.rerun()
         else:
-            if st.button("⏹️ 停止闭环", use_container_width=True, key="btn_loop_stop"):
-                loop.stop()
-                st.success("⏹️ 闭环已停止")
-                st.rerun()
+            # 看板线程在跑 → 可在此停止；常驻在跑 → 提示去常驻进程停
+            if loop.is_running:
+                if st.button("⏹️ 停止闭环", use_container_width=True, key="btn_loop_stop"):
+                    loop.stop()
+                    st.success("⏹️ 闭环已停止")
+                    st.rerun()
+            else:
+                st.markdown(
+                    f"🟢 **常驻进程运行中**（PID `{resident.get('pid')}`，"
+                    f"心跳 `{resident.get('age_sec'):.0f}s` 前）\n\n"
+                    "闭环由独立的 `run_loop.py` 常驻进程驱动，看板仅用于监控。"
+                    "如需从看板接管，请先结束该常驻进程（或在它已停时再点启动）。",
+                )
     with c2:
-        if st.button("🔄 手动跑一周期", use_container_width=True, key="btn_loop_once"):
+        # 常驻在跑时禁止并发手动触发：会和常驻抢同一份计划/账户，造成重复下单。
+        _disabled_once = bool(resident["running"])
+        if st.button("🔄 手动跑一周期", use_container_width=True, key="btn_loop_once",
+                     disabled=_disabled_once):
             with st.spinner("执行一个闭环周期…"):
                 rep = loop.run_once()
             st.session_state.trade_loop_last = rep.to_dict()
             st.success("✅ " + rep.summary())
+        if _disabled_once:
+            st.caption("常驻进程运行中，已禁用以防重复下单")
     with c3:
         st.caption(f"扫描间隔 {loop.config.scan_interval_sec:.0f}s · "
                    f"状态机 {_STATE_LABEL.get(loop.state.value, loop.state.value)}")
@@ -416,8 +438,15 @@ def _render_loop():
     # ---------- 状态 ----------
     status = loop.get_status()
     g = status.get("guard") or {}
+    # 看板 in-process 线程没跑、但常驻进程在跑时，状态以常驻心跳为准，避免显示"已停止"
+    _live_state = status["state"]
+    _is_resident = bool(resident.get("running")) and not loop.is_running
+    if _is_resident and resident.get("state"):
+        _live_state = resident["state"]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("闭环状态", _STATE_LABEL.get(status["state"], status["state"]))
+    m1.metric("闭环状态",
+              _STATE_LABEL.get(_live_state, _live_state)
+              + ("（常驻）" if _is_resident else ""))
     m2.metric("安全中枢", f"{g.get('mode', '-')}"
               + ("（已熔断）" if g.get("halted") else ""))
     m3.metric("交易计划", status["plan_date"] or "无")

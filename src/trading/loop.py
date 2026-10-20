@@ -1000,6 +1000,27 @@ def read_heartbeat(path: Optional[Path] = None) -> dict:
         return {}
 
 
+def is_resident_loop_running(stale_sec: float = 120.0) -> dict:
+    """判断是否有独立的常驻 ``run_loop.py`` 进程在跑（与看板 in-process 线程抢同一把锁）。
+
+    看板里的 ``TradingLoop`` 是 in-process 后台线程，``is_running`` 只看自己；而真正的
+    无人值守闭环通常跑在独立的 ``run_loop.py`` 常驻进程里。两者抢同一个
+    ``data/.run_loop.lock``，所以看板点「启动闭环」会被拒（"已有另一个闭环实例在运行"）。
+
+    这里读心跳文件判断常驻进程是否活着，让看板如实显示状态，而不是给一个永远点不动的
+    「启动闭环」按钮。返回 dict：``{running, pid, age_sec, state}``。
+    """
+    hb = read_heartbeat()
+    if not hb:
+        return {"running": False, "pid": None, "age_sec": None, "state": ""}
+    age = hb.get("age_sec")
+    if age is not None and age <= stale_sec:
+        return {"running": True, "pid": hb.get("pid"),
+                "age_sec": age, "state": hb.get("state") or ""}
+    return {"running": False, "pid": hb.get("pid"),
+            "age_sec": age, "state": hb.get("state") or ""}
+
+
 if __name__ == "__main__":  # 手动跑一个周期
     from src.trading.yuekai import YuekaiBroker
     b = YuekaiBroker()
