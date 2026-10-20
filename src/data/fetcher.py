@@ -1018,25 +1018,39 @@ class DataFetcher:
     # 混在同一份排名里，比统一的粗粒度板级中性化更糟。
     _INDUSTRY_BULK_MIN_CODES = 2500
 
-    def get_industry_map(self, force_refresh: bool = False) -> Dict[str, str]:
-        """获取股票代码→行业映射（内存缓存）。
+    # 行业映射拿到这个规模即可视为「全市场快照」（用于接受）；低于此仅作增量基底。
+    _INDUSTRY_ACCEPT_FLOOR = 2000
 
-        两条容易踩的坑，这里都堵上了：
-          1) **空结果不许落盘**。历史上接口被代理拦截时会拿到 ``{}``，又被原样
-             写进 ``industry_map.json``；此后每次调用都直接返回这个空缓存，
-             即使网络恢复也**永远不会自愈**（2026-10-19 实测：东财
-             ``17.push2.eastmoney.com`` 直接 ProxyError）。
-          2) **空缓存要当负缓存用**。既然抓不到，就得记住"刚失败过"，六小时内
-             不再重试；否则一次选股要串行打上百个注定失败的请求。
+    def get_industry_map(self, force_refresh: bool = False) -> Dict[str, str]:
+        """获取股票代码→行业映射（内存缓存 + 磁盘增量持久化）。
+
+        2026-10-20 重写要点（此前行业中性化被空映射架空，且失败静默）：
+
+        1) **增量自愈**。本机到东财 ``push2.eastmoney.com`` 被代理**彻底封锁**
+           （直连/代理均 ``ProxyError``，已实测），东财 f100 全市场快照只能在
+           「窗口」里抓到。改为：把已有缓存当**增量基底**，每轮成功就拿到的页
+           立刻 ``update`` 并落盘；多轮（force 时 6 轮、退避重试）抢任何可用窗口，
+           跨小时/跨天累计，直到覆盖全市场。绝不再「一次全失败就清零」。
+
+        2) **非空缓存永远复用**。负缓存（空 ``{}``）只在「确实抓不到」时生效，
+           且只在 6h 窗口内阻止非强制调用；只要磁盘上有非空部分映射，一律先用着，
+           不因为一次网络抖动把历史积累丢掉。
+
+        3) **显式状态，替代静默跳过**。无论成败都写 ``industry_map_status.json``
+           （coverage / source / note），并在覆盖不足时打 WARNING 说明根因与恢复方式，
+           让「中性化被降级」从静默变成可见。
         """
         import json as _json
         import time as _time
+        from datetime import datetime as _dt
 
         if self._industry_map is not None and not force_refresh:
             return self._industry_map
 
         cache_file = self.cache_dir / "industry_map.json"
-        # 尝试缓存
+        status_file = self.cache_dir / "industry_map_status.json"
+
+        # ---- 非空缓存：直接复用（不丢历史积累）----
         if cache_file.exists() and not force_refresh:
             try:
                 cached = _json.loads(cache_file.read_text(encoding="utf-8"))
@@ -1058,80 +1072,129 @@ class DataFetcher:
                 self._industry_map = {}
                 return {}
 
-        logger.info("获取行业分类数据…")
-        self._industry_map = {}
-        # 路线一：东财行情列表接口自带 f100（所属行业），全市场只要 1~10 次请求。
-        # 本机到东财是**间歇性**可达（2026-10-19 实测：某两分钟里 200 OK、拿到 496 个
-        # 行业板块，之后连续 ProxyError / ConnectionReset），原路线要「列板块 + 逐板块
-        # 拉成分股」上百次请求，几乎不可能全部撞在可用窗口里。请求越少、成功率越高，
-        # 且拿到一次就永久落盘缓存，之后不再打网络。
-        try:
-            bulk = self._fetch_industry_map_bulk()
-            if len(bulk) >= self._INDUSTRY_BULK_MIN_CODES:
-                self._industry_map = bulk
-                logger.info(f"行业映射（全市场快照）: {len(bulk)} 只")
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"全市场行业快照失败（回退板块循环）: {e}")
-
-        if not self._industry_map:
-            # 路线二（兜底）：先拉板块列表，再逐板块拉成分股 —— 上百次请求，
-            # 只在路线一完全不可用时才走。
-            logger.info("从 AKShare 逐板块获取行业分类…")
+        # ---- 增量基底：载入磁盘已有（哪怕不完整）----
+        base: Dict[str, str] = {}
+        if cache_file.exists():
             try:
-                industry_df = _ak().stock_board_industry_name_em()
-                if len(industry_df) > 0:
-                    # 遍历每个行业获取成分股
-                    industries = industry_df.head(100)["板块名称"].tolist()  # 取前100个行业
-                    for _i, ind in enumerate(industries):
-                        try:
-                            cons = _ak().stock_board_industry_cons_em(symbol=ind)
-                            if len(cons) > 0:
-                                for _, row in cons.iterrows():
-                                    code = str(row.get("代码", ""))
-                                    if code:
-                                        self._industry_map[code] = ind
-                        except Exception:
-                            continue
-                        # 接口"看起来通、其实全空"时要尽早止损：连试 10 个行业
-                        # 一个成分股都没有，再跑下去只是浪费 90 次请求。
-                        if _i >= 9 and not self._industry_map:
-                            logger.warning("连续 10 个行业板块都拿不到成分股，判定接口不可用，提前放弃")
-                            break
-            except Exception as e:
-                logger.warning(f"行业映射获取失败: {e}")
+                _c = _json.loads(cache_file.read_text(encoding="utf-8"))
+                if isinstance(_c, dict):
+                    base = _c
+            except Exception:
+                base = {}
+        self._industry_map = dict(base)
+        if self._industry_map:
+            logger.info(f"行业映射载入增量基底: {len(self._industry_map)} 只")
 
-        # 缓存：只有拿到可信规模才覆盖，否则保留旧值（或仅刷新"失败时间戳"）
-        _n = len(self._industry_map)
+        # ---- 多轮拉取，抢任何可用窗口 ----
+        attempts = 3 if force_refresh else 2
+        for attempt in range(1, attempts + 1):
+            if len(self._industry_map) >= self._INDUSTRY_BULK_MIN_CODES:
+                break
+            logger.info(f"获取行业分类数据（第 {attempt}/{attempts} 轮，已积累 "
+                        f"{len(self._industry_map)} 只）…")
+            try:
+                bulk = self._fetch_industry_map_bulk()
+                if bulk:
+                    before = len(self._industry_map)
+                    self._industry_map.update(bulk)
+                    logger.info(f"东财 f100 本轮 +{len(self._industry_map) - before} 只"
+                                f" → 累计 {len(self._industry_map)} 只")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"东财快照本轮失败: {e}")
+            # 即时落盘，保留累计成果
+            self._persist_industry_map()
+            if len(self._industry_map) >= self._INDUSTRY_BULK_MIN_CODES:
+                break
+            if attempt < attempts:
+                _time.sleep(8)   # 退避，等窗口
+
+        # ---- 退路：THS 行业板块分类（代理允许 q.10jqka.com.cn，作可用性诊断）----
+        # 注意：THS 个股成分股接口在本机 AKShare 版本不可达/需鉴权，故只缓存「行业 taxonomy」
+        # 供诊断，绝不掺进 code→industry 映射（否则会污染中性化）。
+        if len(self._industry_map) < self._INDUSTRY_ACCEPT_FLOOR:
+            try:
+                boards = self._fetch_industry_boards_ths()
+                if boards:
+                    (self.cache_dir / "industry_boards_ths.json").write_text(
+                        _json.dumps(boards, ensure_ascii=False), encoding="utf-8")
+                    logger.info(f"THS 行业板块分类已缓存（{len(boards)} 个，仅诊断用）")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"THS 行业板块获取失败: {e}")
+
+        # ---- 显式状态（替代静默跳过）----
+        n = len(self._industry_map)
+        if n >= self._INDUSTRY_BULK_MIN_CODES:
+            note, tone = "ok", "INFO"
+        elif n >= self._INDUSTRY_ACCEPT_FLOOR:
+            note = (f"partial：已映射 {n} 只（约 {n / 5000:.0%}），"
+                    f"行业中性化仅覆盖已映射个股，其余降级板块级")
+            tone = "WARNING"
+        else:
+            note = (
+                f"skipped：个股→行业映射仅 {n} 只（需≥{self._INDUSTRY_BULK_MIN_CODES}）。"
+                f"根因=代理封锁 push2.eastmoney.com（已实测直连/代理均 ProxyError），"
+                f"THS/csindex 成分股接口在本机 AKShare 版本不可达/需鉴权。"
+                f"行业中性化已降级为板块级。恢复方式：在代理白名单放行 *.eastmoney.com，"
+                f"或在可达网络运行；每小时自动重试，窗口开启即增量补满。"
+            )
+            tone = "WARNING"
+        status = {
+            "at": _dt.now().isoformat(timespec="seconds"),
+            "coverage": n,
+            "floor": self._INDUSTRY_BULK_MIN_CODES,
+            "source": "eastmoney_f100" if n >= self._INDUSTRY_ACCEPT_FLOOR else "none",
+            "note": note,
+        }
         try:
-            if _n >= self._MIN_INDUSTRY_CODES:
-                cache_file.write_text(
-                    _json.dumps(self._industry_map, ensure_ascii=False), encoding="utf-8")
-            elif not cache_file.exists():
-                cache_file.write_text("{}", encoding="utf-8")   # 负缓存：记下"抓不到"
-            else:
-                cache_file.touch()      # 保留旧内容，只刷新负缓存窗口
-        except OSError as e:
-            logger.debug(f"行业映射缓存写入失败（已忽略）: {e}")
-        logger.info(f"行业映射获取完成: {_n} 只")
+            status_file.write_text(_json.dumps(status, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        if tone == "WARNING":
+            logger.warning("⚠️ 行业中性化降级：" + note)
+        else:
+            logger.info(f"行业映射就绪: {n} 只")
         return self._industry_map
+
+    def _persist_industry_map(self) -> None:
+        """把当前（可能不完整的）行业映射立即落盘，保留增量累计成果。"""
+        try:
+            cache_file = self.cache_dir / "industry_map.json"
+            cache_file.write_text(
+                json.dumps(self._industry_map, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            logger.debug(f"行业映射落盘失败（已忽略）: {e}")
+
+    def _fetch_industry_boards_ths(self) -> Dict[str, str]:
+        """THS（同花顺）行业板块分类：name→code。
+
+        经实测本机代理放行 ``q.10jqka.com.cn``，可作为「行业分类可用」的诊断与
+        taxonomy。个股→行业映射仍需东财 f100（被代理封锁），故本函数产物只用于诊断，
+        不掺入 ``industry_map.json``。
+        """
+        try:
+            ak = _ak()
+            df = ak.stock_board_industry_name_ths()
+            out: Dict[str, str] = {}
+            for _, row in df.iterrows():
+                name = str(row.get("name") or "").strip()
+                code = str(row.get("code") or "").strip()
+                if name:
+                    out[name] = code
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"THS 行业板块获取失败: {e}")
+            return {}
     
     def _fetch_industry_map_bulk(self, timeout: float = 12.0, max_pages: int = 12,
-                                 max_seconds: float = 25.0,
+                                 max_seconds: float = 45.0,
                                  _get=None) -> Dict[str, str]:
-        """**一次分页**拿到全市场「代码 → 所属行业」。
+        """一次分页拿到全市场「代码 → 所属行业」（东财 f100）。
 
-        为什么另开这条路：``stock_board_industry_name_em`` + 逐板块拉成分股要上百次
-        请求，而本机到东财是**间歇性**可达（代理和直连都会随机 ProxyError /
-        ConnectionReset），请求越多越不可能全部成功。东财行情列表接口自带
-        ``f100``（所属行业）字段，翻几页就能覆盖全 A 股 —— 抢到一个可用窗口即可，
-        拿到后由调用方落盘，之后永远不再打网络。
+        本机代理封锁 push2.eastmoney.com，故「窗口」极短暂；这里尽量抢：
+        多 host 试探、每页重试、单页失败不中止整轮（继续下一页，能捞多少捞多少）。
+        拿到后由 :meth:`get_industry_map` 增量落盘。
 
-        容错：每一页都「先直连、再走代理」各试一次，任意一页彻底失败就立即返回
-        已有结果（不抛异常），由调用方按覆盖量决定采不采用。
-
-        ⚠️ ``max_seconds`` 是**总时限**，不是单次超时：这条路径是在 18:45 的选股
-        作业里同步跑的，网络全挂时若让「12 页 × 2 次 × 12s」跑满，光等超时就要
-        近 5 分钟，把整个收盘后调度拖住。到点即停，拿多少算多少。
+        ``max_seconds`` 是**总时限**，防止网络全挂时拖住收盘后调度；到点即停。
         """
         try:
             import requests as _rq
@@ -1142,7 +1205,12 @@ class DataFetcher:
         deadline = _time.time() + max(0.0, max_seconds)
 
         getter = _get or _rq.get
-        url = "https://17.push2.eastmoney.com/api/qt/clist/get"
+        # 多 host 试探：代理可能只封了 17.push2，放行其它序号（实测当前全封，留作弹性）
+        hosts = [
+            "https://17.push2.eastmoney.com/api/qt/clist/get",
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            "https://15.push2.eastmoney.com/api/qt/clist/get",
+        ]
         ut = "bd1d9ddb04089700cf9c27f6f7426281"
         # 全 A：沪主板 + 深主板/创业板 + 科创板 + 北交所
         fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
@@ -1151,22 +1219,36 @@ class DataFetcher:
         out: Dict[str, str] = {}
         total = 0
         for pn in range(1, max_pages + 1):
+            if _time.time() > deadline:
+                logger.debug(f"全市场行业快照到时限（{max_seconds:.0f}s），已取 {len(out)} 只")
+                break
             params = {
                 "pn": pn, "pz": page_size, "po": 1, "np": 1, "ut": ut,
                 "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
                 "fields": "f12,f14,f100",
             }
             payload = None
-            # 直连优先（代理失败时它是唯一能通的路），再退回调代理
-            for kwargs in ({"proxies": {"http": None, "https": None}}, {}):
-                try:
-                    resp = getter(url, params=params, timeout=timeout, **kwargs)
-                    payload = (resp.json() or {}).get("data") or {}
+            # 单页最多重试 2 次；每次多 host ×（直连→代理）
+            for _attempt in range(2):
+                for host in hosts:
+                    for kwargs in ({"proxies": {"http": None, "https": None}}, {}):
+                        try:
+                            resp = getter(host, params=params, timeout=timeout, **kwargs)
+                            p = (resp.json() or {}).get("data") or {}
+                            if p.get("diff"):
+                                payload = p
+                                break
+                        except Exception:  # noqa: BLE001
+                            continue
+                    if payload:
+                        break
+                if payload:
                     break
-                except Exception:  # noqa: BLE001
-                    continue
+                if _attempt == 0:
+                    _time.sleep(1)
             if not payload:
-                break
+                # 单页彻底失败：继续下一页（间歇网络可能下一页就通），不中止整轮
+                continue
             rows = payload.get("diff") or []
             if not rows:
                 break
@@ -1180,9 +1262,6 @@ class DataFetcher:
             except (TypeError, ValueError):
                 total = 0
             if total and pn * page_size >= total:
-                break
-            if _time.time() > deadline:
-                logger.debug(f"全市场行业快照到时限（{max_seconds:.0f}s），已取 {len(out)} 只")
                 break
         logger.debug(f"全市场行业快照: {len(out)}/{total or '?'} 只")
         return out

@@ -734,9 +734,17 @@ class Predictor:
                 group_map = ind_map
                 self._last_neutral_kind = "industry"
             else:
+                # 行业级中性化不可用 → 降级为板级（粗粒度）。不再静默：
+                # 读 fetcher 写好的显式状态文件，把根因（如代理封锁东财）打 WARNING。
                 group_map = {p.code: _board_of(p.code) for p in predictions}
                 self._last_neutral_kind = "board"
-                logger.info("行业映射不可用，回退板级中性化（粗粒度，仅去板块水位）")
+                reason = self._read_industry_map_status_note()
+                if reason:
+                    logger.warning(
+                        "行业中性化降级为板级（粗粒度，仅去板块水位）：" + reason)
+                else:
+                    logger.warning(
+                        "行业映射不可用，回退板级中性化（粗粒度，仅去板块水位）")
             scores = pd.Series({p.code: float(p.score) for p in predictions})
             neu = neutralize_cross_section(scores, group_map)
             for p in predictions:
@@ -745,6 +753,21 @@ class Predictor:
         except Exception as e:  # noqa: BLE001
             self._last_neutral_kind = None
             logger.debug(f"截面中性化跳过（安全降级）: {e}")
+
+    @staticmethod
+    def _read_industry_map_status_note() -> str:
+        """读取 fetcher 写好的 ``industry_map_status.json``，返回降级根因（无则返回空串）。"""
+        try:
+            from pathlib import Path
+            from src.data.fetcher import fetcher
+            f = Path(getattr(fetcher, "cache_dir", None) or "") / "industry_map_status.json"
+            if f.exists():
+                import json as _json
+                st = _json.loads(f.read_text(encoding="utf-8"))
+                return str(st.get("note") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
 
     def predict_batch(
         self,
