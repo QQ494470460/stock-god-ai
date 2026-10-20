@@ -647,6 +647,104 @@ def test_settle_cannot_write_into_real_data_dir(force_trading_time, tmp_path):
     assert Path(loopmod.DATA_DIR).resolve() != Path(real_data_dir).resolve()
 
 
+class FakeNotifier:
+    """记录所有推送调用，用于断言「某条通知只发一次」。"""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, title, markdown, payload=None):
+        self.sent.append({"title": title, "markdown": markdown, "payload": payload})
+        return True
+
+
+def test_halt_push_fires_only_once_per_episode(force_trading_time):
+    """熔断期间每个 tick 都推通知 = 轰炸（默认 notify=True 且接了通知渠道时）。
+
+    必须在「进入熔断」那一刻只推一次；解除/自愈后**再次**熔断才重发。
+    """
+    notifier = FakeNotifier()
+    b = FakeBroker()
+    paper = FakePaper()
+    loop = TradingLoop(
+        b, guard=build_supervisor(b, paper_account=paper),
+        paper_account=paper,
+        config=LoopConfig(auto_build_plan=False), notifier=notifier,
+    )
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.guard.kill_switch("测试中控熔断")
+
+    # 连续 5 个 tick：应只在第一次推送，其余 tick 保持静默
+    for _ in range(5):
+        loop.tick()
+    halts = [s for s in notifier.sent if "已熔断" in s["title"]]
+    assert len(halts) == 1, f"熔断通知被推送了 {len(halts)} 次，应仅 1 次"
+
+    # 解除 → 重置标志位；再次熔断 → 必须能重发一次
+    loop.guard.resume(operator="test")
+    loop.tick()                                  # 未熔断 → _halt_notified 复位
+    loop.guard.kill_switch("二次熔断")
+    loop.tick()
+    halts = [s for s in notifier.sent if "已熔断" in s["title"]]
+    assert len(halts) == 2, f"解除后再熔断应重发，实际推送 {len(halts)} 次"
+
+
+def test_settle_is_idempotent_across_process_restart(force_trading_time, tmp_path, monkeypatch):
+    """常驻进程崩溃/重启后，今日结算报告已落盘 → 不再重复结算（防重推日报 + 防计数清零）。
+
+    模拟：① 第一个实例结算一次并落盘运行态；② 新建第二个实例（=重启）后
+    ``_should_settle`` 必须 False —— 即便内存清零，磁盘报告也能拦住重复结算。
+    """
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+
+    loop1 = TradingLoop(
+        b, guard=build_supervisor(b, paper_account=paper),
+        paper_account=paper,
+        config=LoopConfig(auto_build_plan=False, notify=False))
+    loop1.plan = mk_plan([("600519", 90, 0.30)])
+    loop1.tick()                                  # 建仓
+    loop1._settled_dates.clear()
+    loop1._should_settle = lambda now: True
+    loop1.tick()                                  # 结算 → 写报告 + 落盘运行态
+
+    report = tmp_path / "loop_reports" / "loop_report_20261014.json"
+    assert report.exists(), "结算报告未生成，无法验证幂等"
+
+    # ② 重启：新建实例（__init__ 会 _load_runtime 从磁盘读回 settled_dates）
+    loop2 = TradingLoop(
+        b, guard=build_supervisor(b, paper_account=paper),
+        paper_account=paper,
+        config=LoopConfig(auto_build_plan=False, notify=False))
+    # 极端兜底：即便内存没读回运行态，磁盘报告也必须拦住重复结算
+    loop2._settled_dates.clear()
+    assert loop2._should_settle(datetime(2026, 10, 14, 15, 30)) is False, \
+        "重启后不应重复结算（今日报告已存在 / 运行态已落盘）"
+
+
+def test_day_start_equity_persists_across_restart(force_trading_time, tmp_path):
+    """当日起始权益落盘后，重启的新实例能读回，避免 day_pnl 从 0 重算。"""
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_200_000.0, cash=1_200_000.0)
+
+    loop1 = TradingLoop(
+        b, guard=build_supervisor(b, paper_account=paper),
+        paper_account=paper,
+        config=LoopConfig(auto_build_plan=False, notify=False))
+    loop1.plan = mk_plan([("600519", 90, 0.30)])
+    loop1.tick()                                  # 写入 _day_start_equity 并落盘
+    today_s = "2026-10-14"
+    assert today_s in loop1._day_start_equity
+
+    # 重启：读回运行态
+    loop2 = TradingLoop(
+        b, guard=build_supervisor(b, paper_account=paper),
+        paper_account=paper,
+        config=LoopConfig(auto_build_plan=False, notify=False))
+    assert loop2._day_start_equity.get(today_s) == loop1._day_start_equity[today_s], \
+        "重启后当日起始权益未读回，day_pnl 会失真"
+
+
 # ======================================================================
 # 计划的时点语义（跨日不串台）
 # ======================================================================

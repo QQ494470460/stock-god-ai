@@ -227,6 +227,21 @@ class TradingLoop:
             "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
         }
 
+        # ⚠️ 这两项原本是**纯内存**状态，常驻进程崩溃/被开机自启重启后会丢失：
+        #   · _settled_dates 丢失 → 收盘后重复结算，把当天真实的拦截/成交计数清零、
+        #     并重推一遍日报；同时 get_status().settled_today 永远 False（--until-close 永不退）。
+        #   · _day_start_equity 丢失 → 重启后当日盈亏从 0 算起（day_pnl 失真）。
+        # 无人值守闭环的设计就是要自动重启（≤5 次），所以必须把它们持久化到磁盘。
+        # 即便持久化失败，_should_settle 还有「今日报告文件已存在即视为已结算」的
+        # 兜底幂等保护（见 _should_settle）。
+        self._runtime_file: Path = (
+            Path(self.config.heartbeat_file).parent / "loop_runtime.json"
+            if self.config.heartbeat_file
+            else Path(DATA_DIR) / "loop_runtime.json"
+        )
+        self._halt_notified: bool = False   # 熔断通知只发一次，解除后再熔断才重发
+        self._load_runtime()
+
         # 心跳：每次 tick 落盘一次，用于回答「今天到底有没有在跑」。
         self.heartbeat_file: Path = (
             Path(self.config.heartbeat_file) if self.config.heartbeat_file
@@ -302,6 +317,47 @@ class TradingLoop:
         self.heartbeat_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    # ------------------------------------------------------------------
+    # 跨重启持久化（常驻进程崩溃/被开机自启重启后，结算状态 / 当日起始权益不能丢）
+    # ------------------------------------------------------------------
+    def _load_runtime(self) -> None:
+        """把 _settled_dates / _day_start_equity 从磁盘读回（无则保持内存默认值）。
+
+        为什么需要：这两项原先是纯内存状态。无人值守闭环的设计就是要**自动重启**
+        （开机自启 .bat 在崩溃后 ≤5 次内自动拉起），重启后内存清零会导致：
+
+        * 重复结算：把当天真实的拦截/成交计数清零、并重推一遍日报；
+        * ``settled_today`` 永远 False（``--until-close`` 永不退出）；
+        * 当日盈亏从 0 算起（day_pnl 失真）。
+
+        读盘失败（文件不存在/损坏）一律静默忽略 —— 宁可退化成「未结算/从零计」，
+        也绝不让一次读盘异常把整个 tick 打挂（交易主流程优先级最高）。
+        """
+        try:
+            if not self._runtime_file.exists():
+                return
+            data = json.loads(self._runtime_file.read_text(encoding="utf-8"))
+            self._day_start_equity = {
+                k: float(v) for k, v in (data.get("day_start_equity") or {}).items()
+            }
+            self._settled_dates = set(d for d in (data.get("settled_dates") or []) if d)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"闭环运行态读盘失败（已忽略，按内存默认值）: {e}")
+
+    def _save_runtime(self) -> None:
+        """把 _settled_dates / _day_start_equity 落盘（仅在状态变化时调用，频率极低）。"""
+        try:
+            self._runtime_file.parent.mkdir(parents=True, exist_ok=True)
+            self._runtime_file.write_text(
+                json.dumps({
+                    "day_start_equity": self._day_start_equity,
+                    "settled_dates": sorted(self._settled_dates),
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"闭环运行态落盘失败（已忽略）: {e}")
 
     # ------------------------------------------------------------------
     # 账户 / 持仓 / 行情（PAPER 与 LIVE 统一口径）
@@ -613,7 +669,21 @@ class TradingLoop:
                 return False
         except Exception:  # noqa: BLE001
             pass
-        return (now.hour, now.minute) >= (self.config.settle_hour, self.config.settle_minute)
+        if (now.hour, now.minute) < (self.config.settle_hour, self.config.settle_minute):
+            return False
+        # 幂等兜底：今日结算报告已落盘即视为已结算。这是防止**常驻进程崩溃/重启后**
+        # 重复结算的关键 —— 即使运行态文件读盘失败，磁盘上那份报告也能拦住第二次结算，
+        # 避免把当天真实的拦截/成交计数清零、并重推日报。
+        stamp = now.date().strftime("%Y%m%d")
+        report_file = Path(DATA_DIR) / "loop_reports" / f"loop_report_{stamp}.json"
+        if report_file.exists():
+            self._settled_dates.add(now.date())     # 同步内存，使本进程与 get_status() 一致
+            try:
+                self._save_runtime()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        return True
 
     def _settle(self, account, positions, prices, report: TickReport):
         today = _today().strftime("%Y-%m-%d")
@@ -682,6 +752,11 @@ class TradingLoop:
             logger.warning(f"结算报告写入失败: {e}")
 
         self._settled_dates.add(_today())
+        # 落盘：常驻进程重启后不会重复结算 / --until-close 能正确退出
+        try:
+            self._save_runtime()
+        except Exception:  # noqa: BLE001
+            pass
         # 结算报告已落盘，当日累计清零（键保持为今天，避免同一天反复重置）
         self._day_stats = {
             "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
@@ -784,7 +859,10 @@ class TradingLoop:
                 report.cash = float(account.available_cash)
                 report.market_value = float(account.market_value)
                 today = _today().strftime("%Y-%m-%d")
-                self._day_start_equity.setdefault(today, report.equity)
+                if today not in self._day_start_equity:
+                    self._day_start_equity[today] = report.equity
+                    # 落盘：常驻进程重启后当日起始权益仍正确（否则 day_pnl 从 0 算起）
+                    self._save_runtime()
 
             # --- ③ 熔断监控 ---
             if self.guard is not None:
@@ -797,12 +875,19 @@ class TradingLoop:
                     self._set_state(LoopState.HALTED)
                     report.state = self._state.value
                     report.note = "🛑 安全中枢已熔断，停止一切交易"
-                    self._push("⛔ 闭环交易已熔断",
-                               f"熔断原因：{self.guard.safety._state.halt_reason}\n"
-                               f"时间：{now.isoformat(timespec='seconds')}",
-                               {"halted": True})
+                    # 只在「进入熔断」那一刻推一次，避免每个 tick 都推（默认 notify=True，
+                    # 一旦接了通知渠道就会变成通知轰炸）。熔断解除/重启后会重置该标志，
+                    # 下一次再熔断可重新推送。
+                    if not self._halt_notified:
+                        self._halt_notified = True
+                        self._push("⛔ 闭环交易已熔断",
+                                   f"熔断原因：{self.guard.safety._state.halt_reason}\n"
+                                   f"时间：{now.isoformat(timespec='seconds')}",
+                                   {"halted": True})
                     self._last_report = report
                     return report
+                # 未熔断 → 允许下次再触发时重新推送（自愈/手动恢复后重熔断会再报一次）
+                self._halt_notified = False
 
             # --- ④ 收盘结算（不受交易时段限制） ---
             if self._should_settle(now):
