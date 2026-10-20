@@ -790,3 +790,79 @@ def test_daily_loss_halt_message_names_pct_limit_when_pct_trips(tmp_path):
     reason = sup.safety._state.halt_reason
     assert "比例线" in reason, f"比例线触发必须点明，实际: {reason}"
     assert "金额线" in reason, f"金额线同时触发也要点明，实际: {reason}"
+
+
+# ======================================================================
+# 金额线按权益比例推导（2026-10-20：写死 ¥5,000 让 ~¥500 万账户天天熔断）
+# ======================================================================
+
+def test_daily_loss_abs_limit_derives_from_equity_pct():
+    """max_daily_loss_abs_pct>0 时金额线随权益缩放，不再写死。"""
+    c = GuardConfig(max_daily_loss_abs=0.0, max_daily_loss_abs_pct=1.0)
+    assert c.daily_loss_abs_limit(4_995_224.0) == pytest.approx(49_952.24)
+    assert c.daily_loss_abs_limit(1_000_000.0) == pytest.approx(10_000.0)
+    assert c.daily_loss_abs_limit(100_000.0) == pytest.approx(1_000.0)
+
+
+def test_daily_loss_abs_limit_keeps_fixed_when_no_pct():
+    """没配 abs_pct 就完全沿用旧的固定金额线（向后兼容）。"""
+    c = GuardConfig(max_daily_loss_abs=5000.0, max_daily_loss_abs_pct=0.0)
+    assert c.daily_loss_abs_limit(4_995_224.0) == 5000.0
+
+
+def test_daily_loss_abs_limit_fixed_acts_as_floor():
+    """两个都配时固定值当兜底下限，取大者。"""
+    c = GuardConfig(max_daily_loss_abs=5_000.0, max_daily_loss_abs_pct=1.0)
+    assert c.daily_loss_abs_limit(100_000.0) == 5_000.0      # 推导 ¥1,000 < 下限
+    assert c.daily_loss_abs_limit(4_995_224.0) == pytest.approx(49_952.24)
+
+
+def test_daily_loss_abs_limit_disabled_when_both_zero():
+    """两个都是 0 → 不设金额线（inf），只由比例线把关。"""
+    c = GuardConfig(max_daily_loss_abs=0.0, max_daily_loss_abs_pct=0.0)
+    assert c.daily_loss_abs_limit(4_995_224.0) == float("inf")
+
+
+def test_daily_loss_no_longer_halts_small_pct_loss_on_big_account(tmp_path):
+    """回归：¥500 万账户亏 0.23% 不该再熔断（旧写死 ¥5,000 会误杀）。"""
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=0.0, max_daily_loss_abs_pct=1.0,
+    )
+    sup = RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper())
+    sup.safety._state.today_start_equity = 4_995_224.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 4_995_224.0
+    sup.paper_account.cash = 4_995_224.0 - 11_340.0   # 亏 ¥11,340 = 0.23%
+
+    sup.tick_monitor()
+
+    assert sup.safety.halted is False, "0.23% 亏损不该触发熔断（金额线已按 1% 推导）"
+
+
+def test_daily_loss_still_halts_when_derived_abs_line_trips(tmp_path):
+    """推导出来的金额线该熔断时仍要熔断，且原因里写清是推导值。"""
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=0.0, max_daily_loss_abs_pct=1.0,
+    )
+    sup = RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper())
+    sup.safety._state.today_start_equity = 4_995_224.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 4_995_224.0
+    sup.paper_account.cash = 4_995_224.0 - 60_000.0   # 亏 ¥6 万 = 1.2% > 1% 金额线
+
+    sup.tick_monitor()
+
+    assert sup.safety.halted is True
+    reason = sup.safety._state.halt_reason
+    assert "金额线" in reason and "权益×1.00%" in reason, f"须点明推导口径，实际: {reason}"
+    assert "比例线" not in reason, f"3% 比例线没触发，不该出现，实际: {reason}"
+
+
+def test_abs_pct_is_evolution_protected():
+    """新参数属风控硬线，进化引擎不许自动改。"""
+    from src.evolution.space import PROTECTED_LEAVES
+    assert "max_daily_loss_abs_pct" in PROTECTED_LEAVES

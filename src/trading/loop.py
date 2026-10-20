@@ -331,7 +331,27 @@ class TradingLoop:
                 price = float(tick.last_price)
         except Exception:  # noqa: BLE001
             pass
-        # 2) 兜底：日线收盘价（模拟盘 / 离线可用）
+        # 2) 公开实时行情兜底（券商 tick 不可用时的**首选**兜底）
+        #    ⚠️ 这一步不能省，也不能排在日线后面。2026-10-20 实测：模拟盘券商
+        #    tick 恒不可用，于是估值一路退到日线 close —— 盘中那就是**昨收**，
+        #    而买入用的是实时价。结果每笔持仓一买进去就"浮亏" 1%~3%，
+        #    9 笔合计凭空 -¥5.5 万，直接把单日亏损熔断打爆（闭环当天停摆）。
+        #    买入口径与估值口径必须同源，否则风控读到的是幽灵亏损。
+        if price <= 0 and self.config.price_fallback:
+            try:
+                from src.data.fetcher import fetcher
+                q = fetcher.get_realtime_quote(code)
+                if isinstance(q, dict):
+                    p = float(q.get("最新价") or 0)
+                    if p > 0:
+                        price = p
+                elif q is not None:
+                    p = float(getattr(q, "last_price", 0) or getattr(q, "price", 0) or 0)
+                    if p > 0:
+                        price = p
+            except Exception:  # noqa: BLE001
+                pass
+        # 3) 兜底：日线收盘价（离线 / 盘后可用；盘中会退化为昨收，仅最后手段）
         if price <= 0 and self.config.price_fallback and self._price_fn is None:
             try:
                 from src.data.fetcher import fetcher
@@ -340,7 +360,7 @@ class TradingLoop:
                     price = float(df["close"].iloc[-1])
             except Exception:  # noqa: BLE001
                 pass
-        # 3) 外部注入的价格函数
+        # 4) 外部注入的价格函数
         if price <= 0 and self._price_fn is not None:
             try:
                 price = float(self._price_fn(code) or 0)
@@ -382,8 +402,16 @@ class TradingLoop:
         try:
             before = {c: h.get("last_price") for c, h in pa.holdings.items()}
             pa.mark_to_market(clean)
-            return any(pa.holdings[c].get("last_price") != before.get(c)
-                       for c in pa.holdings)
+            changed = any(pa.holdings[c].get("last_price") != before.get(c)
+                          for c in pa.holdings)
+            # 必须落盘：看板是另一个进程，只改内存的话它永远读到旧价，
+            # 同一屏上会出现「持仓浮盈 +x%」与「当日亏损 -y%」互相矛盾。
+            if changed and hasattr(pa, "save"):
+                try:
+                    pa.save()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"纸账户 mark 后落盘失败（已忽略）: {e}")
+            return changed
         except Exception as e:  # noqa: BLE001
             logger.debug(f"纸账户 mark_to_market 失败（已忽略）: {e}")
             return False

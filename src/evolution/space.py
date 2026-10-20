@@ -62,6 +62,7 @@ PROTECTED_LEAVES: Tuple[str, ...] = (
     "max_portfolio_drawdown_pct",
     "max_daily_loss_pct",
     "max_daily_loss_abs",
+    "max_daily_loss_abs_pct",
     "max_single_position_pct",
     "max_orders_per_minute",
     "max_orders_per_tick",          # 防雪崩闸门，属安全阀

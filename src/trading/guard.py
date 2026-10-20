@@ -80,7 +80,10 @@ class GuardConfig:
     # ---- 组合级风控（熔断）----
     max_portfolio_drawdown_pct: float = 8.0   # 峰谷最大回撤熔断线(%)
     max_daily_loss_pct: float = 3.0           # 单日最大亏损比例(%)
-    max_daily_loss_abs: float = 5000.0        # 单日最大亏损金额(元)
+    max_daily_loss_abs: float = 5000.0        # 单日最大亏损金额(元)；0=不设固定金额线
+    # 金额线也可按「当前权益 × 百分比」推导，账户规模变化时自动缩放。
+    # >0 时生效，并与 max_daily_loss_abs 取大者（固定值当兜底下限）。
+    max_daily_loss_abs_pct: float = 0.0       # 单日最大亏损金额线(占权益%)
 
     # ---- 持仓约束 ----
     max_positions: int = 20                  # 最大持仓只数
@@ -129,6 +132,27 @@ class GuardConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def daily_loss_abs_limit(self, equity: float) -> float:
+        """单日亏损「绝对金额线」的实际阈值。
+
+        历史坑：写死 ¥5,000 对小额账户合理，但账户做到 ~¥500 万后只占 0.10%，
+        几乎每天都熔断，闭环事实上跑不起来（2026-10-20 就是这么停的）。
+        因此支持按权益比例推导：
+
+        - max_daily_loss_abs_pct > 0 → 金额线 = 权益 × pct%，并取 max(固定值, 推导值)
+          （固定值只当兜底下限，设 0 即完全交给比例推导）
+        - 否则 → 沿用固定金额线 max_daily_loss_abs
+        - 两者都为 0 → 返回 inf，等于「不设金额线」，只由 3% 比例线把关
+        """
+        fixed = float(self.max_daily_loss_abs or 0.0)
+        pct = float(self.max_daily_loss_abs_pct or 0.0)
+        if pct > 0:
+            derived = max(0.0, float(equity or 0.0)) * pct / 100.0
+            return max(fixed, derived)
+        if fixed > 0:
+            return fixed
+        return float("inf")
 
 
 # ======================================================================
@@ -1307,8 +1331,9 @@ class RiskSupervisor:
         # 单日亏损熔断（比例线 / 绝对金额线，任一触发即停）
         dl = self.safety.daily_loss_pct(equity)
         loss_abs = -dl / 100.0 * self.safety._state.today_start_equity
+        abs_limit = self.config.daily_loss_abs_limit(self.safety._state.today_start_equity)
         hit_pct = dl <= -self.config.max_daily_loss_pct
-        hit_abs = loss_abs >= self.config.max_daily_loss_abs
+        hit_abs = loss_abs >= abs_limit
         if hit_pct or hit_abs:
             # ⚠️ 必须说清是**哪条线**触发的。只报百分比会严重误导排障：
             # 2026-10-20 实际是绝对金额线（¥11,340 ≥ ¥5,000）触发的，
@@ -1318,7 +1343,11 @@ class RiskSupervisor:
             if hit_pct:
                 which.append(f"比例线 {dl:.2f}% ≤ -{self.config.max_daily_loss_pct:.1f}%")
             if hit_abs:
-                which.append(f"金额线 ¥{loss_abs:,.0f} ≥ ¥{self.config.max_daily_loss_abs:,.0f}")
+                abs_desc = ("∞（未设金额线）" if abs_limit == float("inf")
+                            else f"¥{abs_limit:,.0f}"
+                            + (f" = 权益×{self.config.max_daily_loss_abs_pct:.2f}%"
+                               if float(self.config.max_daily_loss_abs_pct or 0) > 0 else ""))
+                which.append(f"金额线 ¥{loss_abs:,.0f} ≥ {abs_desc}")
             reason = (f"单日亏损熔断（{'；'.join(which)}；"
                       f"当日亏损 {dl:.2f}% / ¥{loss_abs:,.0f}）")
             self.safety.halt(reason, operator="auto(dailyloss)")

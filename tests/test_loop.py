@@ -780,3 +780,93 @@ def test_no_auto_build_never_rebuilds_and_skips_validity_check(monkeypatch):
     assert box["n"] == 0
     assert loop.plan is stale, "auto_build_plan=False 时不该替换手放的计划"
 
+
+
+# ======================================================================
+# 取价口径：买入口径必须与估值口径同源（2026-10-20 幽灵亏损事故）
+# ======================================================================
+
+class DeadTickBroker(FakeBroker):
+    """券商 tick 恒不可用（模拟盘实测如此），逼出兜底路径。"""
+
+    def get_tick(self, code):
+        return TickData(code=code, name=code, last_price=0.0, open=0.0,
+                        high=0.0, low=0.0, pre_close=0.0,
+                        volume=0, amount=0.0, bid1=0.0, ask1=0.0)
+
+
+def test_price_of_prefers_realtime_over_stale_daily_close(monkeypatch, tmp_path):
+    """券商 tick 挂了 → 必须取实时公开行情，不能一路退到日线 close(=昨收)。
+
+    事故复盘：买入用实时价、估值用昨收，每笔持仓一买进去就"浮亏" 1%~3%，
+    9 笔合计凭空 -¥5.5 万，直接把单日亏损熔断打爆，闭环当天停摆。
+    """
+    import src.data.fetcher as fetcher_mod
+
+    monkeypatch.setattr(fetcher_mod.fetcher, "get_realtime_quote",
+                        lambda code: {"代码": code, "最新价": 64.13, "昨收": 63.20})
+    monkeypatch.setattr(
+        fetcher_mod.fetcher, "get_daily_kline",
+        lambda code: _FakeFrame(63.20))          # 昨收，退化值
+
+    loop = TradingLoop(DeadTickBroker(), config=LoopConfig(
+        dry_run=True, heartbeat_file=str(tmp_path / "hb.json")))
+    loop._price_cache.clear()
+
+    assert loop._price_of("002008") == pytest.approx(64.13), \
+        "必须取实时价 64.13，而不是日线昨收 63.20"
+
+
+def test_price_of_falls_back_to_daily_close_only_when_realtime_missing(monkeypatch, tmp_path):
+    """实时行情也拿不到时，才允许退到日线 close（离线/盘后）。"""
+    import src.data.fetcher as fetcher_mod
+
+    monkeypatch.setattr(fetcher_mod.fetcher, "get_realtime_quote", lambda code: None)
+    monkeypatch.setattr(fetcher_mod.fetcher, "get_daily_kline",
+                        lambda code: _FakeFrame(63.20))
+
+    loop = TradingLoop(DeadTickBroker(), config=LoopConfig(
+        dry_run=True, heartbeat_file=str(tmp_path / "hb.json")))
+    loop._price_cache.clear()
+
+    assert loop._price_of("002008") == pytest.approx(63.20)
+
+
+def test_mark_to_market_persists_so_other_processes_agree(tmp_path):
+    """mark 完必须落盘：看板是另一个进程，只改内存它永远读到旧价。"""
+    from src.trading.paper import PaperAccount
+
+    pa = PaperAccount(account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json")
+    pa.holdings["002008"] = {"code": "002008", "name": "大族激光",
+                             "quantity": 100, "avg_cost": 63.20,
+                             "last_price": 63.20, "market_value": 6320.0}
+    pa.mark_to_market({"002008": 64.13})
+    pa.save()
+
+    reread = PaperAccount(account_file=tmp_path / "pa.json",
+                          history_file=tmp_path / "ph.json")
+    assert reread.holdings["002008"]["last_price"] == pytest.approx(64.13), \
+        "落盘后重开必须读到 mark 后的价，否则跨进程口径不一致"
+
+
+class _FakeFrame:
+    """最小 DataFrame 替身，只需支持 df['close'].iloc[-1]。"""
+
+    def __init__(self, close: float):
+        self.close = _FakeSeries(close)
+
+    def __getitem__(self, key):
+        return self.close if key == "close" else _FakeSeries(0.0)
+
+    def __len__(self):
+        return 1
+
+
+class _FakeSeries:
+    def __init__(self, v):
+        self._v = v
+        self.iloc = self
+
+    def __getitem__(self, i):
+        return self._v

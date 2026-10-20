@@ -182,6 +182,17 @@ class PaperAccount:
         except Exception:
             pass
     
+    def save(self):
+        """对外落盘入口。
+
+        ``mark_to_market()`` 只改内存，历史上从不落盘 —— 于是
+        ``data/paper_account.json`` 里的 ``last_price`` 一直停在下一次买入/卖出
+        那一刻。看板是**另一个进程**，读到的就是这份陈旧文件，于是持仓浮盈和
+        风控口径对不上（2026-10-20：磁盘估值比真实低 ¥4 万，凭空多出 -¥5.5 万
+        当日亏损，直接把熔断打爆）。mark 完必须让磁盘跟上。
+        """
+        self._save()
+
     def _save_history(self):
         try:
             records = [r.__dict__ for r in self.trade_history[-500:]]  # 保留最近500条
