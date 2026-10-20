@@ -118,3 +118,57 @@ def test_default_paths_point_at_production():
     """默认路径必须仍是生产的 data/ 目录（防止有人把默认值改歪）。"""
     assert PAPER_ACCOUNT_FILE == ROOT / "data" / "paper_account.json"
     assert PAPER_HISTORY_FILE == ROOT / "data" / "paper_trade_history.json"
+
+
+# ======================================================================
+# 当日盈亏口径（2026-10-20 排障：today_pnl 是已实现口径，被当成当日盈亏展示）
+# ======================================================================
+
+def test_day_start_equity_is_captured_before_first_buy(tmp_path):
+    """当日基线必须在**第一笔建仓之前**定格，否则当天第一笔的损益会被吞掉。"""
+    pa = PaperAccount(account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json", initial_cash=100_000.0)
+    assert pa.day_start_equity() is None, "新建账户当日基线未定，不应伪造一个数"
+
+    pa.buy("002008", "大族激光", price=10.0, quantity=1000)   # 花 ~1万建仓
+    # 现金被抽走，但基线必须仍是 10 万（不能变成 9 万）
+    assert pa.day_start_equity() == 100_000.0
+
+
+def test_today_pnl_market_reflects_floating_loss_not_only_sells(tmp_path):
+    """只买不卖时，已实现口径恒为 0，但当日浮亏必须能被看见。"""
+    pa = PaperAccount(account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json", initial_cash=100_000.0)
+    pa.buy("002008", "大族激光", price=10.0, quantity=1000)
+    pa.mark_to_market({"002008": 9.0})          # 浮亏 1000
+
+    assert pa.today_pnl == 0.0, "已实现口径：本例没有卖出，应为 0"
+    # 市值口径必须看到浮亏（不能被建仓抽走的现金当成亏损）
+    assert pa.today_pnl_market() < -900.0
+    assert pa.today_return_pct() < -0.9
+
+
+def test_today_pnl_market_ignores_cash_outflow_from_building_position(tmp_path):
+    """建仓本身不是亏损：把现金换成都市值不应产生当日亏损。"""
+    pa = PaperAccount(account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json", initial_cash=100_000.0)
+    pa.buy("002008", "大族激光", price=10.0, quantity=1000)
+    pa.mark_to_market({"002008": 10.0})         # 价格与成本一致
+
+    assert pa.today_pnl_market() < 0, "有手续费，应为小额负数"
+    assert pa.today_pnl_market() > -100.0, "只应是手续费量级，绝不是 -9000 的现金缺口"
+
+
+def test_day_start_equity_survives_restart(tmp_path):
+    """跨进程重启后当日基线不能丢，否则收益率会闪回 0 看起来像系统失忆。"""
+    pa = PaperAccount(account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json", initial_cash=100_000.0)
+    pa.buy("002008", "大族激光", price=10.0, quantity=1000)
+    pa.mark_to_market({"002008": 9.5})
+    pa.save()
+    before = pa.today_pnl_market()
+
+    pa2 = PaperAccount(account_file=tmp_path / "pa.json",
+                       history_file=tmp_path / "ph.json")
+    assert pa2.day_start_equity() == 100_000.0
+    assert pa2.today_pnl_market() == pytest.approx(before, abs=1.0)

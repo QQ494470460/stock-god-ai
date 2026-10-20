@@ -547,11 +547,17 @@ def _render_dashboard():
 
     account = broker.query_account()
     if account:
+        # 「今日盈亏」用纸账户的市值口径（已实现+浮动），不用 account.today_pnl ——
+        # 后者是券商侧的当日盈亏，模拟盘下与纸账户对不上，两个数字同屏会打架。
+        _pa = globals().get("paper_account", None)
+        _today_pnl = getattr(account, "today_pnl", 0.0) or 0.0
+        if _pa is not None and hasattr(_pa, "today_pnl_market"):
+            _today_pnl = _pa.today_pnl_market()
         cols = st.columns(4)
         cols[0].metric("💰 总资产", f"¥{account.total_asset:,.0f}")
         cols[1].metric("🏦 可用资金", f"¥{account.available_cash:,.0f}")
         cols[2].metric("📦 持仓市值", f"¥{account.market_value:,.0f}")
-        cols[3].metric("📈 今日盈亏", f"¥{account.today_pnl:+,.0f}")
+        cols[3].metric("📈 今日盈亏", f"¥{_today_pnl:+,.0f}")
 
     st.markdown("---")
     positions = broker.query_positions()

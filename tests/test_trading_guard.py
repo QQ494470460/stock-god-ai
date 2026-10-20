@@ -866,3 +866,21 @@ def test_abs_pct_is_evolution_protected():
     """新参数属风控硬线，进化引擎不许自动改。"""
     from src.evolution.space import PROTECTED_LEAVES
     assert "max_daily_loss_abs_pct" in PROTECTED_LEAVES
+
+
+def test_daily_loss_abs_line_ignored_when_baseline_missing(tmp_path):
+    """当日基线缺失/为 0 时不能拿 0 当基线比金额线（会恒成立 → 开盘即误熔断）。"""
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=0.0, max_daily_loss_abs_pct=1.0,
+    )
+    sup = RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper())
+    sup.safety._state.today_start_equity = 0.0        # 基线坏掉
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 1_000_000.0
+
+    sup.tick_monitor()
+
+    assert sup.safety.halted is False, "基线为 0 时金额线判据必须失效，不能误熔断"

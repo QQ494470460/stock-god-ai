@@ -80,6 +80,9 @@ class PaperAccount:
         self.today_pnl = 0.0
         self.today_trades = 0
         self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
+        # 当日起始权益（float | None）。None = 当日尚未建仓/尚未定基线，
+        # 此时 today_pnl_market() 退化为 today_pnl（已实现口径），不会返回假数。
+        self._day_start_equity: Optional[float] = None
         
         # 线程安全
         self._lock = threading.Lock()
@@ -150,6 +153,14 @@ class PaperAccount:
                         float(h.get("market_value", 0.0)) for h in self.holdings.values()
                     )
                     self.initial_cash = loaded_equity
+                # 当日基线：跨进程重启后当日盈亏不能归零重算，
+                # 否则「重启一次，当日收益率就闪回 0」—— 用户会以为系统失忆。
+                # 存档里有就用存档的；没有（当日首个进程）才以载入总资产为基线。
+                self._day_start_equity = data.get("day_start_equity", None)
+                if self._day_start_equity is None:
+                    self._day_start_equity = (self.cash + sum(
+                        float(h.get("market_value", 0.0)) for h in self.holdings.values()
+                    )) if self._last_reset_date == datetime.now().strftime("%Y-%m-%d") else None
                 logger.info(f"📂 纸交易账户已恢复: 现金 ¥{self.cash:,.0f}, {len(self.holdings)} 只持仓"
                             f" · 本金基线 ¥{self.initial_cash:,.0f}")
             else:
@@ -176,6 +187,7 @@ class PaperAccount:
                 "today_pnl": self.today_pnl,
                 "today_trades": self.today_trades,
                 "last_reset_date": self._last_reset_date,
+                "day_start_equity": self._day_start_equity,
             }
             self.account_file.parent.mkdir(parents=True, exist_ok=True)
             self.account_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -192,6 +204,36 @@ class PaperAccount:
         当日亏损，直接把熔断打爆）。mark 完必须让磁盘跟上。
         """
         self._save()
+
+    # ========== 当日盈亏口径 ==========
+
+    def day_start_equity(self) -> Optional[float]:
+        """当日起始权益（现金 + 持仓按买入成本计）。
+
+        用于算**真实**当日盈亏：``总资产 − 当日起始权益``。
+        ``today_pnl`` 只在**卖出**时累加已实现盈亏，是"已实现口径"，
+        绝不能当成"今日赚了多少"展示 —— 一整天只买不卖时它会停在 0，
+        而现金已经被建仓抽走，看上去像"没亏"；反过来若把现金变动当成盈亏
+        又会把建仓误算成亏损。两种口径混用是 2026-10-20 排障时最大的误导源。
+
+        返回 None = 当日基线未定（新建账户尚未建仓，或跨日刚重置）。
+        """
+        return (None if self._day_start_equity is None
+                else float(self._day_start_equity))
+
+    def today_return_pct(self) -> float:
+        """当日收益率（%），基于 day_start_equity；无基线时返回 0。"""
+        base = self._day_start_equity
+        if not base or base <= 0:
+            return 0.0
+        return (self.get_total_asset() - base) / base * 100.0
+
+    def today_pnl_market(self) -> float:
+        """当日浮动盈亏（已实现 + 持仓浮动），口径与风控一致。"""
+        base = self._day_start_equity
+        if not base:
+            return self.today_pnl
+        return self.get_total_asset() - base
 
     def _save_history(self):
         try:
@@ -215,6 +257,8 @@ class PaperAccount:
                 _h["today_quantity"] = 0
                 _h["available"] = int(_h.get("quantity", 0) or 0)
             self._last_reset_date = today
+            # 新的一天：当日基线必须跟着重置，否则收益率会拿昨天的起点算，恒为负
+            self._day_start_equity = None
             self._save()
     
     # ========== 交易操作 ==========
@@ -224,6 +268,11 @@ class PaperAccount:
         """买入（虚拟成交）"""
         with self._lock:
             self._check_daily_reset()
+            # 当日第一笔建仓前先定格基线：此刻 total_asset 才是真正的"今日起点"
+            if self._day_start_equity is None:
+                self._day_start_equity = self.cash + sum(
+                    float(h.get("market_value", 0.0) or 0.0)
+                    for h in self.holdings.values())
             
             # 最小1手
             quantity = (quantity // 100) * 100
@@ -373,6 +422,12 @@ class PaperAccount:
     def mark_to_market(self, prices: Dict[str, float]):
         """按最新市价更新持仓市值"""
         with self._lock:
+            # 当日首个有效行情 = 当日基线定格点。必须在 mark 之前取，
+            # 否则买入/卖出改变现金后再定基线，会把当天第一笔的损益吞掉。
+            if self._day_start_equity is None:
+                self._day_start_equity = self.cash + sum(
+                    float(h.get("market_value", 0.0) or 0.0)
+                    for h in self.holdings.values())
             for code, price in prices.items():
                 if code in self.holdings:
                     self.holdings[code]["last_price"] = price

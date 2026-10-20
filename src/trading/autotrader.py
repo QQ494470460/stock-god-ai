@@ -231,14 +231,36 @@ class AutoTrader:
         if self.paper_account:
             prices = {}
             for code in self.paper_account.holdings:
+                price = 0.0
+                # 1) 券商实时行情
                 try:
                     tick = self.broker.get_tick(code)
-                    if tick:
-                        prices[code] = tick.last_price
+                    if tick and getattr(tick, "last_price", 0) > 0:
+                        price = float(tick.last_price)
                 except Exception:
                     pass
+                # 2) 公开实时行情兜底 —— 与 loop._price_of 保持同源。
+                #    缺这一步的话：券商 tick 不可用时（模拟盘实测恒不可用）
+                #    这里会**完全跳过 mark**，纸账户 last_price 永远停在成交价，
+                #    看板（另一进程读 JSON）看到的就是过期估值。
+                if price <= 0:
+                    try:
+                        from src.data.fetcher import fetcher
+                        q = fetcher.get_realtime_quote(code)
+                        if isinstance(q, dict):
+                            price = float(q.get("最新价") or 0)
+                    except Exception:
+                        pass
+                if price > 0:
+                    prices[code] = price
             if prices:
                 self.paper_account.mark_to_market(prices)
+                # 变更后必须落盘，否则跨进程永远读到旧价（loop 已修，此处对齐）
+                if hasattr(self.paper_account, "save"):
+                    try:
+                        self.paper_account.save()
+                    except Exception:  # noqa: BLE001
+                        pass
         
         # 3. 持仓股票：AI信号检查是否需要卖出
         positions = self.broker.query_positions()

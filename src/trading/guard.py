@@ -1331,9 +1331,15 @@ class RiskSupervisor:
         # 单日亏损熔断（比例线 / 绝对金额线，任一触发即停）
         dl = self.safety.daily_loss_pct(equity)
         loss_abs = -dl / 100.0 * self.safety._state.today_start_equity
-        abs_limit = self.config.daily_loss_abs_limit(self.safety._state.today_start_equity)
+        # ⚠️ 基线缺失/异常时**不能**拿 0 当基线去比金额线：limit 会算成 ¥0，
+        # 于是 loss_abs(≥0) ≥ 0 恒成立 → 每天开盘第一 tick 就误熔断。
+        # 基线不可信时只让比例线说话（它不依赖基线金额）。
+        _base = self.safety._state.today_start_equity
+        _base_ok = isinstance(_base, (int, float)) and _base > 0
+        abs_limit = self.config.daily_loss_abs_limit(_base if _base_ok else 0.0)
+        abs_limit = abs_limit if _base_ok else float("inf")
         hit_pct = dl <= -self.config.max_daily_loss_pct
-        hit_abs = loss_abs >= abs_limit
+        hit_abs = _base_ok and loss_abs >= abs_limit
         if hit_pct or hit_abs:
             # ⚠️ 必须说清是**哪条线**触发的。只报百分比会严重误导排障：
             # 2026-10-20 实际是绝对金额线（¥11,340 ≥ ¥5,000）触发的，

@@ -106,13 +106,18 @@ def rebuild(state: dict, rows) -> tuple[dict, dict]:
     for wk, accs in acc_by_window.items():
         slot = perf.setdefault(wk, {"accuracy": [], "n": 0})
         slot["accuracy"] = accs[-WINDOW_KEEP:]
-        slot["n"] = n_by_window[wk]
-        # 只保留最近 20 条，但 n 记总批次次数（与线上口径一致）
+        # ⚠️ n 必须是「窗口内的样本数」= len(accuracy)，不是历史总批次数。
+        # 线上 record_verification() 的 accuracy 会被 [-20:] 截断，但 n 一直累加，
+        # 于是线上 n 与 len(accuracy) 本来就可能不等（这是已知的口径瑕疵，
+        # should_retrain 读的也是 len(accuracy)）。回填若把 n 设成总批次数，
+        # 就会造出「n=36 但只有 18 条数据」的假样本量，误导排障与后续判断。
+        # 这里跟 len(accuracy) 对齐，两边口径才一致。
+        slot["n"] = len(slot["accuracy"])
 
     stats = {"windows": {}, "before": before}
     for wk in sorted(acc_by_window):
         stats["windows"][wk] = {
-            "n_total": n_by_window[wk],
+            "n_records": n_by_window[wk],
             "kept": min(n_by_window[wk], WINDOW_KEEP),
             "acc": acc_by_window[wk][-WINDOW_KEEP:],
         }
@@ -154,9 +159,12 @@ def main() -> int:
     print(f"📥 待重放验证记录: {len(rows)} 条")
     for wk, s in stats["windows"].items():
         old = stats["before"].get(wk, {})
-        print(f"  {wk}: n {old.get('n', 0)} → {s['n_total']}"
-              f" | 保留最近 {s['kept']} 条 | 均值 {avg(s['acc']):.1%}"
-              f" (原 {avg(old.get('acc') or []):.1%})")
+        old_acc = old.get("acc") or []
+        print(f"  {wk}: n {old.get('n', 0)} → {s['kept']}"
+              f" | 窗口内样本 {s['kept']} 条（历史共 {s['n_records']} 条）"
+              f" | 均值 {avg(s['acc']):.1%} (原 {avg(old_acc):.1%})")
+        if old_acc and len(old_acc) == len(s["acc"]) and old_acc != s["acc"]:
+            print("        ⚠️ 同等长度但内容不同，请确认是新增数据而非重放污染")
         print(f"        accuracy = {s['acc']}")
 
     if not args.apply:

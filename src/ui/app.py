@@ -915,11 +915,18 @@ def _today_status_data() -> dict:
             mv = sum(float(h.get("market_value") or 0) for h in hold.values())
             cash = float(acc.get("cash") or 0)
             init = float(acc.get("initial_cash") or 0) or (cash + mv)
+            # 当日盈亏必须用「总资产 − 当日基线」的市值口径。
+            # 存档里的 today_pnl 是**只累计卖出**的已实现口径：只买不卖时恒为 0，
+            # 一旦拿它当"今日盈亏"展示，看到的就是一个跟真实账户无关的数
+            # （2026-10-20 就把 -¥5.5 万的已实现亏损挂在首屏上误导排障）。
+            day_base = acc.get("day_start_equity")
+            equity = cash + mv
+            today_pnl = (equity - float(day_base)) if day_base else float(acc.get("today_pnl") or 0)
             out["acct"] = {
-                "equity": cash + mv,
+                "equity": equity,
                 "n_pos": len(hold),
-                "pnl": float(acc.get("today_pnl") or 0),
-                "ret": ((cash + mv) / init - 1.0) if init else 0.0,
+                "pnl": today_pnl,
+                "ret": (equity / init - 1.0) if init else 0.0,
             }
         except Exception:  # noqa: BLE001
             pass
