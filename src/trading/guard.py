@@ -1315,9 +1315,51 @@ class RiskSupervisor:
                 self.safety._state.baseline_account = acct_id
                 self.safety._save()
 
-        # 首次记录当日起始净值
-        if self.safety._state.today_date != datetime.now().strftime("%Y-%m-%d"):
-            self.safety.set_today_start(equity)
+        # ---- 新交易日边界 ----
+        # 自动熔断（单日亏损 / 组合回撤）本质是「按日 / 按状态」的风险断路器，
+        # 隔夜后应自愈，否则无人值守循环会在任何一次熔断后永久停摆、再也不
+        # 交易，直到有人手动 resume —— 这直接违背了「无人值守」的初衷。
+        #
+        # 安全约束（守住铁律，缺一不可）：
+        #  1) 仅自愈「自动触发」的熔断（halted_by 以 "auto(" 开头）。
+        #     人工 KILL SWITCH（kill_switch / 看板手动，operator=user/dashboard/system）
+        #     绝不自动恢复，必须人工 resume。
+        #  2) 实盘(LIVE/LIVE_PENDING)模式下的任何熔断都不自动恢复 ——
+        #     自动恢复等于「无人值守自动回实盘」，违反「绝不自动实盘」。
+        #     这类熔断需人工 resume（resume 会强制回到 PAPER）。
+        #  3) 自愈后保持当前模式（通常是 PAPER），不会因此进入实盘。
+        #  4) legacy 状态（halted_by 为空）按「非自动」处理 —— 宁可不动，
+        #     也不在信息不足时擅自放行，fail-safe。
+        #
+        # 注：回撤熔断是「峰值相对当前」的，自愈后下一 tick 若仍超阈值会
+        # 立即重新熔断 —— 等于「每天重新评估一次」，既恢复交易能力、
+        # 又不丢失对持续深跌的保护；单日亏损熔断则随今日基线重置自然归零。
+        today = datetime.now().strftime("%Y-%m-%d")
+        st = self.safety._state
+        if st.today_date != today:
+            if st.halted:
+                _by = st.halted_by or ""
+                _is_auto = _by.startswith("auto(")
+                _is_paper = self.safety.mode == TradingMode.PAPER
+                if _is_auto and _is_paper:
+                    _reason = st.halt_reason or _by
+                    with self.safety._lock:
+                        st.halted = False
+                        st.halt_reason = ""
+                        st.halt_at = ""
+                        st.halted_by = ""
+                        self.safety._save()
+                    logger.warning(
+                        f"♻️ 自动熔断已于新交易日自愈（缘由 {_by}：{_reason}），"
+                        f"无人值守循环恢复交易（保持 PAPER 模式）"
+                    )
+                    alerts.append(f"自动熔断新交易日自愈：{_reason}")
+                    self.safety.set_today_start(equity)
+                else:
+                    # 人工 / 实盘熔断：不解除，仅刷新当日起始净值
+                    self.safety.set_today_start(equity)
+            else:
+                self.safety.set_today_start(equity)
 
         self.safety.update_equity(equity)
 

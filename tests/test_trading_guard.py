@@ -314,6 +314,64 @@ def test_kill_switch_blocks_trading(tmp_path):
     assert prop.status == "blocked"
 
 
+def _halt_state(sup, by="auto(dailyloss)", reason="单日亏损熔断", day="2000-01-01"):
+    """把安全中枢置为「已熔断」状态，便于测试新交易日自愈逻辑。"""
+    sup.safety._state.halted = True
+    sup.safety._state.halted_by = by
+    sup.safety._state.halt_reason = reason
+    sup.safety._state.halt_at = "2000-01-01T09:30:00"
+    sup.safety._state.today_date = day
+    sup.safety._state.today_start_equity = 1_000_000.0
+    sup.safety._state.peak_equity = 1_000_000.0
+
+
+def _make_sup(tmp_path):
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"))
+    paper = FakePaper(total=1_000_000)
+    return RiskSupervisor(FakeBroker(total_asset=1_000_000), cfg, paper_account=paper), paper
+
+
+def test_tick_monitor_clears_yesterdays_auto_halt_on_new_day(tmp_path):
+    """新交易日，自动熔断（auto(...)）应在 PAPER 模式下自愈，恢复无人值守闭环。"""
+    sup, _ = _make_sup(tmp_path)
+    _halt_state(sup)  # auto(dailyloss)，旧日期
+    assert sup.safety.halted is True
+
+    sup.tick_monitor()  # 当前日期 ≠ today_date，应进入新交易日自愈分支
+
+    assert sup.safety.halted is False
+    assert sup.safety._state.halted_by == ""
+    assert sup.safety._state.halt_reason == ""
+    assert sup.safety._state.today_date == datetime.now().strftime("%Y-%m-%d")
+
+
+def test_tick_monitor_does_not_clear_auto_halt_same_day(tmp_path):
+    """同一交易日内的自动熔断不可自愈：必须熬到新交易日边界才恢复。"""
+    sup, _ = _make_sup(tmp_path)
+    _halt_state(sup, day=datetime.now().strftime("%Y-%m-%d"))  # 当天
+    sup.tick_monitor()
+    assert sup.safety.halted is True  # 当天不自愈
+
+
+def test_tick_monitor_keeps_manual_kill_on_new_day(tmp_path):
+    """人工 KILL SWITCH（operator=user/dashboard/system）绝不在新交易日自动恢复。"""
+    sup, _ = _make_sup(tmp_path)
+    _halt_state(sup, by="user", reason="手动紧急停止")
+    sup.tick_monitor()
+    assert sup.safety.halted is True            # 依旧熔断
+    assert sup.safety._state.halted_by == "user"
+
+
+def test_tick_monitor_keeps_live_auto_halt_on_new_day(tmp_path):
+    """实盘(LIVE)模式下的任何熔断都不自动恢复（不能无人值守自动回实盘）。"""
+    sup, _ = _make_sup(tmp_path)
+    _halt_state(sup, by="auto(dailyloss)")
+    sup.safety._state.mode = TradingMode.LIVE.value
+    sup.tick_monitor()
+    assert sup.safety.halted is True                       # 实盘熔断仍保持
+    assert sup.safety._state.mode == TradingMode.LIVE.value  # 不会因此被改写
+
+
 class _NullJournal:
     def log(self, *a, **k): pass
     def tail(self, n=50): return []
@@ -682,6 +740,12 @@ def test_live_never_falls_back_to_public_quote(tmp_path, monkeypatch):
     tok = sup.safety.arm_live("tester", target=TradingMode.LIVE_PENDING)
     assert sup.safety.confirm_arm(tok, "tester") is True
     assert sup.safety.mode == TradingMode.LIVE_PENDING
+
+    # 把交易时段门控钉成「可交易」，避免测试在非交易时段（如盘后）跑时，
+    # propose_trade 先被「非可交易时段」拦截、根本走不到行情兜底分支，
+    # 导致断言「reason 含 无法获取行情」变成时间相关的偶发失败。
+    import src.trading.calendar as cal
+    monkeypatch.setattr(cal, "order_allowed", lambda: (True, "test"))
 
     assert sup._paper_quote_fallback("600000", None) is None
     prop = sup.propose_trade("600000", "浦发", OrderSide.BUY, ai_score=70, agreement=0.9)

@@ -447,7 +447,9 @@ def main() -> int:
     # 演练 / 预演（--dry-run / --preview）不启动，保持零副作用（与风控隔离纪律一致）。
     if not (args.dry_run or args.preview):
         try:
-            from src.scheduler.auto_scheduler import start_scheduler, is_running
+            from src.scheduler.auto_scheduler import (
+                start_scheduler, is_running, stop_scheduler,
+            )
             if not is_running():
                 sched = start_scheduler()
                 if sched is not None:
@@ -505,6 +507,14 @@ def main() -> int:
     finally:
         try:
             loop.stop(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+        # 关停后台调度器（APScheduler 默认非 daemon 线程，不主动 shutdown
+        # 会让进程在收到信号后挂起、迟迟不退出，进而占着 .run_loop.lock /
+        # .scheduler.lock，导致开机自启的下一份实例抢不到锁而退出 → 闭环整天没跑）。
+        # stop_scheduler 内部幂等，未启动调度时直接返回，安全可反复调用。
+        try:
+            stop_scheduler()
         except Exception:  # noqa: BLE001
             pass
         try:
