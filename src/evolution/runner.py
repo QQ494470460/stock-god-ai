@@ -286,11 +286,14 @@ class EvolutionRunner:
             from src.models.evolution import EvolutionEngine
 
             eng = EvolutionEngine()
+            # evolved=仅当本回合真的落地了变更：候选全被否决/全待批准 = 什么都没变，
+            # 不该刷新 last_evolved_at（否则「跑了但没进化」会被误读成「已进化」）。
             eng._log_evolution(  # noqa: SLF001
                 "evolution_round",
                 f"生成器 {'、'.join(rep.generators)}：候选 {rep.n_candidates}，"
                 f"待批准 {len(rep.pending)}，否决 {len(rep.rejected)}，"
-                f"自动落地 {len(rep.auto_applied)}")
+                f"自动落地 {len(rep.auto_applied)}",
+                evolved=bool(rep.auto_applied))
             eng.save()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"进化日志写入失败（不影响回合结果）: {e}")

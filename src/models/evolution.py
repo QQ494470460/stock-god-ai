@@ -144,7 +144,15 @@ class EvolutionEngine:
         self.state["last_check_at"] = datetime.now().isoformat()
         self.save()
 
-    def _log_evolution(self, action: str, detail: str):
+    def _log_evolution(self, action: str, detail: str, evolved: bool = True):
+        """写一条进化日志。
+
+        ``evolved=False`` 用于「记了日志但并没有真的发生进化」的动作 ——
+        重训**启动**、重训**失败**、清理僵尸标记。它们只是过程/故障事件，
+        不该刷新 ``last_evolved_at``，否则 ``last_evolved_at`` 会被失败事件污染，
+        看起来像「刚进化过」，实际一次成功进化都没有（2026-10-19 事故：
+        ``last_evolved_at`` 被「自动重训失败: 超时」刷新，掩盖了长期未真正进化）。
+        """
         entry = {
             "time": datetime.now().isoformat(),
             "action": action,
@@ -153,7 +161,8 @@ class EvolutionEngine:
         self.state.setdefault("evolution_log", []).append(entry)
         # 只保留最近 100 条
         self.state["evolution_log"] = self.state["evolution_log"][-100:]
-        self.state["last_evolved_at"] = entry["time"]
+        if evolved:
+            self.state["last_evolved_at"] = entry["time"]
         logger.info(f"🧬 自我进化 → {action}: {detail}")
 
     # ========== 核心：从验证结果中学习 ==========
@@ -265,7 +274,8 @@ class EvolutionEngine:
             cfg["retrain_running"] = False
             cfg["retrain_started_at"] = None
             self._log_evolution("offline_retrain",
-                                f"清理卡死的重训标记（{why}），恢复自动进化")
+                                f"清理卡死的重训标记（{why}），恢复自动进化",
+                                evolved=False)   # 清障，不是进化
             self.save()
             logger.warning(f"🧬 检测到卡死的重训标记（{why}），已自动清理")
 
@@ -304,7 +314,8 @@ class EvolutionEngine:
         cfg = self.state.setdefault("offline_evolution", {})
         cfg["retrain_running"] = True
         cfg["retrain_started_at"] = datetime.now().isoformat()
-        self._log_evolution("offline_retrain", "自动重训任务已启动")
+        self._log_evolution("offline_retrain", "自动重训任务已启动",
+                            evolved=False)   # 只是开始，还没产出进化
         self.save()
 
     def mark_retrain_finished(self, f1: Optional[float] = None):
@@ -322,7 +333,8 @@ class EvolutionEngine:
         cfg = self.state.setdefault("offline_evolution", {})
         cfg["retrain_running"] = False
         cfg["retrain_started_at"] = None
-        self._log_evolution("offline_retrain", f"自动重训失败: {reason}")
+        self._log_evolution("offline_retrain", f"自动重训失败: {reason}",
+                            evolved=False)   # 失败不算进化，绝不刷新 last_evolved_at
         self.save()
 
     def set_offline_config(self, **kwargs):
@@ -374,6 +386,7 @@ class EvolutionEngine:
                 "threshold_suggest",
                 f"准确率{accuracy:.1%} → 建议放宽阈值 {old_adj:+.1f} → {new_adj:+.1f}"
                 "（更激进方向，需人工批准，未自动生效）",
+                evolved=False,   # 仅建议，状态未变，不算进化
             )
             return (f"💡 建议放宽推荐阈值 {old_adj:+.1f} → {new_adj:+.1f}"
                     "（更激进方向，须人工批准，未自动生效）")

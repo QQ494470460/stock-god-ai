@@ -287,3 +287,56 @@ def test_evolve_threshold_ignores_zero_accuracy(tmp_path):
     e.state["threshold_adjustment"] = 2.0
     assert e._evolve_threshold(0.0) is None
     assert e.state["threshold_adjustment"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# last_evolved_at 不被「过程/失败事件」污染（2026-10-19 事故）
+# ---------------------------------------------------------------------------
+# 线上真实误导：`last_evolved_at` 停在 2026-10-19T17:58，看起来「刚进化过」，
+# 但对应的日志其实是「自动重训失败: 超时」——一次成功进化都没有。
+# 根因：`_log_evolution()` 对**任何**日志条目都刷新 last_evolved_at，
+# 包括重训启动、重训失败、清理僵尸标记这类过程/故障事件。
+# 修复：这类事件传 evolved=False，只有真的改变了状态才算进化。
+
+def test_retrain_start_does_not_count_as_evolved(tmp_path):
+    """重训「启动」只是过程事件，不算进化。"""
+    e = _engine(tmp_path, enabled=True)
+    assert e.state.get("last_evolved_at") is None
+
+    e.mark_retrain_started()
+    assert e.state.get("last_evolved_at") is None, "启动重训不该刷新 last_evolved_at"
+
+
+def test_retrain_failure_does_not_count_as_evolved(tmp_path):
+    """重训失败（超时）绝不能刷新 last_evolved_at —— 这正是事故的掩盖点。"""
+    e = _engine(tmp_path, enabled=True)
+    e.mark_retrain_started()
+    e.mark_retrain_failed("超时")
+
+    assert e.state.get("last_evolved_at") is None, (
+        "重训失败刷新了 last_evolved_at —— 会把「失败」伪装成「已进化」")
+    assert e.state["offline_evolution"]["retrain_running"] is False
+
+
+def test_retrain_finished_does_count_as_evolved(tmp_path):
+    """重训真正完成（模型更新）才算一次进化。"""
+    e = _engine(tmp_path, enabled=True)
+    e.mark_retrain_started()
+    e.mark_retrain_finished(0.63)
+
+    assert e.state.get("last_evolved_at") is not None, "重训完成应当记为一次进化"
+    assert e.state["offline_evolution"]["retrain_running"] is False
+    assert e.state["offline_evolution"]["last_retrain_at"] is not None
+
+
+def test_zombie_cleanup_does_not_count_as_evolved(tmp_path):
+    """清理卡死标记只是清障，不是进化。"""
+    e = _engine(tmp_path, enabled=True)
+    e.mark_retrain_started()
+    # 把开始时间推到超时之外，制造僵尸标记
+    old = (datetime.now() - timedelta(hours=10)).isoformat()
+    e.state["offline_evolution"]["retrain_started_at"] = old
+    e.save()
+
+    ok, _why = e.should_retrain()
+    assert e.state.get("last_evolved_at") is None, "清障不该刷新 last_evolved_at"
