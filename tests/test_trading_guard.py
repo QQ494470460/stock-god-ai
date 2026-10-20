@@ -603,3 +603,190 @@ def test_disarm_records_audit_reason(tmp_path):
     assert rec["data"]["operator"] == "bob"
     assert "audit-cleanup" in rec["data"]["reason"]
 
+
+
+# ---------------------------------------------------------------------------
+# PAPER 行情兜底（2026-10-20 事故修复）
+# ---------------------------------------------------------------------------
+# 静默失效：闭环跑在 PAPER，propose_trade 却向**真实券商** YuekaiBroker.get_tick()
+# 取行情（走 xtquant/QMT）。本机没装 QMT → get_tick 恒 None → 每笔意图都被
+# 「无法获取行情或账户」拦掉。实测 2674 次拦截 / 仅 4 笔成交，纸面闭环等于
+# 从没交易过，而心跳与界面一切正常，完全看不出异常。
+#
+# 修法：PAPER 下券商 tick 拿不到时退回公开行情源；LIVE 绝不兜底（fail-closed）。
+
+class _DeadTickBroker(FakeBroker):
+    """券商行情彻底不可用（模拟本机没开 QMT 的情形）。"""
+
+    def get_tick(self, code):
+        return None
+
+
+def test_paper_falls_back_to_public_quote_when_broker_tick_dead(tmp_path, monkeypatch):
+    """PAPER + 券商无行情 → 用公开行情兜底，不该被「无法获取行情或账户」拦掉。"""
+    import src.data.fetcher as fm
+
+    monkeypatch.setattr(fm.fetcher, "get_realtime_quote",
+                        lambda code: {"代码": code, "名称": "测试股", "最新价": 12.34,
+                                      "昨收": 12.0, "今开": 12.1, "最高": 12.5,
+                                      "最低": 11.9, "成交量": 1000, "成交额": 1234.0,
+                                      "涨跌幅": 2.8},
+                        raising=False)
+
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    broker = _DeadTickBroker()
+    sup = RiskSupervisor(broker, cfg, paper_account=FakePaper())
+    assert sup.safety.mode == TradingMode.PAPER
+
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY, ai_score=70, agreement=0.9)
+    assert prop.status != "blocked" or "无法获取行情" not in (prop.reason or ""), (
+        f"PAPER 下券商无行情时应走公开行情兜底，实际被拦: {prop.reason}")
+
+
+def test_paper_fallback_uses_the_public_price(tmp_path, monkeypatch):
+    """兜底后拿到的价格必须来自公开行情（12.34），而不是券商的 10.0。"""
+    import src.data.fetcher as fm
+
+    monkeypatch.setattr(fm.fetcher, "get_realtime_quote",
+                        lambda code: {"代码": code, "名称": "测试股", "最新价": 12.34,
+                                      "昨收": 12.0, "今开": 12.1, "最高": 12.5,
+                                      "最低": 11.9, "成交量": 1000, "成交额": 1234.0,
+                                      "涨跌幅": 2.8},
+                        raising=False)
+
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    sup = RiskSupervisor(_DeadTickBroker(), cfg, paper_account=FakePaper())
+
+    tick = sup._paper_quote_fallback("600000", None)
+    assert tick is not None and tick.last_price == 12.34
+
+
+def test_live_never_falls_back_to_public_quote(tmp_path, monkeypatch):
+    """LIVE 下券商无行情必须照样拦截 —— 不能拿公开行情去下真单（fail-closed）。"""
+    import src.data.fetcher as fm
+
+    called = {"n": 0}
+
+    def _quote(code):
+        called["n"] += 1
+        return {"最新价": 12.34, "昨收": 12.0}
+
+    monkeypatch.setattr(fm.fetcher, "get_realtime_quote", _quote, raising=False)
+
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    sup = RiskSupervisor(_DeadTickBroker(), cfg, paper_account=FakePaper())
+    # 必须走真实武装路径（set_mode 会拒绝直接进实盘，这是设计如此）
+    tok = sup.safety.arm_live("tester", target=TradingMode.LIVE_PENDING)
+    assert sup.safety.confirm_arm(tok, "tester") is True
+    assert sup.safety.mode == TradingMode.LIVE_PENDING
+
+    assert sup._paper_quote_fallback("600000", None) is None
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY, ai_score=70, agreement=0.9)
+    assert "无法获取行情" in (prop.reason or ""), (
+        "LIVE 下券商无行情必须拦截，绝不能拿公开行情下单")
+    assert called["n"] == 0, "LIVE 下根本不该去取公开行情"
+
+
+def test_daily_loss_halt_message_names_the_tripped_limit(tmp_path):
+    """熔断消息必须说清是「比例线」还是「金额线」触发的。
+
+    2026-10-20 实况：消息写「单日亏损 -0.23% 触发熔断」，而比例线是 3%，
+    看着像阈值被改坏；实际是**绝对金额线**（亏 ¥11,340 ≥ ¥5,000）触发的。
+    只报百分比会严重误导排障。
+    """
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=5000.0,
+    )
+    broker = FakeBroker(total_asset=1_000_000.0)
+    sup = RiskSupervisor(broker, cfg, paper_account=FakePaper())
+
+    # 当日起始 100 万，现净值 99.8 万 → 亏 0.20%（远低于 3% 比例线），
+    # 但绝对亏损 2000 元... 这里取 99.0 万 → 亏 1 万元 > 5000 元金额线。
+    sup.safety._state.today_start_equity = 1_000_000.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 990_000.0       # 亏 1 万 → 触发金额线，不触比例线
+
+    sup.tick_monitor()
+
+    assert sup.safety.halted is True, "金额线超了必须熔断"
+    reason = sup.safety._state.halt_reason
+    assert "金额线" in reason, f"必须点明是金额线触发的，实际: {reason}"
+    assert "10,000" in reason, f"必须给出实际亏损金额，实际: {reason}"
+    assert "比例线" not in reason, f"比例线没触发就不该出现在原因里，实际: {reason}"
+
+
+def test_daily_loss_halt_message_names_pct_limit_when_pct_trips(tmp_path):
+    """比例线触发时要点明比例线（两条线都触发时两条都要写）。"""
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=5000.0,
+    )
+    sup = RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper())
+    sup.safety._state.today_start_equity = 1_000_000.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 900_000.0       # 亏 10% → 比例线、金额线都触发
+
+    sup.tick_monitor()
+
+    reason = sup.safety._state.halt_reason
+    assert "比例线" in reason, f"比例线触发必须点明，实际: {reason}"
+    assert "金额线" in reason, f"金额线同时触发也要点明，实际: {reason}"
+
+
+def test_daily_loss_halt_message_names_the_tripped_limit(tmp_path):
+    """熔断消息必须说清是「比例线」还是「金额线」触发的。
+
+    2026-10-20 实况：消息写「单日亏损 -0.23% 触发熔断」，而比例线是 3%，
+    看着像阈值被改坏；实际是**绝对金额线**（亏 ¥11,340 ≥ ¥5,000）触发的。
+    只报百分比会严重误导排障。
+    """
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=5000.0,
+    )
+    broker = FakeBroker(total_asset=1_000_000.0)
+    sup = RiskSupervisor(broker, cfg, paper_account=FakePaper())
+
+    # 当日起始 100 万，现净值 99.8 万 → 亏 0.20%（远低于 3% 比例线），
+    # 但绝对亏损 2000 元... 这里取 99.0 万 → 亏 1 万元 > 5000 元金额线。
+    sup.safety._state.today_start_equity = 1_000_000.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 990_000.0       # 亏 1 万 → 触发金额线，不触比例线
+
+    sup.tick_monitor()
+
+    assert sup.safety.halted is True, "金额线超了必须熔断"
+    reason = sup.safety._state.halt_reason
+    assert "金额线" in reason, f"必须点明是金额线触发的，实际: {reason}"
+    assert "10,000" in reason, f"必须给出实际亏损金额，实际: {reason}"
+    assert "比例线" not in reason, f"比例线没触发就不该出现在原因里，实际: {reason}"
+
+
+def test_daily_loss_halt_message_names_pct_limit_when_pct_trips(tmp_path):
+    """比例线触发时要点明比例线（两条线都触发时两条都要写）。"""
+    cfg = GuardConfig(
+        state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"),
+        max_daily_loss_pct=3.0, max_daily_loss_abs=5000.0,
+    )
+    sup = RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper())
+    sup.safety._state.today_start_equity = 1_000_000.0
+    sup.safety._state.today_date = datetime.now().strftime("%Y-%m-%d")
+    sup.safety._state.baseline_account = "PAPER"
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 900_000.0       # 亏 10% → 比例线、金额线都触发
+
+    sup.tick_monitor()
+
+    reason = sup.safety._state.halt_reason
+    assert "比例线" in reason, f"比例线触发必须点明，实际: {reason}"
+    assert "金额线" in reason, f"金额线同时触发也要点明，实际: {reason}"

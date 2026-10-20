@@ -838,6 +838,48 @@ class RiskSupervisor:
         return self._positions()
 
     # ---------- 账户/持仓适配（PAPER 走纸账户，LIVE 走券商） ----------
+    def _paper_quote_fallback(self, code: str,
+                              tick: Optional[TickData]) -> Optional[TickData]:
+        """PAPER 模式下用**公开行情**兜底券商 tick。
+
+        事故（2026-10-20，静默失效）：闭环跑在 PAPER，但 propose_trade 的行情取自
+        **真实券商** ``YuekaiBroker.get_tick()``（走 xtquant / QMT）。本机没装 QMT，
+        该方法恒返回 None（"无法连接xtquant服务，请检查QMT…是否开启"）→
+        每笔意图都被「无法获取行情或账户」拦掉。实测 2674 次拦截 / 仅 4 笔成交，
+        纸面闭环等于从没真正交易过；而心跳、界面一切正常，完全看不出异常。
+
+        纸交易本来就不该依赖真实券商链路：这里在 PAPER 下退回公开行情源
+        （腾讯，实测可用）。LIVE / LIVE_PENDING **绝不兜底** —— 实盘拿不到券商
+        行情就必须停手，那是正确的 fail-closed，不能拿公开行情去下真单。
+        """
+        if self.safety.mode != TradingMode.PAPER:
+            return tick
+        try:
+            from src.data.fetcher import fetcher
+            q = fetcher.get_realtime_quote(code) or {}
+            price = float(q.get("最新价") or 0)
+            if price <= 0:
+                return tick
+            logger.info(
+                f"📡 PAPER 行情兜底：{code} 券商 tick 不可用，改用公开行情 "
+                f"¥{price:.2f}（{q.get('名称') or ''}）")
+            return TickData(
+                code=code,
+                name=str(q.get("名称") or ""),
+                last_price=price,
+                open=float(q.get("今开") or 0),
+                high=float(q.get("最高") or 0),
+                low=float(q.get("最低") or 0),
+                pre_close=float(q.get("昨收") or 0),
+                volume=int(float(q.get("成交量") or 0)),
+                amount=float(q.get("成交额") or 0),
+                change_pct=float(q.get("涨跌幅") or 0),
+                time=datetime.now(),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"PAPER 行情兜底失败 {code}: {e}")
+            return tick
+
     def _account(self) -> Optional[AccountInfo]:
         if self.safety.mode == TradingMode.PAPER and self.paper_account:
             pa = self.paper_account
@@ -932,6 +974,10 @@ class RiskSupervisor:
 
         # 3. 取行情/账户
         tick = self.broker.get_tick(code)
+        # PAPER 下券商行情拿不到时（如本机没开 QMT）用公开行情兜底，见
+        # _paper_quote_fallback 的说明。LIVE 绝不兜底：实盘拿不到券商行情就该停手。
+        if tick is None or getattr(tick, "last_price", 0) <= 0:
+            tick = self._paper_quote_fallback(code, tick)
         account = self._account()
         if not tick or tick.last_price <= 0 or not account:
             reason = "无法获取行情或账户"
@@ -1258,11 +1304,23 @@ class RiskSupervisor:
             self.safety.halt(reason, operator="auto(drawdown)")
             alerts.append(reason)
 
-        # 单日亏损熔断
+        # 单日亏损熔断（比例线 / 绝对金额线，任一触发即停）
         dl = self.safety.daily_loss_pct(equity)
-        if (dl <= -self.config.max_daily_loss_pct or
-                (-dl / 100.0 * self.safety._state.today_start_equity) >= self.config.max_daily_loss_abs):
-            reason = f"单日亏损 {dl:.2f}% 触发熔断"
+        loss_abs = -dl / 100.0 * self.safety._state.today_start_equity
+        hit_pct = dl <= -self.config.max_daily_loss_pct
+        hit_abs = loss_abs >= self.config.max_daily_loss_abs
+        if hit_pct or hit_abs:
+            # ⚠️ 必须说清是**哪条线**触发的。只报百分比会严重误导排障：
+            # 2026-10-20 实际是绝对金额线（¥11,340 ≥ ¥5,000）触发的，
+            # 但消息写成「单日亏损 -0.23% 触发熔断」，而比例线是 3% ——
+            # 看上去像「亏 0.23% 就熔断」，让人以为阈值被改坏或算错。
+            which = []
+            if hit_pct:
+                which.append(f"比例线 {dl:.2f}% ≤ -{self.config.max_daily_loss_pct:.1f}%")
+            if hit_abs:
+                which.append(f"金额线 ¥{loss_abs:,.0f} ≥ ¥{self.config.max_daily_loss_abs:,.0f}")
+            reason = (f"单日亏损熔断（{'；'.join(which)}；"
+                      f"当日亏损 {dl:.2f}% / ¥{loss_abs:,.0f}）")
             self.safety.halt(reason, operator="auto(dailyloss)")
             alerts.append(reason)
 
