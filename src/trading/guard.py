@@ -148,6 +148,9 @@ class GuardState:
     peak_equity: float = 0.0         # 组合净值峰值(用于回撤熔断，跨会话保留)
     pending_token: str = ""          # arm_live 生成的待确认令牌
     pending_operator: str = ""
+    # arm_live(target=...) 请求的目标模式，confirm_arm 时据此落地。
+    # 旧状态文件没有此字段 → 空串 → confirm_arm 默认落 LIVE_PENDING（最保守）。
+    pending_target: str = ""
     today_start_equity: float = 0.0  # 当日起始净值(用于单日亏损熔断)
     today_date: str = ""
     # 峰值/当日起始净值所对应的资金账号。
@@ -299,6 +302,9 @@ class SafetyController:
             token = secrets.token_hex(4)  # 8 位十六进制，足够人工核对
             self._state.pending_token = token
             self._state.pending_operator = operator
+            # 记住请求的目标模式：confirm_arm 必须按它落地，否则
+            # promote_to_live() 会被静默钉死在 LIVE_PENDING，永远进不了 LIVE。
+            self._state.pending_target = target.value
             self._save()
             self._journal_event("arm_request", {
                 "operator": operator, "target": target.value, "token": token,
@@ -327,20 +333,36 @@ class SafetyController:
                 self._journal_event("arm_reject", {"operator": operator, "reason": reason})
                 return False
 
+            # 按 arm_live 请求的目标落地模式。
+            # ⚠️ 曾在此处硬编码 LIVE_PENDING，导致 promote_to_live()
+            #    （arm_live(target=LIVE) + confirm_arm）永远停在 LIVE_PENDING、
+            #    LIVE 成了不可达状态 —— 界面/调用方以为升到了全自动实盘，实际没有。
+            #    旧状态文件没有 pending_target → 默认 LIVE_PENDING（最保守）。
+            req = (self._state.pending_target or "").strip()
+            if req not in (TradingMode.LIVE.value, TradingMode.LIVE_PENDING.value):
+                req = TradingMode.LIVE_PENDING.value
+
             # 进入实盘前强制清空当日起始净值，确保单日亏损熔断从零点计
-            self._state.mode = TradingMode.LIVE_PENDING.value
+            self._state.mode = req
             self._state.armed_by = operator
             self._state.armed_at = datetime.now().isoformat()
             self._state.pending_token = ""
             self._state.pending_operator = ""
+            self._state.pending_target = ""
             self._save()
             self._journal_event("arm_confirm", {
                 "operator": operator, "token": token, "mode": self._state.mode,
             })
-            logger.warning(
-                f"🔴 已武装实盘(LIVE_PENDING) by {operator}，"
-                f"此后每笔委托需人工确认"
-            )
+            if req == TradingMode.LIVE.value:
+                logger.warning(
+                    f"🔴🔴 已武装【全自动实盘 LIVE】by {operator} —— "
+                    f"此后系统自主下单，不再逐单人工确认"
+                )
+            else:
+                logger.warning(
+                    f"🔴 已武装实盘(LIVE_PENDING) by {operator}，"
+                    f"此后每笔委托需人工确认"
+                )
             return True
 
     def promote_to_live(self, operator: str) -> bool:

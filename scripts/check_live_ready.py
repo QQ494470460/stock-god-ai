@@ -45,10 +45,40 @@ BAD = "❌"
 INFO = "ℹ️ "
 
 _results: list[tuple[str, str, str, str]] = []  # (level, title, detail, action)
+# 解释器不匹配时置 True：此时下面的 ❌ 都可能是假象，结论必须标注「不可信」
+_wrong_interpreter = False
 
 
 def add(level: str, title: str, detail: str = "", action: str = "") -> None:
     _results.append((level, title, detail, action))
+
+
+# ---------------------------------------------------------------- 0. 解释器
+def check_interpreter() -> None:
+    """第 0 项：先确认「当前解释器就是平时跑项目的那个」。
+
+    曾踩坑（2026-10-20）：用没装项目依赖的 Python 跑本脚本（如沙箱自带 3.13），
+    loguru/pandas 全部导入失败 → 连带刷出「xtquant 未安装 / 账号模块加载失败 /
+    风控中枢状态读取失败」一串 ❌，看起来像「实盘缺一大堆东西」，
+    实际只是**解释器选错了**，一度还被当成结论记进了项目记忆。
+
+    这里先探两个项目核心依赖（loguru + pandas，正确环境必有、裸解释器必无），
+    不匹配就明确告警，并让最终结论标注「不可信」，避免照着假清单白折腾。
+    """
+    global _wrong_interpreter
+    missing = []
+    for mod in ("loguru", "pandas"):
+        try:
+            __import__(mod)
+        except Exception:  # noqa: BLE001
+            missing.append(mod)
+    if not missing:
+        return
+    _wrong_interpreter = True
+    add(BAD, "当前 Python 解释器缺少项目依赖 —— 本清单结果不可信",
+        f"缺少 {'、'.join(missing)}；解释器 {sys.executable}",
+        "换用装了项目依赖的解释器重跑（本机为系统 Python 3.12）："
+        "py -3.12 scripts/check_live_ready.py")
 
 
 # ---------------------------------------------------------------- 1. 位数
@@ -228,6 +258,7 @@ def main() -> int:
     print("  选股神AI · 实盘就绪自检 (Live Readiness)")
     print("=" * 68)
 
+    check_interpreter()          # 第 0 项：先确认没选错解释器
     check_arch()
     check_xtquant()
     check_qmt_process()
@@ -248,6 +279,11 @@ def main() -> int:
 
     print()
     print("-" * 68)
+    if _wrong_interpreter:
+        # 解释器都选错了，下面的 ❌ 全是假象 —— 别让人照着假清单去装 QMT/xtquant
+        print(" 结论：❌ 解释器选错，本清单不可信（并非实盘真的缺失这些条件）")
+        print(" 请用系统 Python 3.12 重跑：py -3.12 scripts/check_live_ready.py")
+        return 1
     if blockers:
         print(f" 结论：实盘未就绪 —— {len(blockers)} 项阻断（❌）、{len(warns)} 项提醒（⚠️）")
         print(" 按上面标注了 → 的步骤逐条处理后重跑本脚本。")

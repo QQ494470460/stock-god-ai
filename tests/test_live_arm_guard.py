@@ -85,3 +85,54 @@ def test_confirm_arm_rechecks_broker(tmp_path):
     broker.is_simulated = True                    # 中途断线降级成模拟
     assert ctl.confirm_arm(token, "alice") is False
     assert ctl.mode == TradingMode.PAPER, "券商是模拟时绝不能进实盘模式"
+
+
+# ---------------------------------------------------------------------------
+# promote_to_live 必须真的能进 LIVE（2026-10-20 修复）
+# ---------------------------------------------------------------------------
+# 缺陷：confirm_arm() 里把模式**硬编码**成 LIVE_PENDING，完全忽略 arm_live()
+# 请求的 target。于是 promote_to_live()（arm_live(target=LIVE) → confirm_arm）
+# 永远停在 LIVE_PENDING，TradingMode.LIVE 成了不可达状态 ——
+# 调用方以为升到了全自动实盘，实际一直在逐单确认档，且没有任何报错。
+
+def test_promote_to_live_reaches_live(tmp_path):
+    """请求 target=LIVE 并确认后，模式必须真的是 LIVE。"""
+    ctl = SafetyController(_cfg(tmp_path), broker=_LiveBroker())
+    token = ctl.arm_live("alice", target=TradingMode.LIVE)
+    assert ctl.confirm_arm(token, "alice") is True
+    assert ctl.mode == TradingMode.LIVE, (
+        "promote 后仍停在 LIVE_PENDING —— LIVE 不可达")
+
+
+def test_promote_to_live_helper_reaches_live(tmp_path):
+    """promote_to_live() 走 arm_live 拿令牌，再 confirm 必须落到 LIVE。"""
+    ctl = SafetyController(_cfg(tmp_path), broker=_LiveBroker())
+    tok = ctl.arm_live("alice", target=TradingMode.LIVE)
+    assert ctl.confirm_arm(tok, "alice") is True
+    assert ctl.mode == TradingMode.LIVE
+
+
+def test_default_arm_stays_live_pending(tmp_path):
+    """不显式要 LIVE 时，仍然只能落在最保守的 LIVE_PENDING。"""
+    ctl = SafetyController(_cfg(tmp_path), broker=_LiveBroker())
+    token = ctl.arm_live("alice")                 # 默认 target=LIVE_PENDING
+    assert ctl.confirm_arm(token, "alice") is True
+    assert ctl.mode == TradingMode.LIVE_PENDING
+
+
+def test_pending_target_is_cleared_after_confirm(tmp_path):
+    """确认后必须清掉 pending_target，避免下次 confirm 复用上一次的目标。"""
+    ctl = SafetyController(_cfg(tmp_path), broker=_LiveBroker())
+    token = ctl.arm_live("alice", target=TradingMode.LIVE)
+    assert ctl.confirm_arm(token, "alice") is True
+    assert ctl._state.pending_target == ""
+    assert ctl._state.pending_token == ""
+
+
+def test_stale_state_without_pending_target_defaults_to_live_pending(tmp_path):
+    """旧状态文件没有 pending_target 字段 → 默认落 LIVE_PENDING（最保守）。"""
+    ctl = SafetyController(_cfg(tmp_path), broker=_LiveBroker())
+    token = ctl.arm_live("alice", target=TradingMode.LIVE)
+    ctl._state.pending_target = ""                # 模拟老版本留下的状态
+    assert ctl.confirm_arm(token, "alice") is True
+    assert ctl.mode == TradingMode.LIVE_PENDING
