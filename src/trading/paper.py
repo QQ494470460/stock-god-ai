@@ -6,12 +6,21 @@
 """
 
 import json
+import os
+import shutil
 import threading
+import time as _time
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, time as dt_time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
+
+try:
+    import msvcrt  # Windows 跨进程文件锁（看板与常驻闭环是两个独立进程，需跨进程串行落盘）
+except Exception:  # noqa: BLE001
+    msvcrt = None
 
 from src.trading.broker import (
     BrokerAPI, Order, OrderSide, OrderType, OrderStatus,
@@ -22,6 +31,112 @@ from src.trading.rules import apply_slippage, check_t1_sell, sellable_quantity
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 PAPER_ACCOUNT_FILE = DATA_DIR / "paper_account.json"
 PAPER_HISTORY_FILE = DATA_DIR / "paper_trade_history.json"
+
+
+def _atomic_write_text(path, text):
+    """原子写：先写 <name>.tmp.<pid> 再 os.replace（Windows 上为原子重命名）。
+
+    为什么必须原子：纸账户文件由**两个独立进程**（常驻 run_loop 守护 + Streamlit
+    看板）轮流向同一份 paper_account.json / paper_trade_history.json 落盘，且我方
+    经常用 ``taskkill /F`` 重启守护 —— 若正落在 ``write_text`` 中途被杀，文件会被
+    截断成半截，下次加载 JSON 解析失败 → 纸账户被「重置」成空账户、历史全丢（这是
+    真实踩过的灾难）。os.replace 要么整体成功要么不动原文件，杜绝半截文件。
+
+    落盘前把上一份**完整**文件留作 .bak（仅当上一份可解析时），损坏时可回滚。
+    临时文件名带 pid，保证两进程并发写不会撞同一个临时文件。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        if path.exists():
+            try:
+                json.loads(path.read_text(encoding="utf-8"))  # 仅校验可解析
+                shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            except Exception:  # noqa: BLE001
+                pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@contextmanager
+def _xlock(self):
+    """跨进程文件锁：让常驻闭环与看板两个进程串行落盘，互不覆盖。
+
+    纸账户的权威态在两个独立进程间共享同一份 JSON 文件。若两个进程同时
+    读-改-写（例如看板 reset 的同时常驻进程 buy），后写的会覆盖先写的，
+    造成成交/持仓/本金丢失。用 msvcrt 对同一个 ``.paper_account.lock``
+    文件加**跨进程**互斥锁，保证同一时刻只有一个进程在改写磁盘。
+
+    锁固定的 0 号字节（双方都 ``seek(0)`` 后加锁），确保锁的是同一段区间，
+    真正的全局互斥。非 Windows（msvcrt 不可用）退化为无锁（原子写仍兜底）。
+
+    同进程同实例可重入：嵌套调用只在外层真正加/解 OS 锁，避免
+    ``_check_daily_reset`` 内的 ``_save`` 与外层 ``buy`` 的锁嵌套死锁。
+    """
+    if msvcrt is None:
+        yield
+        return
+    depth = getattr(self, "_xlock_depth", 0)
+    if depth > 0:
+        self._xlock_depth = depth + 1
+        try:
+            yield
+        finally:
+            self._xlock_depth -= 1
+        return
+    lock_path = self.account_file.parent / ".paper_account.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "a+b")
+    except Exception:  # noqa: BLE001
+        yield  # 锁文件拿不到就退化（原子写仍兜底）
+        return
+    try:
+        fh.seek(0)
+    except Exception:  # noqa: BLE001
+        pass
+    deadline = _time.time() + 10.0
+    acquired = False
+    while True:
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            acquired = True
+            break
+        except OSError:
+            if _time.time() >= deadline:
+                break
+            _time.sleep(0.02)
+    if not acquired:
+        try:
+            fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("⚠️ 纸账户跨进程锁超时（10s），退化为无锁写入（原子写兜底）")
+        yield
+        return
+    self._xlock_depth = 1
+    self._xlock_fh = fh
+    try:
+        yield
+    finally:
+        try:
+            fh.seek(0)
+            msvcrt.locking(self._xlock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._xlock_fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._xlock_depth = 0
+        self._xlock_fh = None
 
 
 @dataclass
@@ -86,6 +201,9 @@ class PaperAccount:
         
         # 线程安全
         self._lock = threading.Lock()
+        # 跨进程锁状态（让常驻闭环与看板串行落盘，互不覆盖；同实例可重入）
+        self._xlock_depth = 0
+        self._xlock_fh = None
         
         self._load()
     
@@ -124,60 +242,109 @@ class PaperAccount:
             if px > 0:
                 h["market_value"] = round(qty * px, 2)
 
-    def _load(self):
-        """从磁盘恢复状态"""
+    def _read_json(self, path):
+        """读 JSON（崩溃安全）：主文件损坏/截断时自动回滚 .bak。
+
+        纸账户文件由常驻闭环 + 看板两个进程并发写，且常被 ``taskkill /F`` 强杀。
+        一旦落盘中途被杀，文件会被截成半截 → 下次 JSON 解析失败。若直接抛错，
+        账户会被当成"空账户"清空（现金/持仓/历史全丢，这是 2026-10 实测过的灾难）。
+        这里：主文件能解析就用主文件；主文件坏则回滚上一份 .bak（原子写每次都会
+        留一份"上一份完整文件"当 .bak）；两份都坏才返回 None（调用方退化为新账户）。
+        """
+        path = Path(path)
         try:
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.warning(f"⚠️ 纸账户主文件损坏/截断，尝试 .bak 回滚: {path.name}")
+        bak = path.with_name(path.name + ".bak")
+        try:
+            if bak.exists():
+                data = json.loads(bak.read_text(encoding="utf-8"))
+                # 把 .bak 还原成主文件，避免下一次还从坏文件读
+                try:
+                    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(f"♻️ 已从 .bak 恢复纸账户文件: {path.name}")
+                return data
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ .bak 也损坏，放弃恢复: {path.name} ({e})")
+        return None
+
+    def _load(self):
+        """从磁盘恢复状态（崩溃安全：主文件坏则回滚 .bak，最坏退化为新账户）"""
+        acct = self._read_json(self.account_file)
+        if acct is not None:
+            self.cash = acct.get("cash", self.initial_cash)
+            self.holdings = acct.get("holdings", {})
+            # 先把 market_value 拉回 quantity×last_price，再做下面的权益对账，
+            # 否则陈旧市值会连带把本金基线也算偏。
+            self._normalize_holdings()
+            # 兼容旧存档：补齐 T+1 相关字段，否则卖出时会 KeyError
+            for _h in self.holdings.values():
+                _h.setdefault("today_quantity", 0)
+                _h.setdefault("available", int(_h.get("quantity", 0) or 0))
+            self.today_pnl = acct.get("today_pnl", 0.0)
+            self.today_trades = acct.get("today_trades", 0)
+            self._last_reset_date = acct.get("last_reset_date", self._last_reset_date)
+            # ★ 本金基线必须与「实际注入的权益」对齐，否则盈亏/收益率/回撤会被按
+            # 默认的 ¥100,000 误算（出现 4890% 这类幽灵收益 —— 即「双账户态不一致」）。
+            # 历史存档若未记录 initial_cash（账户被外部注入了资金/持仓），则以载入时的
+            # 总资产作为 0 基准，避免把注入资本算成盈利。
+            persisted = acct.get("initial_cash", None)
+            if persisted is not None:
+                self.initial_cash = float(persisted)
+            else:
+                loaded_equity = self.cash + sum(
+                    float(h.get("market_value", 0.0)) for h in self.holdings.values()
+                )
+                self.initial_cash = loaded_equity
+            # 当日基线：跨进程重启后当日盈亏不能归零重算，
+            # 否则「重启一次，当日收益率就闪回 0」—— 用户会以为系统失忆。
+            # 存档里有就用存档的；没有（当日首个进程）才以载入总资产为基线。
+            self._day_start_equity = acct.get("day_start_equity", None)
+            if self._day_start_equity is None:
+                self._day_start_equity = (self.cash + sum(
+                    float(h.get("market_value", 0.0)) for h in self.holdings.values()
+                )) if self._last_reset_date == datetime.now().strftime("%Y-%m-%d") else None
+            logger.info(f"📂 纸交易账户已恢复: 现金 ¥{self.cash:,.0f}, {len(self.holdings)} 只持仓"
+                        f" · 本金基线 ¥{self.initial_cash:,.0f}")
+        else:
             if self.account_file.exists():
-                data = json.loads(self.account_file.read_text(encoding="utf-8"))
-                self.cash = data.get("cash", self.initial_cash)
-                self.holdings = data.get("holdings", {})
-                # 先把 market_value 拉回 quantity×last_price，再做下面的权益对账，
-                # 否则陈旧市值会连带把本金基线也算偏。
-                self._normalize_holdings()
-                # 兼容旧存档：补齐 T+1 相关字段，否则卖出时会 KeyError
-                for _h in self.holdings.values():
-                    _h.setdefault("today_quantity", 0)
-                    _h.setdefault("available", int(_h.get("quantity", 0) or 0))
-                self.today_pnl = data.get("today_pnl", 0.0)
-                self.today_trades = data.get("today_trades", 0)
-                self._last_reset_date = data.get("last_reset_date", self._last_reset_date)
-                # ★ 本金基线必须与「实际注入的权益」对齐，否则盈亏/收益率/回撤会被按
-                # 默认的 ¥100,000 误算（出现 4890% 这类幽灵收益 —— 即「双账户态不一致」）。
-                # 历史存档若未记录 initial_cash（账户被外部注入了资金/持仓），则以载入时的
-                # 总资产作为 0 基准，避免把注入资本算成盈利。
-                persisted = data.get("initial_cash", None)
-                if persisted is not None:
-                    self.initial_cash = float(persisted)
-                else:
-                    loaded_equity = self.cash + sum(
-                        float(h.get("market_value", 0.0)) for h in self.holdings.values()
-                    )
-                    self.initial_cash = loaded_equity
-                # 当日基线：跨进程重启后当日盈亏不能归零重算，
-                # 否则「重启一次，当日收益率就闪回 0」—— 用户会以为系统失忆。
-                # 存档里有就用存档的；没有（当日首个进程）才以载入总资产为基线。
-                self._day_start_equity = data.get("day_start_equity", None)
-                if self._day_start_equity is None:
-                    self._day_start_equity = (self.cash + sum(
-                        float(h.get("market_value", 0.0)) for h in self.holdings.values()
-                    )) if self._last_reset_date == datetime.now().strftime("%Y-%m-%d") else None
-                logger.info(f"📂 纸交易账户已恢复: 现金 ¥{self.cash:,.0f}, {len(self.holdings)} 只持仓"
-                            f" · 本金基线 ¥{self.initial_cash:,.0f}")
+                logger.error("💥 纸账户主文件与 .bak 均损坏，已重置为新账户（历史可能丢失）")
             else:
                 logger.info(f"💰 新建纸交易账户: 初始资金 ¥{self.initial_cash:,.0f}")
-        except Exception as e:
-            logger.warning(f"加载纸账户失败: {e}")
-        
-        try:
-            if self.history_file.exists():
-                raw = json.loads(self.history_file.read_text(encoding="utf-8"))
-                self.trade_history = [TradeRecord(**r) for r in raw]
+
+        hist = self._read_json(self.history_file)
+        if hist is not None:
+            try:
+                self.trade_history = [TradeRecord(**r) for r in hist]
                 logger.info(f"📋 已加载 {len(self.trade_history)} 条交易记录")
-        except Exception as e:
-            logger.warning(f"加载交易记录失败: {e}")
+            except Exception as e:  # noqa: BLE001
+                # 个别记录缺字段会导致整份反序列化失败 —— 退化为逐条解析，
+                # 能救一条是一条，绝不整体丢弃历史。
+                logger.warning(f"交易记录反序列化失败（字段缺失），逐条抢救: {e}")
+                kept = []
+                for r in hist:
+                    try:
+                        kept.append(TradeRecord(**r))
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.trade_history = kept
+                logger.warning(f"♻️ 已从损坏的历史中抢救出 {len(kept)} 条成交记录")
     
     def _save(self):
-        """持久化（后台异步写）"""
+        """持久化（带跨进程串行 + 原子写）。
+
+        独立调用方（如 mark_to_market 后的 save）走这里；buy/sell/reset 在已持有
+        跨进程锁时改走 ``_save_nolock``，避免重复加锁。
+        """
+        with _xlock(self):
+            self._save_nolock()
+
+    def _save_nolock(self):
+        """无锁落盘：调用方必须已持有跨进程锁(_xlock)，否则并发写会互相覆盖。"""
         try:
             self._normalize_holdings()   # 落盘前再拉正一次，防止外部改 last_price
             data = {
@@ -189,8 +356,7 @@ class PaperAccount:
                 "last_reset_date": self._last_reset_date,
                 "day_start_equity": self._day_start_equity,
             }
-            self.account_file.parent.mkdir(parents=True, exist_ok=True)
-            self.account_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_text(self.account_file, json.dumps(data, ensure_ascii=False, indent=2))
         except Exception:
             pass
     
@@ -248,10 +414,14 @@ class PaperAccount:
         return self.get_total_asset() - base
 
     def _save_history(self):
+        with _xlock(self):
+            self._save_history_nolock()
+
+    def _save_history_nolock(self):
+        """无锁落盘历史：调用方必须已持有跨进程锁(_xlock)。"""
         try:
             records = [r.__dict__ for r in self.trade_history[-500:]]  # 保留最近500条
-            self.history_file.parent.mkdir(parents=True, exist_ok=True)
-            self.history_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_text(self.history_file, json.dumps(records, ensure_ascii=False, indent=2))
             self._history_dirty = False
         except Exception:
             pass
@@ -279,8 +449,10 @@ class PaperAccount:
             strategy: str = "", ai_score: float = 0.0) -> Tuple[bool, str, Optional[TradeRecord]]:
         """买入（虚拟成交）"""
         with self._lock:
-            self._check_daily_reset()
-            # 当日第一笔建仓前先定格基线：此刻 total_asset 才是真正的"今日起点"
+            with _xlock(self):   # 跨进程串行：防止与看板 reset / 另一进程写入互相覆盖
+                self._load()     # 落盘前先对齐磁盘最新态（两进程共享同一份文件）
+                self._check_daily_reset()
+                # 当日第一笔建仓前先定格基线：此刻 total_asset 才是真正的"今日起点"
             if self._day_start_equity is None:
                 self._day_start_equity = self.cash + sum(
                     float(h.get("market_value", 0.0) or 0.0)
@@ -349,8 +521,8 @@ class PaperAccount:
             # paper_trade_history.json。旧实现只设了 _history_dirty 却从不调用
             # _save_history()，于是交易记录永远写不进磁盘 —— 看板「交易记录」tab
             # 始终空白，且常驻进程重启后历史全丢。
-            self._save_history()
-            self._save()
+            self._save_history_nolock()
+            self._save_nolock()
             _slip = (fill_price - price) * quantity
             logger.info(f"📈 纸交易买入: {name}({code}) {quantity}股 @¥{fill_price:.2f} "
                        f"(盘口¥{price:.2f} 滑点¥{_slip:.2f}) 费用¥{commission:.2f} "
@@ -362,7 +534,9 @@ class PaperAccount:
              strategy: str = "", ai_score: float = 0.0) -> Tuple[bool, str, Optional[TradeRecord]]:
         """卖出"""
         with self._lock:
-            self._check_daily_reset()
+            with _xlock(self):   # 跨进程串行：防止与看板 reset / 另一进程写入互相覆盖
+                self._load()     # 落盘前先对齐磁盘最新态（两进程共享同一份文件）
+                self._check_daily_reset()
             
             quantity = (quantity // 100) * 100
             if quantity < 100:
@@ -441,8 +615,8 @@ class PaperAccount:
             # paper_trade_history.json。旧实现只设了 _history_dirty 却从不调用
             # _save_history()，于是交易记录永远写不进磁盘 —— 看板「交易记录」tab
             # 始终空白，且常驻进程重启后历史全丢。
-            self._save_history()
-            self._save()
+            self._save_history_nolock()
+            self._save_nolock()
             _slip = (price - fill_price) * quantity
             logger.info(f"📉 纸交易卖出: {h.get('name', code)}({code}) {quantity}股 @¥{fill_price:.2f} "
                        f"(盘口¥{price:.2f} 滑点¥{_slip:.2f}) "
@@ -580,17 +754,19 @@ class PaperAccount:
             keep_history: True=保留历史成交记录；False=连历史一起清空（测试/主动清账）。
         """
         with self._lock:
-            self.cash = new_cash if new_cash is not None else self.initial_cash
-            self.initial_cash = self.cash  # 本金基线跟着新本金走，累计盈亏口径才正确
-            self.holdings = {}
-            self.today_pnl = 0.0
-            self.today_trades = 0
-            self._day_start_equity = None
-            self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
-            if not keep_history:
-                self.trade_history = []
-            self._save()
-            self._save_history()
+            with _xlock(self):   # 跨进程串行：防止与常驻进程买入/卖出互相覆盖
+                self._load()     # 先对齐磁盘最新态（含另一进程刚写的成交/持仓）
+                self.cash = new_cash if new_cash is not None else self.initial_cash
+                self.initial_cash = self.cash  # 本金基线跟着新本金走，累计盈亏口径才正确
+                self.holdings = {}
+                self.today_pnl = 0.0
+                self.today_trades = 0
+                self._day_start_equity = None
+                self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
+                if not keep_history:
+                    self.trade_history = []
+                self._save_nolock()
+                self._save_history_nolock()
             logger.info(f"🔄 纸交易账户已重置: ¥{self.cash:,.0f}"
                         f"{'（保留成交历史）' if keep_history else '（已清空成交历史）'}")
 

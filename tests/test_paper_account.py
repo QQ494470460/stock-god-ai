@@ -318,3 +318,90 @@ def test_sell_pairs_to_earliest_open_buy_fifo(tmp_path):
     assert ok
     assert rec.close_id == "BUY1", "应 FIFO 配对到最早的开仓 BUY1，而非 BUY2"
 
+
+# ======================================================================
+# 落盘健壮性（2026-10-21 漏洞修补：两个进程并发写 + taskkill /F 强杀 → 文件被截断）
+# ======================================================================
+
+def test_atomic_write_leaves_recoverable_bak(tmp_path):
+    """每次落盘都应为上一份完整文件留 .bak，供损坏时回滚。"""
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    pa = PaperAccount(initial_cash=500_000.0, account_file=acct, history_file=hist)
+    pa.buy("600519", "贵州茅台", 1500.0, 100)
+    pa.save()  # 第二次落盘 → 此时会为上一份完整文件留 .bak
+    bak = acct.with_name(acct.name + ".bak")
+    assert bak.exists(), "原子写应为上一份完整文件留 .bak"
+    # .bak 必须是合法 JSON（能解析），否则回滚无意义
+    recovered = json.loads(bak.read_text(encoding="utf-8"))
+    assert "cash" in recovered and "holdings" in recovered
+
+
+def test_corrupt_main_file_recovers_from_bak(tmp_path):
+    """主账户文件被截断/损坏时，必须从 .bak 回滚，而非把账户清空。
+
+    模拟 ``taskkill /F`` 在 ``write_text`` 中途杀进程导致文件半截；下次加载若直接
+    抛错，账户会被当成空账户（现金/持仓/历史全丢，2026-10 实测过的灾难）。
+    """
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    pa = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    pa.buy("600519", "贵州茅台", 1500.0, 100)
+    pa.save()  # 再落盘一次 → 为完整状态留 .bak
+    # 人为截断主文件（模拟中途强杀）
+    acct.write_text('{ "cash": 12', encoding="utf-8")
+    # 新进程应从 .bak 恢复，而非清空账户
+    pa2 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    assert "600519" in pa2.holdings, "应从 .bak 恢复持仓"
+    assert len(pa2.trade_history) == 1, "应从 .bak 恢复成交历史"
+    assert pa2.initial_cash == pytest.approx(1_000_000.0, rel=1e-6)
+
+
+def test_corrupt_main_and_bak_resets_without_crash(tmp_path):
+    """主文件与 .bak 都损坏时，必须优雅退化为新账户，绝不能抛异常卡死加载。"""
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    acct.write_text("{bad", encoding="utf-8")
+    acct.with_name(acct.name + ".bak").write_text("{bad", encoding="utf-8")
+    hist.write_text("[bad", encoding="utf-8")
+    hist.with_name(hist.name + ".bak").write_text("[bad", encoding="utf-8")
+    pa = PaperAccount(initial_cash=100_000.0, account_file=acct, history_file=hist)
+    assert pa.cash == 100_000.0
+    assert pa.initial_cash == 100_000.0
+    assert pa.trade_history == []
+
+
+def test_buy_preserves_other_process_trade_on_disk(tmp_path):
+    """常驻进程(pa1)买入后，另一进程(pa2)再买入不得覆盖 pa1 的成交/持仓。
+
+    这是「跨进程 clobber」漏洞的回归钉：两进程共享同一份文件，pa2 必须在落盘前
+    reload 到 pa1 已写入磁盘的状态，再加自己的成交，最终磁盘上两者都在。
+    """
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    pa1 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    pa1.buy("600519", "贵州茅台", 1500.0, 100)   # pa1 落盘
+
+    pa2 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    pa2.buy("000001", "平安银行", 12.0, 1000)     # pa2 应 reload 到 pa1 的状态再买
+
+    pa3 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    assert "600519" in pa3.holdings, "pa1 的持仓被 pa2 覆盖丢失"
+    assert "000001" in pa3.holdings, "pa2 的持仓未写入"
+    assert len(pa3.trade_history) == 2, "应累计两笔成交，而非互相覆盖"
+
+
+def test_reset_keeps_other_process_trade_on_disk(tmp_path):
+    """看板(pa2)重置账户时，必须先在磁盘对齐常驻进程(pa1)已写入的成交再清仓，
+    避免把 pa1 的成交历史覆盖掉（keep_history 默认 True）。"""
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    pa1 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    pa1.buy("600519", "贵州茅台", 1500.0, 100)   # pa1 落盘
+    pa2 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    pa2.reset(500_000.0)                          # pa2 重置（默认保留历史）
+    pa3 = PaperAccount(initial_cash=1_000_000.0, account_file=acct, history_file=hist)
+    assert pa3.cash == pytest.approx(500_000.0, rel=1e-3), "重置后现金应为新本金"
+    assert len(pa3.holdings) == 0, "重置应清仓"
+    assert len(pa3.trade_history) == 1, "重置不得覆盖 pa1 的成交历史"
+
