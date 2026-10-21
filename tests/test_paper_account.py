@@ -222,3 +222,99 @@ def test_reload_reads_disk_trades(tmp_path):
     assert len(pa2.trade_history) == 1, "新进程未从磁盘读回成交历史"
     assert pa2.trade_history[0].filled_at, "读回的成交缺少时间戳"
 
+
+# ======================================================================
+# 重置账户不误删成交历史（2026-10-21：点「重置账户」会把配对历史清空）
+# ======================================================================
+
+def test_reset_keeps_history_by_default(tmp_path):
+    """重置账户默认保留成交历史，只有显式 keep_history=False 才清空。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    pa.buy("600519", "贵州茅台", 1500.0, 100)
+    pa.buy("000001", "平安银行", 12.0, 1000)
+    assert len(pa.trade_history) == 2
+
+    # 默认：保留历史，只清仓/重置本金
+    pa.reset(500_000.0)
+    assert pa.cash == 500_000.0
+    assert pa.initial_cash == 500_000.0
+    assert len(pa.holdings) == 0, "重置应清掉持仓"
+    assert len(pa.trade_history) == 2, "默认重置误删了成交历史！"
+
+    # 显式清空：才连历史一起抹掉
+    pa.reset(200_000.0, keep_history=False)
+    assert len(pa.trade_history) == 0, "keep_history=False 应清空历史"
+
+
+# ======================================================================
+# 买卖配对（2026-10-21：交易记录没有开仓/平仓对应链接）
+# ======================================================================
+
+def test_sell_links_to_fifo_buy_via_close_id(tmp_path):
+    """卖出必须按 FIFO 把 close_id 勾回最早的那笔开仓买入（双向打标）。"""
+    # 预置一笔「昨日」买入（可卖），并把它写进成交历史，模拟已存在的开仓记录
+    seed = {
+        "cash": 500000.0,
+        "holdings": {
+            "600519": {"name": "贵州茅台", "quantity": 100, "available": 100,
+                       "today_quantity": 0, "avg_cost": 1500.0,
+                       "market_value": 150000.0, "last_price": 1500.0},
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-21",
+    }
+    hist = tmp_path / "paper_history.json"
+    buy_rec = {
+        "trade_id": "PB202610210900001000", "code": "600519", "name": "贵州茅台",
+        "side": "buy", "price": 1500.0, "quantity": 100, "amount": 150000.0,
+        "commission": 5.0, "stamp_tax": 0.0, "filled_at": "2026-10-21T09:00:00",
+        "strategy": "seed", "ai_score": 0.0, "pnl": 0.0, "pnl_pct": 0.0, "close_id": "",
+    }
+    hist.write_text(json.dumps([buy_rec]), encoding="utf-8")
+    pa, _ = _new_account(tmp_path, seed=seed, initial_cash=500000.0)
+
+    ok, _, rec = pa.sell("600519", 1550.0, 100)
+    assert ok, "昨日持仓应可卖"
+
+    # 卖出记录应指向被平的开仓买入
+    assert rec.close_id == "PB202610210900001000", "卖出未配对到开仓买入"
+    # 买入记录应被反向打标为已被该卖出平仓
+    buy_in_mem = next(t for t in pa.trade_history if t.trade_id == "PB202610210900001000")
+    assert buy_in_mem.close_id == rec.trade_id, "开仓买入未反向配对到平仓卖出"
+
+    # 配对必须落盘：重新载入后仍能读回
+    pa2 = PaperAccount(account_file=tmp_path / "pa.json",
+                       history_file=tmp_path / "paper_history.json")
+    sell2 = next(t for t in pa2.trade_history if t.side == "sell")
+    buy2 = next(t for t in pa2.trade_history if t.trade_id == "PB202610210900001000")
+    assert sell2.close_id == "PB202610210900001000"
+    assert buy2.close_id == sell2.trade_id
+
+
+def test_sell_pairs_to_earliest_open_buy_fifo(tmp_path):
+    """同标的多次买入后，卖出应先配对最早（FIFO）那笔开仓。"""
+    seed = {
+        "cash": 500000.0,
+        "holdings": {
+            "000001": {"name": "平安银行", "quantity": 200, "available": 200,
+                       "today_quantity": 0, "avg_cost": 12.0,
+                       "market_value": 2400.0, "last_price": 12.0},
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-21",
+    }
+    hist = tmp_path / "paper_history.json"
+    hist.write_text(json.dumps([
+        {"trade_id": "BUY1", "code": "000001", "name": "平安银行", "side": "buy",
+         "price": 10.0, "quantity": 100, "amount": 1000.0, "commission": 5.0,
+         "stamp_tax": 0.0, "filled_at": "2026-10-20T09:00:00", "strategy": "s",
+         "ai_score": 0.0, "pnl": 0.0, "pnl_pct": 0.0, "close_id": ""},
+        {"trade_id": "BUY2", "code": "000001", "name": "平安银行", "side": "buy",
+         "price": 14.0, "quantity": 100, "amount": 1400.0, "commission": 5.0,
+         "stamp_tax": 0.0, "filled_at": "2026-10-21T09:00:00", "strategy": "s",
+         "ai_score": 0.0, "pnl": 0.0, "pnl_pct": 0.0, "close_id": ""},
+    ]), encoding="utf-8")
+    pa, _ = _new_account(tmp_path, seed=seed, initial_cash=500000.0)
+
+    ok, _, rec = pa.sell("000001", 13.0, 100)
+    assert ok
+    assert rec.close_id == "BUY1", "应 FIFO 配对到最早的开仓 BUY1，而非 BUY2"
+

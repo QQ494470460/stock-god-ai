@@ -424,6 +424,17 @@ class PaperAccount:
                 pnl=pnl, pnl_pct=pnl_pct,
             )
             self.trade_history.append(record)
+
+            # 配对：把这笔平仓和最早的、尚未被平仓的同标的开仓买入勾在一起（FIFO）。
+            # 双向打标：买入记录的 close_id → 平仓卖出的 trade_id；
+            # 卖出记录的 close_id → 被平的开仓买入的 trade_id。
+            # 看板交易记录据此显示「开仓↔平仓」配对，否则每笔买卖孤立、无法回溯。
+            for _tr in self.trade_history:
+                if _tr.side == "buy" and _tr.code == code and not _tr.close_id:
+                    _tr.close_id = record.trade_id      # 买入 → 卖出
+                    record.close_id = _tr.trade_id      # 卖出 → 买入
+                    break
+
             self._history_dirty = True
 
             # 必须把成交历史落盘：看板是**另一个进程**，只读磁盘上的
@@ -556,17 +567,32 @@ class PaperAccount:
             "cash": round(self.cash, 2),
         }
     
-    def reset(self, new_cash: float = None):
-        """重置账户"""
+    def reset(self, new_cash: float = None, keep_history: bool = True):
+        """重置账户（清仓 + 重置当日统计，默认保留成交历史）。
+
+        默认 **保留** 成交历史（keep_history=True）—— 之前点「重置账户」会无脑把
+        ``paper_trade_history.json`` 一并清空，导致无法回溯某笔买卖的配对/盈亏，
+        是个易踩的坑。只有在用户**显式**勾选「同时清空成交历史」时（UI 传
+        keep_history=False）才做清盘式重置。
+
+        Args:
+            new_cash: 重置后的初始本金；None 则沿用当前 initial_cash。
+            keep_history: True=保留历史成交记录；False=连历史一起清空（测试/主动清账）。
+        """
         with self._lock:
-            self.cash = new_cash or self.initial_cash
+            self.cash = new_cash if new_cash is not None else self.initial_cash
+            self.initial_cash = self.cash  # 本金基线跟着新本金走，累计盈亏口径才正确
             self.holdings = {}
-            self.trade_history = []
             self.today_pnl = 0.0
             self.today_trades = 0
+            self._day_start_equity = None
+            self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
+            if not keep_history:
+                self.trade_history = []
             self._save()
             self._save_history()
-            logger.info(f"🔄 纸交易账户已重置: ¥{self.cash:,.0f}")
+            logger.info(f"🔄 纸交易账户已重置: ¥{self.cash:,.0f}"
+                        f"{'（保留成交历史）' if keep_history else '（已清空成交历史）'}")
 
 
 # 全局单例

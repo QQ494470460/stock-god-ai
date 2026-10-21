@@ -639,9 +639,15 @@ def _render_paper_trading():
     with col_op2:
         new_cash = st.number_input("重置本金", 10000.0, 1000000.0, 100000.0, 10000.0, key="paper_reset_cash")
     with col_op3:
+        # 默认保留成交历史：勾选才连历史一起清空，避免误点重置把买卖配对记录删光
+        wipe_hist = st.checkbox("同时清空成交历史", value=False, key="paper_reset_wipe_hist",
+                                help="不勾选则只清仓/重置本金，保留已记录的买卖配对历史")
         if st.button("🔁 重置账户", use_container_width=True, key="paper_reset_btn"):
-            pa.reset(new_cash)
-            st.success(f"✅ 已重置，初始资金 ¥{new_cash:,.0f}")
+            pa.reset(new_cash, keep_history=not wipe_hist)
+            if wipe_hist:
+                st.success(f"✅ 已重置并清空成交历史，初始资金 ¥{new_cash:,.0f}")
+            else:
+                st.success(f"✅ 已重置，初始资金 ¥{new_cash:,.0f}（成交历史已保留）")
             st.rerun()
 
     # === Row3: 持仓明细 ===
@@ -720,6 +726,13 @@ def _render_paper_trading():
         trade_rows = []
         for t in reversed(trades):
             emoji = "🟢" if t.side == "buy" else "🔴"
+            # 配对：买入=被哪笔卖出平仓(close_id)，卖出=平掉了哪笔买入(close_id)
+            if t.close_id:
+                pair = t.close_id
+            elif t.side == "buy":
+                pair = "持仓中"
+            else:
+                pair = "—"
             trade_rows.append({
                 "": emoji, "代码": t.code, "名称": t.name[:6],
                 "方向": "买" if t.side == "buy" else "卖",
@@ -728,6 +741,7 @@ def _render_paper_trading():
                 "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
                 "盈亏%": f"{t.pnl_pct:+.2f}%" if t.side == "sell" and t.pnl_pct else "—",
                 "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
+                "配对": pair,
                 "时间": t.filled_at[:16] if t.filled_at else "",
             })
         st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
@@ -1223,6 +1237,12 @@ def _render_orders():
             rows = []
             for t in reversed(trades):
                 emo = "🟢" if t.side == "buy" else "🔴"
+                if t.close_id:
+                    pair = t.close_id
+                elif t.side == "buy":
+                    pair = "持仓中"
+                else:
+                    pair = "—"
                 rows.append({
                     "": emo, "ID": t.trade_id, "代码": t.code, "名称": t.name[:6],
                     "方向": "买" if t.side == "buy" else "卖",
@@ -1230,6 +1250,7 @@ def _render_orders():
                     "金额": f"¥{t.amount:,.0f}",
                     "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
                     "策略": t.strategy, "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
+                    "配对": pair,
                     "时间": t.filled_at[:16] if t.filled_at else "",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
