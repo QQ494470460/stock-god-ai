@@ -968,3 +968,101 @@ class _FakeSeries:
 
     def __getitem__(self, i):
         return self._v
+
+
+# ======================================================================
+# 无人值守闭环的纸账户重置安全（关键回归）
+# ======================================================================
+
+def test_paper_reset_external_disk_change_realigns_guard_and_keeps_running(force_trading_time, tmp_path):
+    """回归：常驻进程运行期间，用户从看板「重置账户」改了 initial_cash，
+    闭环每 tick 从磁盘重载纸账户，必须①把外部重置反映进内存，②检测本金
+    基线(initial_cash)变更并自动把风控净值基线(peak_equity)对齐到新权益。
+
+    若缺①：常驻进程永远用内存里的陈旧副本交易，用户点了「重置」也视而不见。
+    若缺②：旧 peak(100万) 远高于新权益(10万) 会被误判成 90% 腰斩→熔断，
+            且无法自愈，当天剩余时间全冻结 —— 这是无人值守循环最危险的静默停摆。
+
+    本用例用「第二个实例写盘」模拟看板进程重置，从而同时锁住①和②：
+      · 断言 cash 被重载为 10 万 → 抓「不重载」的退化；
+      · 断言未进入 HALTED 且 peak_equity 对齐到 10 万 → 抓「不重对齐」的误熔断。
+    """
+    from src.trading.paper import PaperAccount
+
+    account_file = tmp_path / "paper_account.json"
+    history_file = tmp_path / "paper_history.json"
+    paper = PaperAccount(initial_cash=1_000_000.0,
+                         account_file=account_file, history_file=history_file)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+
+    # tick 1：建立基线，guard peak → 1,000,000
+    rep1 = loop.tick()
+    assert rep1.state == LoopState.RUNNING.value
+    assert loop.guard.safety._state.peak_equity == pytest.approx(1_000_000.0, rel=1e-3)
+
+    # 模拟「另一个进程（看板）」重置账户到 10 万（initial_cash 跟着变，默认保留历史）
+    PaperAccount(initial_cash=1_000_000.0,
+                 account_file=account_file, history_file=history_file).reset(100_000.0)
+
+    # tick 2：闭环从磁盘重载 → 检测到 initial_cash 变更 → 自动对齐基线
+    rep2 = loop.tick()
+    # ① 重载必须反映外部重置
+    assert loop.guard.paper_account.cash == pytest.approx(100_000.0, rel=1e-3), \
+        "闭环未从磁盘重载纸账户，外部「重置账户」被无视"
+    assert loop.guard.paper_account.holdings == {}, \
+        "重置后持仓应被清空"
+    # ② 绝不能因旧 peak 误判腰斩而熔断
+    assert rep2.state != LoopState.HALTED.value, (
+        f"重置账户后误熔断！state={rep2.state}, note={rep2.note}")
+    assert loop.guard.safety._state.peak_equity == pytest.approx(100_000.0, rel=1e-3), \
+        "风控净值基线必须对齐到重置后的权益，否则旧 peak 仍会触发误熔断"
+    # 且闭环继续正常运行（不是卡死在 HALTED/PREOPEN/IDLE）
+    assert rep2.state == LoopState.RUNNING.value
+
+
+def test_loop_only_rebaselines_on_initial_cash_change_not_on_cash_change(force_trading_time, tmp_path):
+    """回归：本金基线(_last_pa_baseline)只在 initial_cash 变更时才重对齐，
+    普通市值波动（cash 变化）绝不应触发 rebaseline —— 否则会把真实的腰斩
+    当成「重置」而静默放宽熔断线，违反回撤熔断纪律。
+
+    用 spy 记录 rebaseline_peak 的调用：普通亏损一 tick 不应调用；重置改了
+    initial_cash 的那一 tick 才调用一次。
+    """
+    from src.trading.paper import PaperAccount
+
+    account_file = tmp_path / "paper_account.json"
+    history_file = tmp_path / "paper_history.json"
+    paper = PaperAccount(initial_cash=1_000_000.0,
+                         account_file=account_file, history_file=history_file)
+    loop = mk_loop(broker=FakeBroker(total=1_000_000.0, cash=1_000_000.0),
+                   paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+
+    loop.tick()  # 建立基线 _last_pa_baseline=1,000,000，guard peak=1,000,000
+
+    calls = []
+    orig = loop.guard.safety.rebaseline_peak
+    def _spy(*a, **k):
+        calls.append((a, k))
+        return orig(*a, **k)
+    loop.guard.safety.rebaseline_peak = _spy
+
+    # 普通市值波动：只改 cash（写盘），不动 initial_cash
+    pa2 = PaperAccount(initial_cash=1_000_000.0,
+                       account_file=account_file, history_file=history_file)
+    pa2.cash = 950_000.0
+    pa2._save()
+    loop.tick()
+    assert calls == [], (
+        "普通市值波动不应触发 rebaseline_peak，否则会把真实腰斩当成重置放宽熔断")
+
+    # 重置账户：initial_cash 变更 → 必须触发一次
+    paper.reset(500_000.0)
+    loop.tick()
+    assert len(calls) == 1, (
+        f"initial_cash 变更必须触发一次 rebaseline_peak，实际 {len(calls)} 次")
+    assert loop.guard.safety._state.peak_equity == pytest.approx(500_000.0, rel=1e-3)

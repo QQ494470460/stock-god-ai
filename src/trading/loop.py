@@ -241,6 +241,9 @@ class TradingLoop:
         )
         self._halt_notified: bool = False   # 熔断通知只发一次，解除后再熔断才重发
         self._load_runtime()
+        # 纸账户本金基线（initial_cash）的上一 tick 记忆：用于检测「重置」这类
+        # 非交易性基线变更并自动对齐风控净值基线，避免误熔断。
+        self._last_pa_baseline: Optional[float] = None
 
         # 心跳：每次 tick 落盘一次，用于回答「今天到底有没有在跑」。
         self.heartbeat_file: Path = (
@@ -825,6 +828,48 @@ class TradingLoop:
         """执行一个完整的闭环周期。线程安全（可重入保护）。"""
         with self._lock:
             self._price_cache.clear()
+            # 纸账户权威态以磁盘为准：外部（看板/用户）可能重置或手动调整了纸账户，
+            # 若不每 tick 从磁盘重载，常驻进程会一直用内存里的陈旧副本交易 ——
+            # 既忽略用户的重置操作，又会在「重置改了 initial_cash」后触发误熔断。
+            _pa = getattr(self.guard, "paper_account", None)
+            if _pa is not None and hasattr(_pa, "reload"):
+                try:
+                    _pa.reload()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"纸账户重载失败（已忽略）: {e}")
+            # 纸账户基线变更检测：initial_cash 是「本金基线」，全代码里只有
+            # reset() 会改它。若本 tick 与上个 tick 的基线不同，说明用户/看板
+            # 在常驻进程运行期间重置了账户（清仓+改本金）—— 这是「与交易无关」
+            # 的资金基数变更，必须同步把风控的净值基线（peak_equity / 当日起始）
+            # 对齐到新权益，否则旧 peak 远高于新权益会立刻被误判成腰斩→熔断，
+            # 且无法自愈（实测：纸账户 10 万 vs 遗留 peak 100 万 → 首 tick 报
+            # 89.95% 回撤直接 halt，把当天剩余时间全冻结）。
+            # 注意：真实腰斩只会改变 cash/market_value，绝不会动 initial_cash，
+            # 所以用 initial_cash 作判据不会把真回撤误当成重置而静默放宽熔断。
+            if _pa is not None and hasattr(_pa, "get_total_asset"):
+                _cur_baseline = getattr(_pa, "initial_cash", None)
+                if _cur_baseline is not None:
+                    if self._last_pa_baseline is None:
+                        self._last_pa_baseline = _cur_baseline
+                    elif abs(_cur_baseline - self._last_pa_baseline) > 1e-6:
+                        try:
+                            _new_eq = _pa.get_total_asset()
+                            if self.guard is not None and getattr(self.guard, "safety", None) is not None:
+                                self.guard.safety.rebaseline_peak(
+                                    _new_eq, operator="autoloop",
+                                    reason=(
+                                        f"检测到纸账户重置(initial_cash "
+                                        f"{self._last_pa_baseline:,.0f}→{_cur_baseline:,.0f})，"
+                                        f"自动对齐风控净值基线，避免误熔断"
+                                    ),
+                                )
+                                logger.warning(
+                                    f"♻️ 因纸账户重置自动对齐风控基线：净值基数→"
+                                    f"¥{_new_eq:,.0f}（原 ¥{self._last_pa_baseline:,.0f}）"
+                                )
+                            self._last_pa_baseline = _cur_baseline
+                        except Exception as e:  # noqa: BLE001
+                            logger.error(f"纸账户重置后对齐风控基线失败（下个 tick 会重试）: {e}")
             now = _now()
             report = TickReport(
                 at=now.strftime("%H:%M:%S"),
