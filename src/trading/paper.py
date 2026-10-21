@@ -205,6 +205,18 @@ class PaperAccount:
         """
         self._save()
 
+    def reload(self):
+        """从磁盘重载账户与交易历史（看板是独立进程，必须主动重载才能看到
+        常驻闭环写入的最新持仓/权益/成交记录）。
+
+        看板的 ``paper_account`` 是模块级单例，只在 Streamlit 进程启动那一刻
+        从磁盘载入一次；之后常驻 ``run_loop.py`` 交易产生的变更只落在磁盘上，
+        看板若不主动 reload，刷新多少次都看不到新成交、新持仓。本方法让
+        「账户仪表盘 / 交易记录」tab 每次渲染前都对齐到磁盘真相。
+        """
+        with self._lock:
+            self._load()
+
     # ========== 当日盈亏口径 ==========
 
     def day_start_equity(self) -> Optional[float]:
@@ -332,7 +344,12 @@ class PaperAccount:
             )
             self.trade_history.append(record)
             self._history_dirty = True
-            
+
+            # 必须把成交历史落盘：看板是**另一个进程**，只读磁盘上的
+            # paper_trade_history.json。旧实现只设了 _history_dirty 却从不调用
+            # _save_history()，于是交易记录永远写不进磁盘 —— 看板「交易记录」tab
+            # 始终空白，且常驻进程重启后历史全丢。
+            self._save_history()
             self._save()
             _slip = (fill_price - price) * quantity
             logger.info(f"📈 纸交易买入: {name}({code}) {quantity}股 @¥{fill_price:.2f} "
@@ -408,7 +425,12 @@ class PaperAccount:
             )
             self.trade_history.append(record)
             self._history_dirty = True
-            
+
+            # 必须把成交历史落盘：看板是**另一个进程**，只读磁盘上的
+            # paper_trade_history.json。旧实现只设了 _history_dirty 却从不调用
+            # _save_history()，于是交易记录永远写不进磁盘 —— 看板「交易记录」tab
+            # 始终空白，且常驻进程重启后历史全丢。
+            self._save_history()
             self._save()
             _slip = (price - fill_price) * quantity
             logger.info(f"📉 纸交易卖出: {h.get('name', code)}({code}) {quantity}股 @¥{fill_price:.2f} "

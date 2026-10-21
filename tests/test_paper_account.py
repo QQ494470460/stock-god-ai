@@ -172,3 +172,53 @@ def test_day_start_equity_survives_restart(tmp_path):
                        history_file=tmp_path / "ph.json")
     assert pa2.day_start_equity() == 100_000.0
     assert pa2.today_pnl_market() == pytest.approx(before, abs=1.0)
+
+
+# ======================================================================
+# 成交历史落盘（2026-10-21：看板「交易记录」tab 长期空白）
+# ======================================================================
+
+def test_trade_history_persisted_on_every_fill(tmp_path):
+    """每笔成交都必须把历史落盘 —— 旧实现只在 reset() 落盘，导致看板
+    「交易记录」tab 始终空白，且常驻闭环重启后历史全丢。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    pa.buy("600519", "贵州茅台", 1500.0, 100)
+    pa.buy("000001", "平安银行", 12.0, 1000)
+    hist = tmp_path / "paper_history.json"
+    assert hist.exists(), "成交历史未落盘"
+    recs = json.loads(hist.read_text(encoding="utf-8"))
+    assert len(recs) == 2
+    assert all(r["side"] == "buy" for r in recs)
+    # 必须带成交时间，否则「交易记录」tab 的时间列空白
+    assert all(r.get("filled_at") for r in recs), "成交记录缺少 filled_at 时间戳"
+
+
+def test_sell_fill_is_persisted(tmp_path):
+    """卖出成交同样必须落盘（T+1：只能卖『昨日及更早』买入的持仓）。"""
+    seed = {
+        "cash": 500000.0,
+        "holdings": {
+            "600519": {"name": "贵州茅台", "quantity": 100, "available": 100,
+                       "today_quantity": 0, "avg_cost": 1500.0,
+                       "market_value": 150000.0, "last_price": 1500.0},
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-21",
+    }
+    pa, _ = _new_account(tmp_path, seed=seed, initial_cash=500000.0)
+    ok, _, _ = pa.sell("600519", 1550.0, 100)
+    assert ok, "昨日持仓应可卖"
+    recs = json.loads((tmp_path / "paper_history.json").read_text(encoding="utf-8"))
+    assert any(r["side"] == "sell" for r in recs), "卖出成交未落盘"
+    assert recs[-1].get("filled_at"), "卖出记录缺少时间戳"
+
+
+def test_reload_reads_disk_trades(tmp_path):
+    """看板是独立进程：reload() 必须能从磁盘读回常驻闭环写入的成交。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    pa.buy("002008", "大族激光", 10.0, 1000)
+    # 模拟另一个进程（看板）重新载入
+    pa2 = PaperAccount(account_file=tmp_path / "pa.json",
+                       history_file=tmp_path / "paper_history.json")
+    assert len(pa2.trade_history) == 1, "新进程未从磁盘读回成交历史"
+    assert pa2.trade_history[0].filled_at, "读回的成交缺少时间戳"
+

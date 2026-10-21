@@ -537,38 +537,73 @@ def _render_loop():
 
 def _render_dashboard():
     st.markdown('<div class="section-title">📊 账户仪表盘</div>', unsafe_allow_html=True)
-    if not st.session_state.trade_connected:
-        st.info("👆 请先在「登录管理」中连接券商，或直接用「纸交易模拟」")
-        return
 
-    broker = st.session_state.trade_broker
+    # 看板是独立进程：先对齐到磁盘真相（常驻闭环写入的最新纸账户状态），
+    # 否则刷新多少次都看不到闭环新下的单、新算的权益。
+    pa = paper_account
+    pa.reload()
+
+    guard = st.session_state.get("trade_guard")
+    is_live = bool(guard and getattr(guard, "safety", None)
+                   and guard.safety.mode.value == "live")
+
     if st.button("🔄 刷新数据", key="refresh_acct"):
         st.rerun()
 
-    account = broker.query_account()
-    if account:
-        # 「今日盈亏」用纸账户的市值口径（已实现+浮动），不用 account.today_pnl ——
-        # 后者是券商侧的当日盈亏，模拟盘下与纸账户对不上，两个数字同屏会打架。
-        _pa = globals().get("paper_account", None)
-        _today_pnl = getattr(account, "today_pnl", 0.0) or 0.0
-        if _pa is not None and hasattr(_pa, "today_pnl_market"):
-            _today_pnl = _pa.today_pnl_market()
+    if is_live:
+        # 实盘：以券商账户为准
+        if not st.session_state.trade_connected:
+            st.info("👆 请先在「登录管理」中连接券商")
+            return
+        broker = st.session_state.trade_broker
+        account = broker.query_account()
+        if not account:
+            st.info("👆 请先在「登录管理」中连接券商")
+            return
         cols = st.columns(4)
         cols[0].metric("💰 总资产", f"¥{account.total_asset:,.0f}")
         cols[1].metric("🏦 可用资金", f"¥{account.available_cash:,.0f}")
         cols[2].metric("📦 持仓市值", f"¥{account.market_value:,.0f}")
-        cols[3].metric("📈 今日盈亏", f"¥{_today_pnl:+,.0f}")
+        cols[3].metric("📈 今日盈亏", f"¥{getattr(account, 'today_pnl', 0.0) or 0.0:+,.0f}")
+        st.markdown("---")
+        positions = broker.query_positions()
+        if positions:
+            st.markdown(f"**📦 持仓明细 ({len(positions)} 只)**")
+            pos_data = [{
+                "代码": p.code, "名称": p.name,
+                "持仓": f"{p.quantity}股", "可用": f"{p.available}股",
+                "成本": f"{p.avg_cost:.2f}", "现价": f"{p.current_price:.2f}",
+                "市值": f"¥{p.market_value:,.0f}",
+                "盈亏": f"¥{p.pnl:+,.0f}", "盈亏%": f"{p.pnl_pct:+.2f}%",
+            } for p in positions]
+            st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
+        else:
+            st.info("📭 当前无持仓")
+        return
 
+    # 纸交易（默认模式）：以纸账户为唯一真相源，与「🧪 纸交易模拟」tab 完全一致。
+    # 旧实现直接读 broker.query_account()（模拟盘下恒为空），导致仪表盘和纸交易
+    # 两个 tab 数字对不上。
+    total_asset = pa.get_total_asset()
+    cash = pa.cash
+    mv = total_asset - cash
+    cols = st.columns(4)
+    cols[0].metric("💰 总资产", f"¥{total_asset:,.0f}")
+    cols[1].metric("🏦 可用资金", f"¥{cash:,.0f}")
+    cols[2].metric("📦 持仓市值", f"¥{mv:,.0f}")
+    cols[3].metric("📈 今日盈亏", f"¥{pa.today_pnl_market():+,.0f}")
+    if st.session_state.trade_connected:
+        st.caption("（纸交易模式：以下为纸账户实时状态，与「🧪 纸交易模拟」一致）")
     st.markdown("---")
-    positions = broker.query_positions()
+    positions = pa.get_positions()
     if positions:
         st.markdown(f"**📦 持仓明细 ({len(positions)} 只)**")
         pos_data = [{
-            "代码": p.code, "名称": p.name,
-            "持仓": f"{p.quantity}股", "可用": f"{p.available}股",
-            "成本": f"{p.avg_cost:.2f}", "现价": f"{p.current_price:.2f}",
-            "市值": f"¥{p.market_value:,.0f}",
-            "盈亏": f"¥{p.pnl:+,.0f}", "盈亏%": f"{p.pnl_pct:+.2f}%",
+            "代码": p["code"], "名称": p["name"],
+            "持仓": f"{p['quantity']}股", "可卖(T+1)": f"{p['sellable']}股",
+            "成本": f"{p['avg_cost']:.2f}", "现价": f"{p['last_price']:.2f}",
+            "市值": f"¥{p['market_value']:,.0f}",
+            "盈亏": f"¥{p['pnl']:+,.0f}", "盈亏%": f"{p['pnl_pct']:+.2f}%",
         } for p in positions]
         st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
     else:
@@ -584,6 +619,7 @@ def _render_paper_trading():
     st.caption("独立虚拟账户 · 零风险验证策略 · 自动记录盈亏")
 
     pa = paper_account
+    pa.reload()   # 看板独立进程：对齐磁盘上常驻闭环写入的最新持仓/权益/成交
 
     # === Row1: 账户总览 ===
     col1, col2, col3, col4 = st.columns(4)
@@ -1181,6 +1217,7 @@ def _render_orders():
                 st.info("📭 今日无订单记录")
     
     with tabs[1]:
+        paper_account.reload()   # 看板独立进程：先对齐磁盘，否则看不到常驻闭环的新成交
         trades = paper_account.get_recent_trades(50)
         if trades:
             rows = []
