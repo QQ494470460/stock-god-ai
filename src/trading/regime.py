@@ -108,3 +108,49 @@ class RegimeWeighter:
 
     def describe(self) -> Dict[str, float]:
         return dict(REGIME_STRATEGY_WEIGHTS.get(self.regime, {}))
+
+
+class RegimeSmoother:
+    """市场状态粘性（Status Hysteresis）。
+
+    背景：``detect_regime`` 每天基于基准均线重新判断，遇到横盘 / 假突破会
+    在牛/熊/震荡之间反复横跳，导致 ``RegimeWeighter`` 权重天天变、策略随之
+    忽攻忽守（whipsaw）。本类要求**同一新信号连续出现 ``hold_days`` 个交易日**
+    才真正切换，期间维持原状态，滤掉噪声翻转。
+
+    设计：纯状态机、零 IO；非法/未知信号一律当作「维持现状」；与
+    ``RegimeWeighter`` 解耦（本类只产出「已确认的 regime 字符串」）。
+    """
+
+    def __init__(self, hold_days: int = 2, initial: str = DEFAULT_REGIME):
+        self.hold_days = max(1, int(hold_days))
+        self.current = initial if initial in VALID_REGIMES else DEFAULT_REGIME
+        self._pending: Optional[str] = None
+        self._count: int = 0
+
+    def update(self, signal: Optional[str]) -> str:
+        """喂入今日原始信号，返回经过粘性处理后的「生效 regime」。
+
+        - 信号 == 当前状态：清空待定，维持现状。
+        - 信号 != 当前且与待定一致：计数 +1；达到 ``hold_days`` 才翻盘。
+        - 信号非法（None / 未知）：等同维持现状，绝不引入无效状态。
+        """
+        sig = signal if signal in VALID_REGIMES else self.current
+        if sig == self.current:
+            self._pending = None
+            self._count = 0
+            return self.current
+        if self._pending != sig:
+            self._pending = sig
+            self._count = 1
+        else:
+            self._count += 1
+        if self._count >= self.hold_days:
+            self.current = sig
+            self._pending = None
+            self._count = 0
+        return self.current
+
+    def describe(self) -> Dict[str, float]:
+        """便于与 ``RegimeWeighter.describe`` 对齐：返回当前生效状态的权重表。"""
+        return dict(REGIME_STRATEGY_WEIGHTS.get(self.current, {}))

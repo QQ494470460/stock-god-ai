@@ -45,7 +45,8 @@ from src.trading.broker import (
 from src.trading.executor import TradeExecutor, RiskConfig
 from src.trading.paper import PaperAccount
 from src.trading.rules import check_buyable, check_sellable, sellable_quantity
-from src.trading.regime import RegimeWeighter
+from src.trading.regime import RegimeWeighter, RegimeSmoother
+from src.trading.intelligence import StrategyCredibility
 
 try:  # 与 calendar.py 一致：打包/测试环境下 config 可能不在 sys.path 顶层
     from config.settings import ROOT_DIR, DATA_DIR
@@ -122,6 +123,28 @@ class GuardConfig:
     vol_control_window: int = 20          # 滚动计算已实现波动的样本窗口(交易日)
     vol_control_spike_multiple: float = 2.5  # 当前波动 ≥ 基线 × 该倍数 → 触发降仓
     vol_control_min_strength: float = 0.3    # 触发后新开仓强度下限（不完全停手，留流动性）
+
+    # ---- 市场状态粘性（Regime Hysteresis，Batch 3）----
+    # 要求同一新 regime 信号连续出现 N 个交易日才真正切换，避免基准均线在
+    # 横盘/假突破时天天横跳、策略随之忽攻忽守（whipsaw）。
+    regime_hysteresis_days: int = 2
+
+    # ---- 策略信誉自适应权重（Online Credibility，Batch 3）----
+    # 用每笔已平仓交易的「信号方向 vs 实际盈亏」一致性（类 IC 的 EWMA 代理）
+    # 为每个策略标签维护信誉，映射成 ic_weights 喂给多策略集成器（Feature #7），
+    # 让集成权重随真实战绩自我调优。默认开启；未知标签按中性 1.0 兜底。
+    credibility_enabled: bool = True
+    credibility_halflife: int = 20         # EWMA 半衰期（笔）
+
+    # ---- 波动自适应熔断线（Volatility-scaled kill-switch，Batch 3）----
+    # 单日亏损熔断线不再写死 3%，而是随「基准近期日波动」动态缩放：
+    # 平静市场波动小 → 线收紧（更敏感，更早保护）；动荡市场波动大 → 线放宽
+    # （抗噪声，避免被正常波动误杀）。始终夹在 [floor, cap] 之间，且回撤熔断
+    # 线(8%) 作为绝对底线始终生效，分层安全不被削弱。
+    adaptive_kill_switch: bool = True
+    kill_switch_ref_vol_pct: float = 1.5   # 参考日波动(%)，作为缩放中枢
+    kill_switch_floor_pct: float = 2.0     # 下限（绝不更松）
+    kill_switch_cap_pct: float = 4.5       # 上限（绝不更紧）
 
     # ---- 人工确认 ----
     confirm_timeout_sec: float = 300.0       # 待确认委托超时(秒)，超时自动撤销
@@ -849,6 +872,22 @@ class RiskSupervisor:
         self._last_equity: Optional[float] = None  # 上一 tick 净值，用于算收益率
         self._vol_control_factor: float = 1.0  # 1.0=不干预；<1.0=降仓
 
+        # 市场状态粘性（Batch 3）：对原始 detect_regime 信号做 N 日确认，防横跳
+        self._regime_smoother = RegimeSmoother(
+            hold_days=getattr(self.config, "regime_hysteresis_days", 2),
+            initial=self.regime.regime,
+        )
+
+        # 策略信誉自适应权重（Batch 3）：在线学习每标签 IC，喂给多策略集成器
+        self._credibility = StrategyCredibility(
+            halflife=getattr(self.config, "credibility_halflife", 20),
+        )
+        self._ic_weights: Dict[str, float] = {}   # 当前生效的 ic_weights
+        self._cred_fed: set = set()               # 已喂给信誉引擎的成交 id（防重复）
+
+        # 波动自适应熔断线（Batch 3）：基准近期日波动，由闭环每交易日推送
+        self._market_vol: Optional[float] = None
+
         logger.info(
             f"🛡️ RiskSupervisor 初始化 | mode={self.safety.mode.value} "
             f"halted={self.safety.halted}"
@@ -988,11 +1027,94 @@ class RiskSupervisor:
             self._vol_control_factor = 1.0
 
     def set_regime(self, regime: Optional[str]) -> None:
-        """由外部（交易闭环 / 调度）每 tick 推送当前市场状态。"""
-        self.regime.update(regime)
+        """由外部（交易闭环 / 调度）每 tick 推送当前市场状态。
+
+        Batch 3：原始信号先经过 ``RegimeSmoother`` 做 N 日确认，避免基准均线在
+        横盘/假突破时天天横跳导致策略权重反复翻转（whipsaw）。最终生效状态写入
+        ``self.regime``（供 ``_adjust_signal_strength`` / ``fuse_signals`` 查表）。
+        """
+        smoothed = self._regime_smoother.update(regime)
+        self.regime.update(smoothed)
+
+    def set_market_vol(self, vol_pct: Optional[float]) -> None:
+        """由闭环每交易日推送「基准近期日波动(%)」，供波动自适应熔断线使用。
+
+        异常/缺失值一律置 None → ``_effective_daily_loss_pct`` 退化为静态配置。
+        """
+        try:
+            self._market_vol = float(vol_pct) if vol_pct is not None else None
+        except (TypeError, ValueError):
+            self._market_vol = None
+
+    def _effective_daily_loss_pct(self) -> float:
+        """波动自适应单日亏损熔断线（Batch 3）。
+
+        以 ``config.max_daily_loss_pct`` 为中枢，按「基准近期日波动 / 参考波动」
+        等比缩放：平静市场波动小 → 线收紧（更敏感），动荡市场波动大 → 线放宽
+        （抗噪声）。结果始终夹在 [floor, cap] 之间，且回撤熔断线(8%) 作为绝对
+        底线始终独立生效。任何异常 / 未推送波动 → 退化为静态 ``max_daily_loss_pct``。
+        """
+        if not self.config.adaptive_kill_switch:
+            return float(self.config.max_daily_loss_pct)
+        mv = self._market_vol
+        ref = self.config.kill_switch_ref_vol_pct
+        if mv is None or mv <= 0 or ref <= 0:
+            return float(self.config.max_daily_loss_pct)
+        ratio = mv / float(ref)
+        ratio = min(max(ratio, 0.7), 1.5)  # 缩放倍率限幅 ±50%
+        eff = float(self.config.max_daily_loss_pct) * ratio
+        return min(max(eff, self.config.kill_switch_floor_pct),
+                   self.config.kill_switch_cap_pct)
+
+    def observe_strategy_outcome(self, tag: str, entry_strength: float,
+                                 realized_return: float) -> None:
+        """向策略信誉引擎喂入一笔已平仓结果（Batch 3）。
+
+        随后刷新 ``_ic_weights``，使 ``fuse_signals`` 的多策略集成随真实战绩调权。
+        """
+        if not self.config.credibility_enabled:
+            return
+        self._credibility.observe(tag, entry_strength, realized_return)
+        self._ic_weights = self._credibility.weights()
+
+    def sync_credibility_from_paper(self, paper) -> None:
+        """从纸账户成交历史增量同步策略信誉（Batch 3）。
+
+        配对每笔 sell 的 close_id 找到对应买入的入场强度(ai_score)，用实际盈亏
+        喂养信誉引擎；已喂过的成交用 trade_id 去重。零 IO、异常静默吞掉。
+        """
+        if not self.config.credibility_enabled or paper is None:
+            return
+        try:
+            trades = getattr(paper, "trade_history", None)
+            if not trades:
+                return
+            by_id = {t.trade_id: t for t in trades
+                     if getattr(t, "trade_id", None)}
+            for t in trades:
+                if getattr(t, "side", "") != "sell":
+                    continue
+                if not getattr(t, "pnl", 0):
+                    continue
+                tid = getattr(t, "close_id", "") or ""
+                buy = by_id.get(tid)
+                entry_strength = (float(getattr(buy, "ai_score", 0.0) or 0.0)
+                                  if buy else 0.0)
+                ret = float(getattr(t, "pnl_pct", 0.0) or 0.0) / 100.0
+                tag = getattr(t, "strategy", "") or ""
+                key = tid or (f"{getattr(t, 'code', '')}-"
+                              f"{getattr(t, 'filled_at', '')}")
+                if not key or key in self._cred_fed:
+                    continue
+                self._credibility.observe(tag, entry_strength, ret)
+                self._cred_fed.add(key)
+            self._ic_weights = self._credibility.weights()
+        except Exception:  # noqa: BLE001  // 学习失败绝不中断主流程
+            pass
 
     def fuse_signals(self, scores: Dict[str, float]) -> Dict:
-        """多策略信号集成（Feature #4 + #2）：用当前市场状态权重融合各策略评分。
+        """多策略信号集成（Feature #4 + #2 + Batch 3）：用当前市场状态权重与
+        在线策略信誉权重融合各策略评分。
 
         ``scores`` 为 ``{策略标签: AI 评分(0~100)}``。返回一个含综合分、决策、
         各策略权重与贡献拆解的 dict，可直接用于下单前的信号融合或绩效归因。
@@ -1452,7 +1574,7 @@ class RiskSupervisor:
                 return False  # 回撤仍在熔断线上 → 未清除
         if self.config.auto_resume_require_dailyloss_clear:
             dl = self.safety.daily_loss_pct(equity)
-            if dl <= -self.config.max_daily_loss_pct:
+            if dl <= -self._effective_daily_loss_pct():
                 return False  # 单日亏损仍在线上 → 未清除
         return True
 
@@ -1574,7 +1696,8 @@ class RiskSupervisor:
         _base_ok = isinstance(_base, (int, float)) and _base > 0
         abs_limit = self.config.daily_loss_abs_limit(_base if _base_ok else 0.0)
         abs_limit = abs_limit if _base_ok else float("inf")
-        hit_pct = dl <= -self.config.max_daily_loss_pct
+        eff_line = self._effective_daily_loss_pct()
+        hit_pct = dl <= -eff_line
         hit_abs = _base_ok and loss_abs >= abs_limit
         if hit_pct or hit_abs:
             # ⚠️ 必须说清是**哪条线**触发的。只报百分比会严重误导排障：
@@ -1583,7 +1706,7 @@ class RiskSupervisor:
             # 看上去像「亏 0.23% 就熔断」，让人以为阈值被改坏或算错。
             which = []
             if hit_pct:
-                which.append(f"比例线 {dl:.2f}% ≤ -{self.config.max_daily_loss_pct:.1f}%")
+                which.append(f"比例线 {dl:.2f}% ≤ -{eff_line:.1f}%")
             if hit_abs:
                 abs_desc = ("∞（未设金额线）" if abs_limit == float("inf")
                             else f"¥{abs_limit:,.0f}"

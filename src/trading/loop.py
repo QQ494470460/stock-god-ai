@@ -1021,12 +1021,27 @@ class TradingLoop:
         设计：每天只算一次（``_regime_day`` 去重）；取不到指数日线（本机无网络 /
         非交易时段接口受限）时静默跳过，regime 保持默认 sideways（权重≈1.0）。
         任何异常都被上层 try 吞掉，绝不因「感知不到市场」而中断交易闭环。
+
+        Batch 3 扩展：同一天里（在 regime 去重守卫之前）还会——
+
+        - 从纸账户成交历史增量同步「策略信誉」（``guard.sync_credibility_from_paper``），
+          让 Feature #7 的多策略集成随真实战绩自我调权；与指数感知相互独立，
+          任一步失败都不影响另一步。
+        - 把基准近期日波动喂给 guard（``guard.set_market_vol``），供「波动自适应
+          熔断线」动态缩放单日亏损熔断阈值。
         """
         if self.guard is None:
             return
         today_s = _today().strftime("%Y-%m-%d")
         if getattr(self, "_regime_day", "") == today_s:
             return  # 一天只推算一次
+        # 每日一次：同步策略信誉（独立于指数感知，失败不影响后续）
+        try:
+            pa = getattr(self.guard, "paper_account", None)
+            self.guard.sync_credibility_from_paper(pa)
+        except Exception:  # noqa: BLE001
+            pass
+        self._regime_day = today_s
         try:
             from datetime import timedelta
             from src.data.fetcher import get_benchmark_kline
@@ -1040,8 +1055,17 @@ class TradingLoop:
         regime = detect_regime(bench)
         if regime:
             self.guard.set_regime(regime)
-            self._regime_day = today_s
             logger.info(f"🌐 市场状态感知更新：{regime}（策略权重已按状态调整）")
+        # 基准近期日波动 → 波动自适应熔断线（独立于 regime 是否判定成功）
+        try:
+            import numpy as _np
+            closes = bench["close"].astype(float).to_numpy()
+            if len(closes) >= 5:
+                r = _np.diff(_np.log(closes[-30:]))
+                if len(r) > 0:
+                    self.guard.set_market_vol(float(_np.std(r, ddof=0)) * 100.0)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # 运行控制

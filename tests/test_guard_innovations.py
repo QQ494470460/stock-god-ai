@@ -203,6 +203,82 @@ def test_heal_throttle_expires(sup):
 
 
 # ----------------------------------------------------------------------
+# Batch 3：市场状态粘性（Regime Hysteresis）
+# ----------------------------------------------------------------------
+def test_set_regime_applies_hysteresis(sup):
+    # 初始 sideways；单次翻转被粘性挡住
+    sup.set_regime("bull")
+    assert sup.regime.regime == "sideways"
+    # 连续第二次才切换
+    sup.set_regime("bull")
+    assert sup.regime.regime == "bull"
+    # 切换后动量权重应放大
+    assert sup._adjust_signal_strength("momentum", 1.0) > 1.0
+
+
+def test_set_regime_revert_needs_hold_days(sup):
+    sup.set_regime("bull")
+    sup.set_regime("bull")  # 切到 bull
+    assert sup.regime.regime == "bull"
+    # 回到 sideways 也要连续两次
+    sup.set_regime("sideways")
+    assert sup.regime.regime == "bull"
+    sup.set_regime("sideways")
+    assert sup.regime.regime == "sideways"
+
+
+# ----------------------------------------------------------------------
+# Batch 3：波动自适应熔断线（Volatility-scaled kill-switch）
+# ----------------------------------------------------------------------
+def test_effective_daily_loss_uses_market_vol(sup):
+    sup.config.adaptive_kill_switch = True
+    sup.config.kill_switch_ref_vol_pct = 1.5
+    # 未推送波动 → 静态 3.0
+    sup.set_market_vol(None)
+    assert sup._effective_daily_loss_pct() == pytest.approx(3.0)
+    # 高波动 → 放宽（ratio 2.0 截到 1.5 → 4.5，封顶 4.5）
+    sup.set_market_vol(3.0)
+    assert sup._effective_daily_loss_pct() == pytest.approx(4.5)
+    # 低波动 → 收紧（ratio 0.5 截到 0.7 → 2.1）
+    sup.set_market_vol(0.75)
+    assert sup._effective_daily_loss_pct() == pytest.approx(2.1)
+    # 关闭 → 静态
+    sup.config.adaptive_kill_switch = False
+    assert sup._effective_daily_loss_pct() == pytest.approx(3.0)
+
+
+def test_effective_daily_loss_caps_and_floors(sup):
+    sup.config.adaptive_kill_switch = True
+    sup.config.kill_switch_ref_vol_pct = 1.5
+    sup.config.kill_switch_floor_pct = 2.0
+    sup.config.kill_switch_cap_pct = 4.5
+    sup.set_market_vol(100.0)   # 极端高 → 封顶 4.5
+    assert sup._effective_daily_loss_pct() <= 4.5 + 1e-9
+    sup.set_market_vol(0.001)   # 极端低 → 封底 2.0
+    assert sup._effective_daily_loss_pct() >= 2.0 - 1e-9
+
+
+# ----------------------------------------------------------------------
+# Batch 3：策略信誉自适应权重 → 多策略集成（Feature #7）
+# ----------------------------------------------------------------------
+def test_credibility_feeds_fuse_signals(sup):
+    # 给 momentum 灌一串正收益 → 抬高其信誉权重
+    for _ in range(30):
+        sup.observe_strategy_outcome("momentum", 1.0, 0.05)
+    assert sup._ic_weights.get("momentum", 1.0) > 1.0
+    # 等评分的两标签融合：momentum 信誉高 → 贡献应高于 defensive
+    out = sup.fuse_signals({"momentum": 50.0, "defensive": 50.0})
+    assert out["contributions"]["momentum"] > out["contributions"]["defensive"]
+
+
+def test_credibility_disabled_is_noop(sup):
+    sup.config.credibility_enabled = False
+    for _ in range(30):
+        sup.observe_strategy_outcome("momentum", 1.0, 0.05)
+    assert sup._ic_weights == {}  # 关闭时不应产出生效权重
+
+
+# ----------------------------------------------------------------------
 # 波动率尾部风险自适应降仓（Feature #6）
 # ----------------------------------------------------------------------
 def _feed_equity(sup, values):
