@@ -644,8 +644,13 @@ class PositionSizer:
     - kelly：半 Kelly 仓位，上限 kelly_cap
     """
 
-    def __init__(self, config: GuardConfig):
+    def __init__(self, config: GuardConfig,
+                 vol_provider: Optional[callable] = None):
         self.config = config
+        # vol_provider(code) -> 年化波动率(float) | None。仅当 sizing_method==
+        # "volatility_target" 且未显式传入 annualized_vol 时调用（固定比例法下永不触发，
+        # 零 IO，不改变既有行为）。
+        self.vol_provider = vol_provider
 
     def size(
         self,
@@ -658,6 +663,7 @@ class PositionSizer:
         payoff: Optional[float] = None,
         existing_value: float = 0.0,
         max_single_pct: Optional[float] = None,
+        code: Optional[str] = None,
     ) -> Tuple[int, float]:
         """返回 (整手数量, 预算金额)
 
@@ -666,10 +672,12 @@ class PositionSizer:
             price: 委托价
             total_equity: 当前总资产
             signal_strength: 信号强度 0~1（融合多模型概率/评分）
-            annualized_vol: 标的年化波动率（volatility_target 用）
+            annualized_vol: 标的年化波动率（volatility_target 用）。为 None 且配置了
+                vol_provider 时，自动按 code 估计 —— 把原本「死代码」的波动率目标法盘活。
             win_prob / payoff: Kelly 用（payoff=avg_win/avg_loss）
             existing_value: 该标的已有市值（用于加仓上限）
             max_single_pct: 单票上限（默认取配置）
+            code: 标的代码（波动率目标法自动估 vol 时需要）
         """
         if price <= 0 or total_equity <= 0:
             return 0, 0.0
@@ -677,11 +685,21 @@ class PositionSizer:
         max_single_pct = max_single_pct or self.config.max_single_position_pct
         strength = max(0.0, min(1.0, signal_strength))
 
-        if self.config.sizing_method == "volatility_target" and annualized_vol:
-            # 波动率越高，预算越小：budget_frac = target / vol（封顶 base 的 2 倍）
-            vol = max(annualized_vol, 1e-6)
-            frac = min(self.config.volatility_target_pct / vol,
-                       self.config.base_risk_fraction * 2)
+        # 波动率目标法：优先用显式传入的 vol，否则尝试按 code 实时估计
+        if self.config.sizing_method == "volatility_target":
+            if annualized_vol is None and self.vol_provider is not None and code:
+                try:
+                    annualized_vol = self.vol_provider(code)
+                except Exception:  # noqa: BLE001
+                    annualized_vol = None
+            if annualized_vol:
+                # 波动率越高，预算越小：budget_frac = target / vol（封顶 base 的 2 倍）
+                vol = max(annualized_vol, 1e-6)
+                frac = min(self.config.volatility_target_pct / vol,
+                           self.config.base_risk_fraction * 2)
+            else:
+                # 未知波动率（无历史）→ 优雅降级为固定比例法，绝不用极小值 vol 撑爆仓位
+                frac = self.config.base_risk_fraction
         elif self.config.sizing_method == "kelly" and win_prob and payoff:
             kelly = win_prob - (1 - win_prob) / max(payoff, 1e-6)
             frac = max(0.0, min(kelly * 0.5, self.config.kelly_cap))  # 半 Kelly + 封顶
@@ -776,7 +794,15 @@ class RiskSupervisor:
         # 安全层组件（把 broker 注入进去：武装实盘前要能确认它是真实盘通道）
         self.safety = SafetyController(self.config, broker=broker)
         self.gate = OrderGate(self.config, self.safety)
-        self.sizer = PositionSizer(self.config)
+
+        # 波动率目标法需要的「按 code 实时估 vol」provider（固定比例法下不会被调用）
+        try:
+            from src.trading.analytics import VolatilityEstimator
+            self._vol_estimator = VolatilityEstimator()
+            vol_provider = self._vol_estimator.annualized_vol
+        except Exception:  # noqa: BLE001
+            vol_provider = None
+        self.sizer = PositionSizer(self.config, vol_provider=vol_provider)
         self.journal = TradeJournal(self.config)
 
         self._lock = threading.RLock()
@@ -1060,6 +1086,7 @@ class RiskSupervisor:
                 annualized_vol=annualized_vol, win_prob=win_prob, payoff=payoff,
                 existing_value=existing_value,
                 max_single_pct=self.config.max_single_position_pct,
+                code=code,
             )
         if qty < 100:
             prop = self.gate.create(
