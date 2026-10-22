@@ -114,6 +114,15 @@ class GuardConfig:
     # 默认开启；未接入指数数据前 regime=sideways → 所有权重≈1.0，零行为变化。
     regime_weighting_enabled: bool = True
 
+    # ---- 波动率尾部风险自适应降仓（Vol-Control，Feature #6）----
+    # 监控组合净值已实现波动率，单边上行不限制、只在「波动率异常飙涨」时自动
+    # 压低**新开仓**强度（不碰止损/风控离场），相当于给系统装一个「恐慌阻尼器」。
+    # 默认开启；纯加法、fail-safe：数据不足/计算异常时退化为不干预（系数=1.0）。
+    vol_control_enabled: bool = True
+    vol_control_window: int = 20          # 滚动计算已实现波动的样本窗口(交易日)
+    vol_control_spike_multiple: float = 2.5  # 当前波动 ≥ 基线 × 该倍数 → 触发降仓
+    vol_control_min_strength: float = 0.3    # 触发后新开仓强度下限（不完全停手，留流动性）
+
     # ---- 人工确认 ----
     confirm_timeout_sec: float = 300.0       # 待确认委托超时(秒)，超时自动撤销
 
@@ -835,6 +844,11 @@ class RiskSupervisor:
         # 熔断自诊断：自愈后的「降权冷静期」截止时间戳（epoch 秒），0=无
         self._heal_throttle_until: float = 0.0
 
+        # 波动率尾部风险自适应降仓（Feature #6）：滚动净值收益缓冲 + 当前阻尼系数
+        self._equity_window: List[float] = []   # 仅存「收益率」，不混装净值水位
+        self._last_equity: Optional[float] = None  # 上一 tick 净值，用于算收益率
+        self._vol_control_factor: float = 1.0  # 1.0=不干预；<1.0=降仓
+
         logger.info(
             f"🛡️ RiskSupervisor 初始化 | mode={self.safety.mode.value} "
             f"halted={self.safety.halted}"
@@ -908,14 +922,18 @@ class RiskSupervisor:
         """当前持仓（自动区分 PAPER 纸账户 / LIVE 券商账户）。"""
         return self._positions()
 
-    # ---------- 信号强度自适应（regime 加权 + 自愈降权） ----------
-    def _adjust_signal_strength(self, strategy_tag: str, raw: float) -> float:
-        """把「市场状态」与「熔断自愈冷静期」折算进下单强度。
+    # ---------- 信号强度自适应（regime 加权 + 自愈降权 + 波动率降仓） ----------
+    def _adjust_signal_strength(self, strategy_tag: str, raw: float,
+                                is_exit: bool = False) -> float:
+        """把「市场状态 / 熔断自愈冷静期 / 波动率尾部风险」折算进下单强度。
 
         - regime 加权：牛市放大进攻、熊市放大防御，由 ``self.regime`` 查表得到
           标签系数（风控类标签 stop 恒为 1.0，止损纪律不受市场状态影响）。
         - 自愈降权：若正处于熔断自愈后的「降权冷静期」，再乘一个折扣系数，
           实现「部分解冻」而非全仓位立刻放开。
+        - 波动率降仓（Vol-Control）：仅对**新开仓**（``is_exit=False``）生效，
+          当组合净值已实现波动率异常飙涨时压低强度；止损/风控离场永远是 1.0
+          （恐慌时更该果断离场，绝不能因为波动大就卡住止损）。
         输出裁剪到 [0, 2.0]（允许 regime 适度放大，但不过冲）。
         """
         s = float(raw)
@@ -923,11 +941,68 @@ class RiskSupervisor:
             s *= self.regime.weight(strategy_tag, 1.0)
         if self._heal_throttle_until and time.time() < self._heal_throttle_until:
             s *= float(self.config.auto_resume_risk_fraction)
+        # Vol-Control：只压新开仓，不碰离场
+        if not is_exit and self.config.vol_control_enabled and self._vol_control_factor < 1.0:
+            s *= self._vol_control_factor
         return max(0.0, min(2.0, s))
+
+    def _update_vol_control(self, equity: float) -> None:
+        """滚动维护净值收益窗口，计算「波动率尾部风险」阻尼系数。
+
+        实现（稳健、零分支依赖）：
+        - 用 ``_last_equity`` 记录上一 tick 净值水位，每 tick 算出**这一笔**的
+          tick 级收益率并追加进 ``_equity_window``（窗口只装收益率，不混装水位，
+          避免首笔 0.0 种子导致后续永远算不出收益率的死窗口）。
+        - 以窗口后半段的收益波动（std）为「当前波动」，以全窗口收益中位数
+          （绝对值）为「常态波动」基线；当前波动 ≥ 基线 × ``vol_control_spike_multiple``
+          即判定波动异常，把系数线性压到 ``vol_control_min_strength``；否则系数=1.0。
+        - 数据不足（窗口未满）或计算异常 → 系数保持 1.0（fail-safe，不干预）。
+        """
+        try:
+            import numpy as _np
+            if equity <= 0:
+                return
+            # 记录收益率（首 tick 无前值，仅打底，不装窗口）
+            if self._last_equity is not None and self._last_equity > 0:
+                self._equity_window.append(
+                    (equity - self._last_equity) / self._last_equity)
+            self._last_equity = equity
+            n = int(self.config.vol_control_window)
+            if len(self._equity_window) > n:
+                self._equity_window = self._equity_window[-n:]
+            if len(self._equity_window) < max(5, n // 2):
+                self._vol_control_factor = 1.0
+                return
+            arr = _np.asarray([float(x) for x in self._equity_window])
+            cur = float(_np.std(arr[-max(2, n // 2):], ddof=0))
+            base = max(abs(float(_np.median(arr))), 1e-6)
+            if cur >= base * float(self.config.vol_control_spike_multiple):
+                # 线性压到下限：偏离越多压得越狠，但保底 min_strength
+                over = min((cur / base) / float(self.config.vol_control_spike_multiple), 3.0)
+                factor = max(float(self.config.vol_control_min_strength),
+                            1.0 - (over - 1.0) * 0.35)
+                self._vol_control_factor = factor
+            else:
+                self._vol_control_factor = 1.0
+        except Exception:  # noqa: BLE001  // 任何异常都不该中断主流程
+            self._vol_control_factor = 1.0
 
     def set_regime(self, regime: Optional[str]) -> None:
         """由外部（交易闭环 / 调度）每 tick 推送当前市场状态。"""
         self.regime.update(regime)
+
+    def fuse_signals(self, scores: Dict[str, float]) -> Dict:
+        """多策略信号集成（Feature #4 + #2）：用当前市场状态权重融合各策略评分。
+
+        ``scores`` 为 ``{策略标签: AI 评分(0~100)}``。返回一个含综合分、决策、
+        各策略权重与贡献拆解的 dict，可直接用于下单前的信号融合或绩效归因。
+        """
+        from src.trading.ensemble import fuse_strategies
+        return fuse_strategies(
+            scores,
+            regime_weights=self.regime.describe(),
+            ic_weights=getattr(self, "_ic_weights", None) or {},
+        )
 
     # ---------- 账户/持仓适配（PAPER 走纸账户，LIVE 走券商） ----------
     def _paper_quote_fallback(self, code: str,
@@ -1033,9 +1108,10 @@ class RiskSupervisor:
         """
         self._log_signal(code, name, side, ai_score, agreement, signal_strength)
 
-        # 0. 市场状态动态加权 + 熔断自愈降权（统一在入口缩放 signal_strength，
-        #    后续预算公式 budget = equity*frac*(0.5+0.5*strength) 自动跟随）
-        signal_strength = self._adjust_signal_strength(strategy_tag, signal_strength)
+        # 0. 市场状态动态加权 + 熔断自愈降权 + 波动率降仓（统一在入口缩放
+        #    signal_strength，后续预算公式 budget = equity*frac*(0.5+0.5*strength) 自动跟随）
+        signal_strength = self._adjust_signal_strength(
+            strategy_tag, signal_strength, is_exit=risk_exit)
 
         # 1. 全局开关
         if not self.safety.can_trade():
@@ -1474,6 +1550,12 @@ class RiskSupervisor:
                 self.safety.set_today_start(equity)
 
         self.safety.update_equity(equity)
+
+        # 波动率尾部风险自适应降仓（Feature #6）：每 tick 更新净值波动阻尼系数
+        try:
+            self._update_vol_control(equity)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"波动率降仓更新跳过（已忽略）: {e}")
 
         # 回撤熔断
         dd = self.safety.current_drawdown_pct(equity)

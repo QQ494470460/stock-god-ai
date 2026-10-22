@@ -200,3 +200,48 @@ def test_heal_throttle_expires(sup):
     sup.regime.enabled = False
     sup._heal_throttle_until = time.time() - 10  # 已过期
     assert sup._adjust_signal_strength("loop", 1.0) == 1.0
+
+
+# ----------------------------------------------------------------------
+# 波动率尾部风险自适应降仓（Feature #6）
+# ----------------------------------------------------------------------
+def _feed_equity(sup, values):
+    """依次把一串净值喂给 _update_vol_control，触发滚动窗口更新。"""
+    for v in values:
+        sup._update_vol_control(v)
+
+
+def test_vol_control_factor_stays_one_with_steady_equity(sup):
+    # 净值几乎不动 → 波动极小 → 系数恒为 1.0（不干预）
+    sup.config.vol_control_window = 20
+    steady = [1_000_000.0 + i * 100.0 for i in range(30)]  # 极缓涨
+    _feed_equity(sup, steady)
+    assert sup._vol_control_factor == pytest.approx(1.0)
+
+
+def test_vol_control_factor_suppresses_new_entry_on_spike(sup):
+    # 先给一段平稳净值铺满窗口，再砸一根大跌，制造「近期波动 >> 常态基线」
+    sup.config.vol_control_window = 20
+    sup.config.vol_control_spike_multiple = 2.5
+    sup.config.vol_control_min_strength = 0.3
+    base = [1_000_000.0] * 24  # 全平 → 常态波动基线≈0，但 median 会被 0 拉满 1e-6 兜底
+    # 制造一段有微小正波动的正常序列（避免基线=0 退化），再接暴跌
+    normal = [1_000_000.0 * (1 + 0.001 * i) for i in range(24)]
+    crash = normal[-1] * 0.80  # 单 tick -20% 暴跌
+    _feed_equity(sup, normal + [crash])
+    # 窗口足够 + 出现 -20% 极端收益 → 近期 std 远超基线 → 系数被压到 <1.0
+    assert sup._vol_control_factor < 1.0
+    assert sup._vol_control_factor >= sup.config.vol_control_min_strength
+
+
+def test_vol_control_never_suppresses_exit(sup):
+    # 即便波动降仓系数 <1（压新开仓），离场/止损永远是 1.0
+    sup.config.vol_control_window = 20
+    normal = [1_000_000.0 * (1 + 0.001 * i) for i in range(24)]
+    crash = normal[-1] * 0.80
+    _feed_equity(sup, normal + [crash])
+    assert sup._vol_control_factor < 1.0  # 确认已进入降仓状态
+    # 离场信号不打折
+    assert sup._adjust_signal_strength("loop", 1.0, is_exit=True) == 1.0
+    # 新开仓信号打折
+    assert sup._adjust_signal_strength("loop", 1.0, is_exit=False) < 1.0
