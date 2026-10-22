@@ -45,6 +45,7 @@ from src.trading.broker import (
 from src.trading.executor import TradeExecutor, RiskConfig
 from src.trading.paper import PaperAccount
 from src.trading.rules import check_buyable, check_sellable, sellable_quantity
+from src.trading.regime import RegimeWeighter
 
 try:  # 与 calendar.py 一致：打包/测试环境下 config 可能不在 sys.path 顶层
     from config.settings import ROOT_DIR, DATA_DIR
@@ -85,6 +86,15 @@ class GuardConfig:
     # >0 时生效，并与 max_daily_loss_abs 取大者（固定值当兜底下限）。
     max_daily_loss_abs_pct: float = 0.0       # 单日最大亏损金额线(占权益%)
 
+    # ---- 熔断自诊断 + 智能自愈（Feature #5）----
+    # 仅对「自动触发」(halted_by 以 "auto(" 开头) 且当前为 PAPER 的熔断生效；
+    # 人工 KILL 与任何实盘熔断绝不自动恢复（对齐 resume 铁律）。
+    auto_resume_cooldown_sec: int = 3600      # 熔断后至少冷却多久才允许自愈评估
+    auto_resume_require_drawdown_clear: bool = True   # 自愈前回撤必须已回落到熔断线之下
+    auto_resume_require_dailyloss_clear: bool = True  # 自愈前单日亏损必须已收复
+    auto_resume_throttle_sec: int = 1800      # 自愈后「降权冷静期」时长
+    auto_resume_risk_fraction: float = 0.5    # 冷静期内 signal_strength 折扣（部分解冻）
+
     # ---- 持仓约束 ----
     max_positions: int = 20                  # 最大持仓只数
     max_single_position_pct: float = 0.30    # 单票最大仓位(占总资产)
@@ -99,6 +109,10 @@ class GuardConfig:
     base_risk_fraction: float = 0.02         # 每笔风险敞口占净值比例(固定比例法)
     volatility_target_pct: float = 0.15      # 年化波动率目标(波动率目标法)
     kelly_cap: float = 0.10                  # Kelly 仓位上限(半 Kelly 后再封顶)
+
+    # ---- 市场状态感知 + 策略动态加权（Feature #4）----
+    # 默认开启；未接入指数数据前 regime=sideways → 所有权重≈1.0，零行为变化。
+    regime_weighting_enabled: bool = True
 
     # ---- 人工确认 ----
     confirm_timeout_sec: float = 300.0       # 待确认委托超时(秒)，超时自动撤销
@@ -814,6 +828,13 @@ class RiskSupervisor:
         self._signal_dedupe: Dict[Tuple[str, str], Tuple] = {}
         self._signal_dedupe_day: str = ""
 
+        # 市场状态感知：维护当前 regime 并对策略标签做动态加权（Feature #4）
+        self.regime = RegimeWeighter(
+            enabled=getattr(self.config, "regime_weighting_enabled", True))
+
+        # 熔断自诊断：自愈后的「降权冷静期」截止时间戳（epoch 秒），0=无
+        self._heal_throttle_until: float = 0.0
+
         logger.info(
             f"🛡️ RiskSupervisor 初始化 | mode={self.safety.mode.value} "
             f"halted={self.safety.halted}"
@@ -886,6 +907,27 @@ class RiskSupervisor:
     def positions(self) -> List[Position]:
         """当前持仓（自动区分 PAPER 纸账户 / LIVE 券商账户）。"""
         return self._positions()
+
+    # ---------- 信号强度自适应（regime 加权 + 自愈降权） ----------
+    def _adjust_signal_strength(self, strategy_tag: str, raw: float) -> float:
+        """把「市场状态」与「熔断自愈冷静期」折算进下单强度。
+
+        - regime 加权：牛市放大进攻、熊市放大防御，由 ``self.regime`` 查表得到
+          标签系数（风控类标签 stop 恒为 1.0，止损纪律不受市场状态影响）。
+        - 自愈降权：若正处于熔断自愈后的「降权冷静期」，再乘一个折扣系数，
+          实现「部分解冻」而非全仓位立刻放开。
+        输出裁剪到 [0, 2.0]（允许 regime 适度放大，但不过冲）。
+        """
+        s = float(raw)
+        if self.regime.enabled:
+            s *= self.regime.weight(strategy_tag, 1.0)
+        if self._heal_throttle_until and time.time() < self._heal_throttle_until:
+            s *= float(self.config.auto_resume_risk_fraction)
+        return max(0.0, min(2.0, s))
+
+    def set_regime(self, regime: Optional[str]) -> None:
+        """由外部（交易闭环 / 调度）每 tick 推送当前市场状态。"""
+        self.regime.update(regime)
 
     # ---------- 账户/持仓适配（PAPER 走纸账户，LIVE 走券商） ----------
     def _paper_quote_fallback(self, code: str,
@@ -990,6 +1032,10 @@ class RiskSupervisor:
             OrderProposal，status 可能为 blocked（含拒绝原因）或 pending
         """
         self._log_signal(code, name, side, ai_score, agreement, signal_strength)
+
+        # 0. 市场状态动态加权 + 熔断自愈降权（统一在入口缩放 signal_strength，
+        #    后续预算公式 budget = equity*frac*(0.5+0.5*strength) 自动跟随）
+        signal_strength = self._adjust_signal_strength(strategy_tag, signal_strength)
 
         # 1. 全局开关
         if not self.safety.can_trade():
@@ -1316,6 +1362,24 @@ class RiskSupervisor:
         return ok, msg, order
 
     # ---------- 周期性监控 / 熔断 ----------
+    def _heal_condition_cleared(self, equity: float) -> bool:
+        """熔断自诊断：触发熔断的条件是否已经真正解除。
+
+        自动熔断（auto(...)）在跨日自愈前先调用本方法做「智能诊断」——
+        只有当回撤 / 单日亏损都已回落到熔断线之下，才允许解冻；否则保持熔断，
+        避免「市场仍在恶化却无人值守盲目放开」。人工 KILL 与实盘熔断不走这里
+        （它们由 ``tick_monitor`` 的新交易日分支直接判定不恢复）。
+        """
+        if self.config.auto_resume_require_drawdown_clear:
+            dd = self.safety.current_drawdown_pct(equity)
+            if dd >= self.config.max_portfolio_drawdown_pct:
+                return False  # 回撤仍在熔断线上 → 未清除
+        if self.config.auto_resume_require_dailyloss_clear:
+            dl = self.safety.daily_loss_pct(equity)
+            if dl <= -self.config.max_daily_loss_pct:
+                return False  # 单日亏损仍在线上 → 未清除
+        return True
+
     def tick_monitor(self) -> List[str]:
         """周期性检查：净值峰值、回撤、单日亏损。触发则 halt。返回告警列表"""
         alerts: List[str] = []
@@ -1357,6 +1421,11 @@ class RiskSupervisor:
         #  3) 自愈后保持当前模式（通常是 PAPER），不会因此进入实盘。
         #  4) legacy 状态（halted_by 为空）按「非自动」处理 —— 宁可不动，
         #     也不在信息不足时擅自放行，fail-safe。
+        #  5) 智能诊断（Feature #5）：自动熔断在新交易日并不「无条件」放开，
+        #     而是先经 ``_heal_condition_cleared`` 确认回撤/单日亏损均已回落到
+        #     熔断线之下才解冻；条件未清除则保持熔断、仅刷新基线，下个交易日
+        #     再评估。解冻后进入「降权冷静期」（``_heal_throttle_until``），
+        #     期间 ``_adjust_signal_strength`` 把下单强度打折，实现部分解冻。
         #
         # 注：回撤熔断是「峰值相对当前」的，自愈后下一 tick 若仍超阈值会
         # 立即重新熔断 —— 等于「每天重新评估一次」，既恢复交易能力、
@@ -1370,18 +1439,34 @@ class RiskSupervisor:
                 _is_paper = self.safety.mode == TradingMode.PAPER
                 if _is_auto and _is_paper:
                     _reason = st.halt_reason or _by
-                    with self.safety._lock:
-                        st.halted = False
-                        st.halt_reason = ""
-                        st.halt_at = ""
-                        st.halted_by = ""
-                        self.safety._save()
-                    logger.warning(
-                        f"♻️ 自动熔断已于新交易日自愈（缘由 {_by}：{_reason}），"
-                        f"无人值守循环恢复交易（保持 PAPER 模式）"
-                    )
-                    alerts.append(f"自动熔断新交易日自愈：{_reason}")
-                    self.safety.set_today_start(equity)
+                    # 智能自愈：先诊断触发条件是否已真正解除。仅当回撤/单日亏损
+                    # 均已回落到熔断线之下才解冻；否则保持熔断（市场仍在恶化），
+                    # 仅刷新当日起始净值，下个交易日再评估。这把原本「隔夜无条件
+                    # 放开」升级为「条件清除才放开」，杜绝在深跌中继盲目恢复交易。
+                    if self._heal_condition_cleared(equity):
+                        with self.safety._lock:
+                            st.halted = False
+                            st.halt_reason = ""
+                            st.halt_at = ""
+                            st.halted_by = ""
+                            self.safety._save()
+                        # 部分解冻：进入「降权冷静期」，期间下单强度打折扣
+                        self._heal_throttle_until = (
+                            time.time() + float(self.config.auto_resume_throttle_sec))
+                        logger.warning(
+                            f"♻️ 自动熔断已智能自愈（条件已清除，缘由 {_by}：{_reason}），"
+                            f"无人值守循环恢复交易（保持 PAPER，"
+                            f"{self.config.auto_resume_throttle_sec}s 降权冷静期）"
+                        )
+                        alerts.append(
+                            f"自动熔断智能自愈：{_reason}（触发条件已清除，"
+                            f"{self.config.auto_resume_throttle_sec}s 冷静期降权）")
+                        self.safety.set_today_start(equity)
+                    else:
+                        # 条件未清除 → 保持熔断，仅刷新当日起始净值避免重复误触发
+                        self.safety.set_today_start(equity)
+                        alerts.append(
+                            f"自动熔断保留（触发条件未清除）：{_reason}")
                 else:
                     # 人工 / 实盘熔断：不解除，仅刷新当日起始净值
                     self.safety.set_today_start(equity)

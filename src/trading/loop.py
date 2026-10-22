@@ -888,6 +888,12 @@ class TradingLoop:
             phase, trading_ok, why = self._phase(now)
             report.market_status = phase
 
+            # --- 市场状态(regime)感知：每交易日推算一次，推给 guard 做策略动态加权 ---
+            try:
+                self._update_regime()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"市场状态感知跳过（已忽略）: {e}")
+
             # --- ① 计划 ---
             try:
                 self._ensure_plan(report)
@@ -1008,6 +1014,34 @@ class TradingLoop:
             from datetime import time as _t
             in_hours = (_t(9, 30) <= t <= _t(11, 30)) or (_t(13, 0) <= t <= _t(15, 0))
             return ("工作日盘中(兜底)" if in_hours else "非交易时段(兜底)"), (is_wd and in_hours), "日历降级"
+
+    def _update_regime(self) -> None:
+        """尽力而为地推算当前市场状态(regime)并推给 guard 做策略动态加权。
+
+        设计：每天只算一次（``_regime_day`` 去重）；取不到指数日线（本机无网络 /
+        非交易时段接口受限）时静默跳过，regime 保持默认 sideways（权重≈1.0）。
+        任何异常都被上层 try 吞掉，绝不因「感知不到市场」而中断交易闭环。
+        """
+        if self.guard is None:
+            return
+        today_s = _today().strftime("%Y-%m-%d")
+        if getattr(self, "_regime_day", "") == today_s:
+            return  # 一天只推算一次
+        try:
+            from datetime import timedelta
+            from src.data.fetcher import get_benchmark_kline
+            from src.trading.regime import detect_regime
+        except Exception:  # noqa: BLE001
+            return
+        start = (_today() - timedelta(days=450)).strftime("%Y-%m-%d")
+        bench = get_benchmark_kline("000300.SH", start_date=start)
+        if bench is None or len(bench) < 60:
+            return
+        regime = detect_regime(bench)
+        if regime:
+            self.guard.set_regime(regime)
+            self._regime_day = today_s
+            logger.info(f"🌐 市场状态感知更新：{regime}（策略权重已按状态调整）")
 
     # ------------------------------------------------------------------
     # 运行控制

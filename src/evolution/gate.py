@@ -71,6 +71,12 @@ class GateCriteria:
     min_periods: int = 12
     #: 是否要求年化波动不得上升
     require_no_vol_increase: bool = False
+    #: 是否启用 walk-forward 多折样本外验证（防过拟合）。默认关闭 ——
+    #   开启后候选必须在「按时间切分的多个 train/test 折」上整体胜过当前参数，
+    #   才允许进入待批准队列。需要可用的评分面板；面板缺失/过短则退化为不拦。
+    require_walk_forward: bool = False
+    #: walk-forward 至少要在多少折上胜过基准（样本外胜率门槛）
+    min_wf_folds: int = 3
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -359,6 +365,14 @@ def evaluate(
     if warnings:
         reasons = reasons + ["（提醒）" + w for w in warnings]
 
+    # ---- 第四层（可选）：walk-forward 多折样本外验证（防过拟合）----
+    if passed and criteria.require_walk_forward:
+        wf_ok, wf_msg = _walk_forward_verdict(
+            score_panel, close_panel, bench, base_params, cand_params, criteria)
+        if not wf_ok:
+            passed = False
+            reasons = reasons + [f"walk-forward 未通过：{wf_msg}"]
+
     ev = Evaluation(
         passed=passed,
         at=_now(),
@@ -386,6 +400,76 @@ def _run(score_panel, close_panel, bench, params: Dict[str, Any]) -> Optional[Di
     except Exception as e:  # noqa: BLE001
         logger.warning(f"回测执行失败: {e}")
         return None
+
+
+def _walk_forward_verdict(
+    score_panel, close_panel, bench, base_params, cand_params,
+    criteria: GateCriteria, _runner=None,
+) -> Tuple[bool, str]:
+    """walk-forward 多折样本外验证：防「全样本回测好看、实盘拉胯」的过拟合。
+
+    把时间轴切成若干 ``(train, test)`` 紧邻折，在**每一折的样本外 test 区间**上
+    比较「候选参数」与「当前参数」的回测表现；候选须在大多数折上同时不输于
+    基准（夏普与超额收益），才认为它真有泛化能力。
+
+    Args:
+        _runner: 可注入的回测函数（测试时可 monkeypatch ``gate._run``）；
+            默认用模块内的 :func:`_run`。
+
+    Returns:
+        ``(通过?, 说明文案)``。面板太短无法切折、或某折回测失败 → 退化为
+        ``(True, "")``（不拦），以确保「无面板/面板不足」时行为与旧逻辑一致。
+    """
+    runner = _runner or _run
+    try:
+        from src.trading.analytics import walk_forward_splits
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return True, ""
+    n = len(score_panel)
+    # 面板至少要够切出「1 个完整的 train+test 折」才值得做
+    _min_len = max(criteria.min_periods * 3, 36)
+    if n < _min_len:
+        return True, ""  # 面板太短，退化为不拦（与旧行为一致）
+
+    folds = walk_forward_splits(
+        n_folds=5,
+        train_size=max(criteria.min_periods, 12),
+        test_size=max(criteria.min_periods // 2, 5),
+    )
+    folds = [(t, e) for (t, e) in folds if e[1] < n]
+    if not folds:
+        return True, ""
+
+    wins = 0
+    usable = 0
+    for (t0, t1), (e0, e1) in folds:
+        try:
+            sp_te = score_panel.iloc[e0:e1 + 1]
+            cp_te = close_panel.iloc[e0:e1 + 1]
+            bm_te = bench.iloc[e0:e1 + 1] if bench is not None else None
+            base_te = runner(sp_te, cp_te, bm_te, base_params)
+            cand_te = runner(sp_te, cp_te, bm_te, cand_params)
+        except Exception:  # noqa: BLE001
+            continue
+        if base_te is None or cand_te is None:
+            continue
+        usable += 1
+        b_sharpe = base_te.get("sharpe") or 0.0
+        c_sharpe = cand_te.get("sharpe") or 0.0
+        b_excess = base_te.get("top_excess") or 0.0
+        c_excess = cand_te.get("top_excess") or 0.0
+        if c_sharpe >= b_sharpe and c_excess >= b_excess:
+            wins += 1
+
+    if usable == 0:
+        return True, ""  # 折都跑不出结果 → 不拦（退化）
+    needed = max(1, int(criteria.min_wf_folds))
+    ok = wins >= needed
+    return ok, (
+        f"walk-forward 样本外胜率 {wins}/{usable}"
+        f"（需≥{needed} 折胜过基准）"
+    )
 
 
 def gate_backtest_keys() -> set:
