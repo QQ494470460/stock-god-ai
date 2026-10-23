@@ -948,3 +948,80 @@ def test_daily_loss_abs_line_ignored_when_baseline_missing(tmp_path):
     sup.tick_monitor()
 
     assert sup.safety.halted is False, "基线为 0 时金额线判据必须失效，不能误熔断"
+
+
+# ======================================================================
+# 熔断期间「止损离场」不应被冻结（修复 32% 回撤根因）
+# ======================================================================
+# 根因：自动熔断（auto(dailyloss)/auto(drawdown)）触发后，闭环在 halt 分支
+# 提前 return，既不复用 _run_exits，guard.propose_trade / approve_and_execute
+# 也一律拒绝——等于把「斩仓」一起冻住，亏损反而越拖越大（实测 32% 回撤）。
+# 修复：自动熔断只冻结「新开仓/调仓」，风控性离场（risk_exit=True）照常放行；
+# 人工 KILL SWITCH（operator=user/dashboard/system）仍冻结一切。
+
+def _sup_with_position(tmp_path, halted_by):
+    """构造一个 PAPER 监督器：持有 600000 一股、已自动熔断。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"), journal_file=str(tmp_path / "j.jsonl"))
+    broker = FakeBroker(total_asset=1_000_000, last_price=10.0)
+    paper = FakePaper(total=1_000_000)
+    paper.holdings = {"600000": {"qty": 1000, "cost": 10.0, "last": 10.0}}
+    sup = RiskSupervisor(broker, cfg, paper_account=paper)
+    sup.safety.halt("单元测试自动熔断", operator=halted_by)
+    return sup, paper
+
+
+def test_risk_exit_sell_executes_during_auto_halt(tmp_path):
+    """自动熔断期间，止损卖出（risk_exit）仍应成交。"""
+    sup, paper = _sup_with_position(tmp_path, "auto(dailyloss)")
+    assert sup.safety.halted is True
+    prop = sup.propose_trade("600000", "浦发", OrderSide.SELL,
+                             ai_score=50, agreement=0.9, risk_exit=True,
+                             explicit_quantity=1000)
+    assert prop.status == "approved", f"自动熔断下止损单不应被 propose 拦截: {prop.reason}"
+    ok, msg, _ = sup.approve_and_execute(prop.proposal_id, "auto")
+    assert ok is True, f"自动熔断下止损单应可执行，实际: {msg}"
+    assert "600000" not in paper.holdings, "止损后应已清掉持仓"
+
+
+def test_new_entry_blocked_during_auto_halt(tmp_path):
+    """自动熔断期间，新开仓（非 risk_exit）仍应被冻结。"""
+    sup, _ = _sup_with_position(tmp_path, "auto(dailyloss)")
+    prop = sup.propose_trade("600000", "浦发", OrderSide.BUY,
+                             ai_score=70, agreement=0.9, risk_exit=False)
+    assert prop.status == "blocked"
+    ok, msg, _ = sup.approve_and_execute(prop.proposal_id, "auto")
+    assert ok is False
+    assert "KILL SWITCH" in msg
+
+
+def test_manual_kill_switch_blocks_risk_exit_too(tmp_path):
+    """人工 KILL SWITCH 下，连止损离场也必须冻结（操作者明确「全部停止」）。"""
+    sup, paper = _sup_with_position(tmp_path, "user")
+    assert sup.safety.halted is True
+    prop = sup.propose_trade("600000", "浦发", OrderSide.SELL,
+                             ai_score=50, agreement=0.9, risk_exit=True)
+    assert prop.status == "blocked", "人工 KILL SWITCH 应冻结一切，包括止损"
+    ok, msg, _ = sup.approve_and_execute(prop.proposal_id, "user")
+    assert ok is False
+    assert "600000" in paper.holdings, "人工 KILL SWITCH 下不应有任何成交"
+
+
+def test_auto_halt_resume_path_still_cuts_losers_then_resumes(tmp_path):
+    """自动熔断下能斩仓（risk_exit 放行），且新交易日自愈逻辑不被破坏。"""
+    sup, paper = _sup_with_position(tmp_path, "auto(drawdown)")
+    # 斩仓
+    prop = sup.propose_trade("600000", "浦发", OrderSide.SELL,
+                             ai_score=50, agreement=0.9, risk_exit=True,
+                             explicit_quantity=1000)
+    ok, _, _ = sup.approve_and_execute(prop.proposal_id, "auto")
+    assert ok is True
+    assert "600000" not in paper.holdings
+    # 自愈逻辑仍在：新交易日 + 条件清除应自动恢复交易
+    sup.safety._state.today_date = "2000-01-01"  # 强制跨日
+    sup.safety._state.peak_equity = 1_000_000.0
+    sup.paper_account.cash = 1_000_000.0
+    # 当前 equity 接近峰值 → 回撤/单日亏损条件已清除
+    sup.tick_monitor()
+    # 自动熔断应在条件清除后自愈（恢复交易能力），且未被「放行止损」改动破坏。
+    assert sup.safety.halted is False, "自动熔断条件清除后应自愈恢复交易"
+

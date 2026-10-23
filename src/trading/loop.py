@@ -925,7 +925,25 @@ class TradingLoop:
                 if self.guard.safety.halted:
                     self._set_state(LoopState.HALTED)
                     report.state = self._state.value
-                    report.note = "🛑 安全中枢已熔断，停止一切交易"
+                    # 关键修正：熔断期间仍执行「纪律性离场」（止损/止盈）。
+                    # 自动熔断只应冻结新开仓/调仓，不能冻结斩仓——否则亏损会越拖
+                    # 越大（实测曾因此出现 32% 回撤）。这里按最新价 mark 后跑一遍
+                    # 止损检查；能否成交由 guard 判定（人工 KILL SWITCH 仍全冻）。
+                    try:
+                        need = [p.code for p in positions]
+                        prices = self._prices_for(need) if need else {}
+                        if self._mark_paper_to_market(prices):
+                            positions = self._positions()
+                            account = self._account()
+                            if account:
+                                report.equity = float(account.total_asset)
+                                report.cash = float(account.available_cash)
+                                report.market_value = float(account.market_value)
+                        if self.config.enable_stop_orders:
+                            self._run_exits(positions, prices, report)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"熔断期间止损检查异常: {e}")
+                    report.note = "🛑 安全中枢已熔断（冻结新开仓/调仓；止损离场照常执行）"
                     # 只在「进入熔断」那一刻推一次，避免每个 tick 都推（默认 notify=True，
                     # 一旦接了通知渠道就会变成通知轰炸）。熔断解除/重启后会重置该标志，
                     # 下一次再熔断可重新推送。

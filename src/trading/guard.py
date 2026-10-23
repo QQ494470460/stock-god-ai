@@ -1237,16 +1237,24 @@ class RiskSupervisor:
 
         # 1. 全局开关
         if not self.safety.can_trade():
-            reason = "KILL SWITCH 已触发，禁止交易" if self.safety.halted else "模式为 OFF，禁止交易"
-            prop = self.gate.create(
-                code=code, name=name, side=side.value, price=0.0,
-                quantity=0, est_amount=0.0, ai_score=ai_score,
-                agreement=agreement, signal_strength=signal_strength,
-                strategy_tag=strategy_tag, risk_exit=risk_exit,
-            )
-            self.gate.mark_blocked(prop, reason)
-            self._emit("risk_block", {"code": code, "reason": reason})
-            return prop
+            # 风控性离场（止损/止盈，risk_exit=True）在「自动熔断」场景下仍放行：
+            # 自动熔断（operator 以 "auto(" 开头，如 auto(dailyloss)/auto(drawdown)）
+            # 只应冻结「新开仓/调仓」，绝不能冻结「斩仓」——否则会像实测那样把
+            # 亏损越拖越大（曾出现 32% 回撤）。人工 KILL SWITCH（user/dashboard/
+            # system）仍冻结一切，那是操作者明确的「全部停止」意图，必须尊重。
+            if risk_exit and str(self.safety._state.halted_by or "").startswith("auto("):
+                pass  # 放行，继续走常规 propose 流程
+            else:
+                reason = "KILL SWITCH 已触发，禁止交易" if self.safety.halted else "模式为 OFF，禁止交易"
+                prop = self.gate.create(
+                    code=code, name=name, side=side.value, price=0.0,
+                    quantity=0, est_amount=0.0, ai_score=ai_score,
+                    agreement=agreement, signal_strength=signal_strength,
+                    strategy_tag=strategy_tag, risk_exit=risk_exit,
+                )
+                self.gate.mark_blocked(prop, reason)
+                self._emit("risk_block", {"code": code, "reason": reason})
+                return prop
 
         # 2. 交易时段（实盘必须有日历约束）
         if self.safety.is_live():
@@ -1485,7 +1493,11 @@ class RiskSupervisor:
 
         # 执行前再熔断一次（防御纵深）
         if self.safety.halted:
-            return False, "KILL SWITCH 已触发，禁止执行", None
+            # 风控性离场（止损/止盈，risk_exit=True）在「自动熔断」场景下仍放行：
+            # 自动熔断只应冻结新开仓/调仓，不能冻结斩仓（实测曾因此出现 32% 回撤）。
+            # 人工 KILL SWITCH 仍冻结一切。
+            if not (prop.risk_exit and str(self.safety._state.halted_by or "").startswith("auto(")):
+                return False, "KILL SWITCH 已触发，禁止执行", None
 
         rate_reason = self._check_rate_limit()
         if rate_reason:
