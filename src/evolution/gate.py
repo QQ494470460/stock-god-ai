@@ -35,8 +35,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import json
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -48,7 +50,11 @@ __all__ = [
     "GateCriteria", "DEFAULT_CRITERIA", "BACKTEST_MAP", "PanelProvider",
     "risk_precheck", "map_changes", "compare_metrics", "evaluate",
     "evaluate_candidate", "verify_supplied_evaluation", "apply_verdict",
+    "load_criteria",
 ]
+
+#: 闸门配置文件的默认位置（项目根 config/）。可被 load_criteria(path=...) 覆盖（测试用）。
+_GATE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "evolution_gate.json"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +92,43 @@ DEFAULT_CRITERIA = GateCriteria()
 
 #: 面板提供者：返回 (score_panel, close_panel, benchmark_close 或 None)
 PanelProvider = Callable[[], Optional[Tuple[Any, Any, Optional[Any]]]]
+
+
+def load_criteria(path=None) -> GateCriteria:
+    """从 ``config/evolution_gate.json`` 读取闸门门槛（可选）。
+
+    这是把 Walk-Forward 门禁从「写了代码但永远关着」变成「可一键开关」的接线点：
+    生产回路（``scripts/evolve.py``）默认用 :func:`load_criteria` 构造
+    :class:`GateCriteria`，而不是硬编码 ``DEFAULT_CRITERIA``。
+
+    ⚠️ 刻意保守的默认：**只要文件里没有显式 ``require_walk_forward: true``，
+    就保持关闭**。理由——开启 WF 需要面板足够长（≥ ``max(min_periods*3, 36)`` 天），
+    否则 ``_walk_forward_verdict`` 会静默退化为「不拦」，等于开关开了却没用；
+    更糟的是如果哪天误把开关打开却忘了先 ``--build-panel``，所有候选会被
+    ``gate:no-data`` 静默拒掉。所以「开」必须是显式的、有意为之的动作。
+
+    Args:
+        path: 配置文件路径；缺省用 :data:`_GATE_CONFIG_PATH`。
+
+    Returns:
+        合并后的 :class:`GateCriteria`。文件缺失 / 损坏 / 没有任何已知字段时，
+        回退到 ``DEFAULT_CRITERIA``（WF 关闭）。
+    """
+    p = Path(path) if path else _GATE_CONFIG_PATH
+    if not p.exists():
+        return DEFAULT_CRITERIA
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"闸门配置读取失败（用默认门槛）: {e}")
+        return DEFAULT_CRITERIA
+    if not isinstance(data, dict):
+        return DEFAULT_CRITERIA
+    known = {k: v for k, v in data.items()
+             if k in GateCriteria.__dataclass_fields__}
+    if not known:
+        return DEFAULT_CRITERIA
+    return replace(DEFAULT_CRITERIA, **known)
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +412,12 @@ def evaluate(
     if passed and criteria.require_walk_forward:
         wf_ok, wf_msg = _walk_forward_verdict(
             score_panel, close_panel, bench, base_params, cand_params, criteria)
+        # 通过/未通过都写进 reasons：否则「开了 WF 且过关」在审计记录里完全不可见，
+        # 事后无法区分「真过了 WF」和「根本没跑 WF」。wf_msg 本身已带
+        # 「walk-forward 通过/未通过」前缀，直接留痕即可。
+        reasons = reasons + [wf_msg]
         if not wf_ok:
             passed = False
-            reasons = reasons + [f"walk-forward 未通过：{wf_msg}"]
 
     ev = Evaluation(
         passed=passed,
@@ -466,8 +512,11 @@ def _walk_forward_verdict(
         return True, ""  # 折都跑不出结果 → 不拦（退化）
     needed = max(1, int(criteria.min_wf_folds))
     ok = wins >= needed
+    verdict = "通过" if ok else "未通过"
+    # ⚠️ 即使通过也要把结果写进 reasons：否则「WF 门禁开启且候选过关」这件事
+    # 在审计记录里完全不可见，事后无法区分「真过了 WF」和「压根没跑 WF」。
     return ok, (
-        f"walk-forward 样本外胜率 {wins}/{usable}"
+        f"walk-forward {verdict}：样本外胜率 {wins}/{usable}"
         f"（需≥{needed} 折胜过基准）"
     )
 

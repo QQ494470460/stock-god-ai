@@ -21,6 +21,11 @@
     # 构建样本外面板（重，首次必做，否则闸门无法判定 → 候选一律被拒）
     py -3.12 scripts/evolve.py --build-panel --max-stocks 200 --pool hs300
 
+    # 开启 Walk-Forward 样本外门禁（防过拟合：候选须在多个样本外折上整体胜过当前参数）
+    # 需先 --build-panel 且面板足够长（≥ max(min_periods*3, 36) 天），否则会静默退化为不拦
+    py -3.12 scripts/evolve.py --run --walk-forward
+    # 也可在 config/evolution_gate.json 把 require_walk_forward 设为 true 长期开启
+
     # 人工裁决
     py -3.12 scripts/evolve.py --show <候选ID>
     py -3.12 scripts/evolve.py --approve <候选ID>
@@ -95,6 +100,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pool", default="hs300", help="股票池（hs300/zz500/all…）")
     ap.add_argument("--reset-overrides", action="store_true",
                     help="清空全部参数覆盖（恢复默认值）")
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="本回合强制开启 Walk-Forward 样本外门禁（防过拟合）："
+                         "候选除通过 A/B 回测外，还须在按时间切分的多个样本外折上"
+                         "整体胜过当前参数，否则被拒。覆盖 config/evolution_gate.json。")
+    ap.add_argument("--no-walk-forward", action="store_true",
+                    help="本回合强制关闭 Walk-Forward 门禁（回到仅 A/B 对比）。"
+                         "覆盖 config/evolution_gate.json。")
     ap.add_argument("--models", action="store_true",
                     help="列出模型注册表（含「已钉住」标记）")
     ap.add_argument("--pin", metavar="KEY",
@@ -472,7 +484,7 @@ def _doctor() -> int:
         warn(f"LLM 状态无法判断：{e}", "检查 config/deepseek.yaml")
 
     # ---------------- 6 状态文件 ----------------
-    print("\n【6/6 生产状态文件】确认它们都在、且可写")
+    print("\n【6/7 生产状态文件】确认它们都在、且可写")
     from config.settings import DATA_DIR
 
     for p, what in [
@@ -485,6 +497,32 @@ def _doctor() -> int:
             ok(f"{what}：{p.name}", f"{p.stat().st_size} 字节")
         else:
             print(f"     ℹ️ {what}：{p.name} 尚未生成（首次运行时创建）")
+
+    # ---------------- 7 Walk-Forward 门禁就绪 ----------------
+    print("\n【7/7 Walk-Forward 门禁就绪】防过拟合的最后一道闸")
+    from src.evolution import gate as _gate
+
+    wf_crit = _gate.load_criteria()
+    if not wf_crit.require_walk_forward:
+        print("   ⚪ Walk-Forward 门禁当前**关闭**（默认）。"
+              "候选只需通过 A/B 回测即可进入待批准队列。")
+        print("     想开启：把 config/evolution_gate.json 的"
+              " require_walk_forward 设为 true，或跑回合时加 --walk-forward。")
+    else:
+        min_len = max(wf_crit.min_periods * 3, 36)
+        if not panels.panel_available():
+            bad("门禁已开启但没有样本外面板 —— 候选会被 gate:no-data 全部拒掉",
+                "scripts/evolve.py --build-panel --max-stocks 200 --pool hs300")
+        else:
+            meta = panels.panel_meta() or {}
+            nd = meta.get("n_days") or 0
+            if nd < min_len:
+                warn(f"门禁已开启，但面板仅 {nd} 天 < {min_len} 天下限 —— "
+                     "walk-forward 会**静默退化为不拦**（等于没开）",
+                     f"用更长的历史重新 --build-panel（覆盖更长区间）")
+            else:
+                ok(f"门禁已开启且面板 {nd} 天 ≥ {min_len} 天下限，"
+                   f"walk-forward 会真正生效（min_wf_folds={wf_crit.min_wf_folds}）")
 
     print("\n" + "=" * 72)
     if blockers:
@@ -564,7 +602,22 @@ def main() -> int:
     if not panels.panel_available():
         print("⚠️ 未找到样本外面板缓存（闸门无法判定，候选会被拒）。"
               "请先执行：scripts/evolve.py --build-panel", file=sys.stderr)
-    runner = EvolutionRunner(provider=panels.provider_from_cache())
+
+    # ---- 闸门门槛：默认从 config/evolution_gate.json 取（WF 默认关），
+    #      CLI 的 --walk-forward / --no-walk-forward 可临时覆盖本回合 ----
+    criteria = gate.load_criteria()
+    if args.walk_forward:
+        criteria = gate.GateCriteria(
+            **{**criteria.to_dict(), "require_walk_forward": True})
+    elif args.no_walk_forward:
+        criteria = gate.GateCriteria(
+            **{**criteria.to_dict(), "require_walk_forward": False})
+    if criteria.require_walk_forward:
+        print(f"🔬 本回合已启用 Walk-Forward 样本外门禁"
+              f"（min_wf_folds={criteria.min_wf_folds}，面板过短会退化为不拦）")
+
+    runner = EvolutionRunner(provider=panels.provider_from_cache(),
+                             criteria=criteria)
 
     # ---- 裁决动作 ----
     try:
@@ -663,11 +716,15 @@ def main() -> int:
         print("\n⚠️ 风控处于熔断状态，进化回合将不做任何改动")
 
     print("\n【判定标准】")
-    c = gate.DEFAULT_CRITERIA
+    c = criteria
     print(f"   夏普提升 ≥ {c.min_sharpe_gain:+.3f}，"
           f"收益提升 ≥ {c.min_return_gain:+.2%}，"
           f"回撤恶化 ≤ {c.max_drawdown_worsen:.2%}，"
           f"调仓期数 ≥ {c.min_periods}")
+    wf = "✅已开启" if c.require_walk_forward else "⚪关闭（默认）"
+    print(f"   Walk-Forward 样本外门禁：{wf}"
+          f"（min_wf_folds={c.min_wf_folds}，需面板 ≥ "
+          f"{max(c.min_periods * 3, 36)} 天，否则退化为不拦）")
     return 0
 
 
