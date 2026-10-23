@@ -40,6 +40,72 @@ def _guard_config_path() -> str | None:
 
 
 # =====================================================================
+# 交易记录片段（原地自动刷新）
+# =====================================================================
+# 与 app.py 的盯盘片段同机制：把「读磁盘 + 渲染」包进 st.fragment，
+# 每 _TRADE_POLL_SEC 秒原地重跑该片段，让看板独立进程能持续看到
+# 常驻闭环 / 页内 AutoTrader 写入磁盘的新成交，而不必手动刷新整页。
+# （此前这两段只在整页重跑时才重读磁盘 → 必须 F5 才看得到新成交）
+_TRADE_POLL_SEC = 5
+
+
+@st.fragment(run_every=_TRADE_POLL_SEC)
+def render_paper_recent_trades_fragment():
+    """Tab3 纸交易模拟 → 「最近交易」：原地自动刷新（每 5s 重读磁盘）。"""
+    paper_account.reload()   # 看板独立进程：对齐磁盘上常驻闭环写入的最新成交
+    trades = paper_account.get_recent_trades(30)
+    if trades:
+        st.markdown("---")
+        st.markdown("### 📝 最近交易")
+        trade_rows = []
+        for t in reversed(trades):
+            emoji = "🟢" if t.side == "buy" else "🔴"
+            if t.close_id:
+                pair = t.close_id
+            elif t.side == "buy":
+                pair = "持仓中"
+            else:
+                pair = "—"
+            trade_rows.append({
+                "": emoji, "代码": t.code, "名称": t.name[:6],
+                "方向": "买" if t.side == "buy" else "卖",
+                "价格": f"{t.price:.2f}", "数量": t.quantity,
+                "金额": f"¥{t.amount:,.0f}",
+                "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
+                "盈亏%": f"{t.pnl_pct:+.2f}%" if t.side == "sell" and t.pnl_pct else "—",
+                "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
+                "配对": pair,
+                "时间": t.filled_at[:16] if t.filled_at else "",
+            })
+        st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
+
+
+@st.fragment(run_every=_TRADE_POLL_SEC)
+def render_paper_trade_records_fragment():
+    """Tab7 订单记录 → 「🧪 纸交易记录」：原地自动刷新。"""
+    paper_account.reload()   # 看板独立进程：先对齐磁盘，否则看不到常驻闭环的新成交
+    trades = paper_account.get_recent_trades(50)
+    if trades:
+        rows = []
+        for t in reversed(trades):
+            emo = "🟢" if t.side == "buy" else "🔴"
+            pair = t.close_id if t.close_id else ("持仓中" if t.side == "buy" else "—")
+            rows.append({
+                "": emo, "ID": t.trade_id, "代码": t.code, "名称": t.name[:6],
+                "方向": "买" if t.side == "buy" else "卖",
+                "价格": f"{t.price:.2f}", "数量": t.quantity,
+                "金额": f"¥{t.amount:,.0f}",
+                "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
+                "策略": t.strategy, "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
+                "配对": pair,
+                "时间": t.filled_at[:16] if t.filled_at else "",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("📭 暂无纸交易记录")
+
+
+# =====================================================================
 # 页面入口
 # =====================================================================
 
@@ -718,33 +784,8 @@ def _render_paper_trading():
         pc7.metric("总盈亏", f"¥{stats['total_pnl']:+,.0f}")
         pc8.metric("累计收益", f"{stats['total_return_pct']:+.2f}%")
 
-    # === 最近交易记录 ===
-    trades = pa.get_recent_trades(30)
-    if trades:
-        st.markdown("---")
-        st.markdown("### 📝 最近交易")
-        trade_rows = []
-        for t in reversed(trades):
-            emoji = "🟢" if t.side == "buy" else "🔴"
-            # 配对：买入=被哪笔卖出平仓(close_id)，卖出=平掉了哪笔买入(close_id)
-            if t.close_id:
-                pair = t.close_id
-            elif t.side == "buy":
-                pair = "持仓中"
-            else:
-                pair = "—"
-            trade_rows.append({
-                "": emoji, "代码": t.code, "名称": t.name[:6],
-                "方向": "买" if t.side == "buy" else "卖",
-                "价格": f"{t.price:.2f}", "数量": t.quantity,
-                "金额": f"¥{t.amount:,.0f}",
-                "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
-                "盈亏%": f"{t.pnl_pct:+.2f}%" if t.side == "sell" and t.pnl_pct else "—",
-                "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
-                "配对": pair,
-                "时间": t.filled_at[:16] if t.filled_at else "",
-            })
-        st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
+    # === 最近交易记录（原地自动刷新片段：见 render_paper_recent_trades_fragment）===
+    render_paper_recent_trades_fragment()
 
 
 # =====================================================================
@@ -1231,28 +1272,6 @@ def _render_orders():
                 st.info("📭 今日无订单记录")
     
     with tabs[1]:
-        paper_account.reload()   # 看板独立进程：先对齐磁盘，否则看不到常驻闭环的新成交
-        trades = paper_account.get_recent_trades(50)
-        if trades:
-            rows = []
-            for t in reversed(trades):
-                emo = "🟢" if t.side == "buy" else "🔴"
-                if t.close_id:
-                    pair = t.close_id
-                elif t.side == "buy":
-                    pair = "持仓中"
-                else:
-                    pair = "—"
-                rows.append({
-                    "": emo, "ID": t.trade_id, "代码": t.code, "名称": t.name[:6],
-                    "方向": "买" if t.side == "buy" else "卖",
-                    "价格": f"{t.price:.2f}", "数量": t.quantity,
-                    "金额": f"¥{t.amount:,.0f}",
-                    "盈亏": f"¥{t.pnl:+,.2f}" if t.side == "sell" else "—",
-                    "策略": t.strategy, "AI评分": f"{t.ai_score:.0f}" if t.ai_score else "—",
-                    "配对": pair,
-                    "时间": t.filled_at[:16] if t.filled_at else "",
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("📭 暂无纸交易记录")
+        # 原地自动刷新片段：每 _TRADE_POLL_SEC 秒重读磁盘，新成交自动冒出，
+        # 无需手动刷新整页（看板独立进程与常驻闭环通过磁盘成交历史解耦）。
+        render_paper_trade_records_fragment()
