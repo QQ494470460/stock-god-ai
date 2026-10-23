@@ -156,22 +156,30 @@ def test_detail_tables_stay_aligned_when_a_leg_returns_none():
 
 
 def test_torch_preloaded_before_xtquant():
-    """回归：券商账号链路（会拉 xtquant）必须**先**把 torch 预载进来。
+    """回归：xtquant 必须**惰性**加载，且加载前先把 torch 预载进来。
 
-    反序会让 torch 的 c10.dll 初始化失败（WinError 1114），LSTM 腿静默降级、
-    集成从三条腿变两条腿而看板上看不出来。import 顺序在本进程里无法回退，
-    所以必须用子进程验证。
+    1) 惰性不变式：模拟/纸交易默认路径不得 eager import 原生 xtquant（冷启动
+       DLL 初始化异常会以原生退出码无声崩溃）。
+    2) 顺序不变式：真正走实盘调用 ensure_xtquant() 时，必须先 preload torch 再
+       import xtquant，否则 torch 的 c10.dll 初始化失败（WinError 1114），LSTM 腿
+       静默降级、集成从三条腿变两条腿而看板上看不出来。
+    import 顺序在本进程里无法回退，所以必须用子进程验证。
     """
     import subprocess
     code = (
         "import sys; sys.path.insert(0, r'{root}');"
-        " import src.trading.account;"                    # 会顺带 import xtquant
+        " import src.trading.yuekai as yk;"
+        " assert 'xtquant' not in sys.modules, 'xtquant must stay lazy until ensure_xtquant()';"
+        " ok = yk.ensure_xtquant();"
+        " assert ok is True, 'ensure_xtquant should succeed when xtquant is installed';"
+        " mods = list(sys.modules);"
+        " assert 'torch' in sys.modules, 'torch must be preloaded before xtquant';"
+        " assert mods.index('torch') < mods.index('xtquant'), 'torch must load before xtquant';"
         " from src.models.ensemble import LSTMSubPredictor;"
-        " print('TORCH', 'torch' in sys.modules, 'LSTM', LSTMSubPredictor().available)"
+        " print('LSTM', LSTMSubPredictor().available)"
     ).format(root=ROOT)
     r = subprocess.run([sys.executable, "-c", code],
                        capture_output=True, text=True, timeout=300)
-    assert "TORCH True" in r.stdout, r.stdout + r.stderr
     assert "LSTM True" in r.stdout, r.stdout + r.stderr
 
 

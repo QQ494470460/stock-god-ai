@@ -68,23 +68,27 @@ if errorlevel 1 (
     exit /b 0
 )
 
-set /a tries=0
+set "pingcnt=31"
 :loop
-set /a tries+=1
 "%PYW%" scripts\run_loop.py --no-notify >> "%LOG%" 2>&1
 set "rc=!ERRORLEVEL!"
 
-echo ===== loop exited code=!rc! (try !tries!) ===== >> "%LLOG%"
+echo ===== loop exited code=!rc! ===== >> "%LLOG%"
 
+if "!rc!"=="0" (
+    echo ===== clean exit 0: launcher stops auto-restart ===== >> "%LLOG%"
+    exit /b 0
+)
 if "!rc!"=="3" (
     echo ===== another instance is running, launcher exits ===== >> "%LLOG%"
     exit /b 0
 )
-if !tries! GEQ 5 (
-    echo ===== 5 attempts failed, giving up. check the logs. ===== >> "%LLOG%"
-    exit /b !rc!
-)
 
-REM ping instead of timeout: timeout aborts when stdin is redirected (headless).
-ping -n 31 127.0.0.1 >nul
+REM Abnormal exit, e.g. -1 / native DLL init / 1 / 2: retry with exponential
+REM backoff. NEVER permanently give up: a transient cold-boot failure must not
+REM leave the trading loop dead for the whole day. run_loop.py also self-heals
+REM its own boot failures, so this is the backstop for native crashes.
+if "!pingcnt!"=="31" ( set "pingcnt=61" ) else if "!pingcnt!"=="61" ( set "pingcnt=121" ) else if "!pingcnt!"=="121" ( set "pingcnt=241" ) else ( set "pingcnt=301" )
+echo ===== backoff ~!pingcnt!s then retry, self-heal ===== >> "%LLOG%"
+ping -n !pingcnt! 127.0.0.1 >nul
 goto loop

@@ -395,6 +395,21 @@ def _print_preview(loop) -> None:
 
 
 def main() -> int:
+    # 顶层兜底：任何未捕获的 Python 异常都写清楚再退出，**不要**以 -1 / 原生码静默消失。
+    # 历史上有两次「闭环整天没跑」都源于启动期异常被吞（emoji 编码崩溃、以及冷启动
+    # 原生退出码），这里确保至少留一条可读的 traceback 在 logs/run_loop.log。
+    try:
+        return _run()
+    except Exception as _e:  # noqa: BLE001
+        import traceback as _tb
+        _ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{_ts}] 💥 顶层未捕获异常，闭环退出：{type(_e).__name__}: {_e}",
+              file=sys.stderr, flush=True)
+        _tb.print_exc()
+        return 1
+
+
+def _run() -> int:
     ap = argparse.ArgumentParser(
         description="无人值守闭环交易进程（默认纸交易）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -430,15 +445,43 @@ def main() -> int:
                   file=sys.stderr)
             return 3
 
-    loop, broker, cfg = build_loop(args)
-    if loop is None:
-        return 2
-
+    # 信号处理器尽早安装，确保启动重试阶段也能被 Ctrl+C / 终止信号优雅打断。
     signal.signal(signal.SIGINT, _on_signal)
     try:
         signal.signal(signal.SIGTERM, _on_signal)
     except (AttributeError, ValueError):  # pragma: no cover
         pass
+
+    # ---- 启动容错：连接 / 加载可能因冷启动（QMT / 网络未就绪）瞬时失败 ----
+    # 这类失败不该让闭环「整天不跑」。以指数退避重试（30→60→120→240→300s 封顶），
+    # 直到成功或收到停止信号。原生崩溃（进程直接死）由启动器负责重启，这里只兜
+    # Python 层可恢复的瞬时失败。
+    if args.preview:
+        loop, broker, cfg = build_loop(args)
+    else:
+        loop = broker = cfg = None
+        boot_attempt = 0
+        while loop is None and not _stop_requested:
+            boot_attempt += 1
+            try:
+                loop, broker, cfg = build_loop(args)
+            except Exception as _be:  # noqa: BLE001
+                loop = None
+                print(f"[{_stamp()}] ❌ 启动异常：{type(_be).__name__}: {_be}",
+                      file=sys.stderr, flush=True)
+            if loop is not None:
+                break
+            if boot_attempt == 1:
+                print(f"[{_stamp()}] ⏳ 闭环启动前置未就绪，将自动退避重试…", flush=True)
+            boot_wait = min(300, 30 * (2 ** min(boot_attempt - 1, 4)))
+            print(f"[{_stamp()}] 💤 {boot_wait}s 后重试启动（第 {boot_attempt} 次）", flush=True)
+            _slept = 0.0
+            while _slept < boot_wait and not _stop_requested:
+                time.sleep(min(0.5, boot_wait - _slept))
+                _slept += 0.5
+    if loop is None:
+        print(f"[{_stamp()}] ⚠️ 启动未成功，闭环退出。", file=sys.stderr, flush=True)
+        return 2
 
     # ---- 无头模式也拉起「收盘后自动化调度」（与看板同一套接线，幂等）----
     # 之前调度只在看板首次被打开（浏览器连接）时才启动，导致无人值守的 run_loop

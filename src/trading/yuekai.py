@@ -18,43 +18,75 @@ from src.trading.broker import (
     Position, AccountInfo, TickData,
 )
 
-# ★ 必须先加载 torch，再加载 xtquant。
-# 反序会导致 torch 的 c10.dll 初始化失败（WinError 1114），LSTM 子模型静默降级、
-# 集成从三条腿退化成两条腿而日志上看不出来。详见 src/models/torch_preload.py。
-try:
-    from src.models.torch_preload import preload_torch
-    preload_torch("xtquant 之前先加载 torch，避免 c10.dll 初始化失败")
-except Exception:  # noqa: BLE001
-    pass
+# ★ xtquant 是「可选依赖」，且是**原生 DLL**，必须只在确实需要实盘时才加载。
+#
+# 历史隐患：它在模块顶层被无条件 import —— 于是连「模拟 / 纸交易」启动也会去加载这个
+# 原生扩展。一旦冷启动（开机自启、QMT 客户端还没起来）时该 DLL 初始化异常，进程会以
+# **原生退出码**（-1 / 0x40010004 = DBG_TERMINATE_PROCESS）无声崩溃，且没有任何
+# Python traceback，看板 / 启动器只能看到「5 次重试全失败、闭环整天没跑」。
+#
+# 现在改为：模拟 / 纸交易模式**完全不碰 xtquant**；只有 connect(mode=live/auto) 真正
+# 要走实盘时，才通过 ``ensure_xtquant()`` 惰性加载，且加载失败一律降级为模拟而非崩溃。
+# torch 仍须在 xtquant 之前预载（避免 c10.dll 初始化失败，WinError 1114），见
+# src/models/torch_preload.py —— 该预载同样只在 ensure_xtquant 内触发。
+XtQuantTrader = None
+XtQuantTraderCallback = None
+StockAccount = None
+xtconstant = None
+XT_AVAILABLE = False
+_xt_import_error: Optional[str] = None
 
-# xtquant 是可选依赖，运行时检查
-try:
-    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
-    from xtquant.xttype import StockAccount
-    from xtquant import xtconstant
-    XT_AVAILABLE = True
-except ImportError:
-    XT_AVAILABLE = False
-    XtQuantTrader = None
-    XtQuantTraderCallback = object
-    StockAccount = None
-    xtconstant = None
-    from loguru import logger
-    logger.warning("xtquant 未安装，YuekaiBroker 将以模拟模式运行")
+# 降级用常量（与 xtconstant 取值一致，实盘未加载时也能用）
+_ORDER_TYPE_FALLBACK = {OrderType.LIMIT: 11, OrderType.MARKET: 22, OrderType.MARKET_BEST5: 22}
+_ACCOUNT_TYPE_FALLBACK = {"stock": None}
 
-# 资金账号类型映射
-ACCOUNT_TYPE_MAP = {"stock": StockAccount} if XT_AVAILABLE else {"stock": None}
+# 模块加载期先给一份可用默认值；实盘加载成功后再由 ensure_xtquant() 覆盖。
+ACCOUNT_TYPE_MAP = dict(_ACCOUNT_TYPE_FALLBACK)
+ORDER_TYPE_MAP = dict(_ORDER_TYPE_FALLBACK)
 
 
-# order_type / status 映射（xtquant可用时引用常量，否则用int）
-if XT_AVAILABLE:
-    ORDER_TYPE_MAP = {
-        OrderType.LIMIT: xtconstant.FIX_PRICE,
-        OrderType.MARKET: xtconstant.MARKET_SH_CONVERT_5_CANCEL,
-        OrderType.MARKET_BEST5: xtconstant.MARKET_SH_CONVERT_5_CANCEL,
-    }
-else:
-    ORDER_TYPE_MAP = {OrderType.LIMIT: 11, OrderType.MARKET: 22, OrderType.MARKET_BEST5: 22}
+def ensure_xtquant() -> bool:
+    """惰性、容错地加载原生 xtquant 依赖。
+
+    只在 connect() 判定确实需要实盘时才调用。任何失败（ImportError / DLL 加载失败 /
+    其它异常）都返回 False 并记录原因，**绝不让原生崩溃冒泡到启动器**。返回 True 表示
+    xtquant 已就绪，相关常量 / 类型映射也已刷新为真实值。
+
+    注意：原生 DLL 在 import 阶段若直接段错误，Python 无法 catch（进程已死）；但本函数
+    把调用时机推迟到实盘分支，使得默认的模拟 / 纸交易模式根本不会触发该 import，从而
+    彻底消除默认模式下冷启动崩溃的可能性。
+    """
+    global XT_AVAILABLE, XtQuantTrader, XtQuantTraderCallback, StockAccount, xtconstant
+    global ACCOUNT_TYPE_MAP, ORDER_TYPE_MAP, _xt_import_error
+    if XT_AVAILABLE:
+        return True
+    try:
+        # 先预载 torch，避免与 xtquant 的 c10.dll 初始化顺序冲突
+        try:
+            from src.models.torch_preload import preload_torch
+            preload_torch("xtquant 之前先加载 torch，避免 c10.dll 初始化失败")
+        except Exception:  # noqa: BLE001
+            pass
+        from xtquant.xttrader import XtQuantTrader as _T, XtQuantTraderCallback as _TCB
+        from xtquant.xttype import StockAccount as _SA
+        from xtquant import xtconstant as _xc
+        XtQuantTrader = _T
+        XtQuantTraderCallback = _TCB
+        StockAccount = _SA
+        xtconstant = _xc
+        ACCOUNT_TYPE_MAP = {"stock": StockAccount}
+        ORDER_TYPE_MAP = {
+            OrderType.LIMIT: xtconstant.FIX_PRICE,
+            OrderType.MARKET: xtconstant.MARKET_SH_CONVERT_5_CANCEL,
+            OrderType.MARKET_BEST5: xtconstant.MARKET_SH_CONVERT_5_CANCEL,
+        }
+        XT_AVAILABLE = True
+        return True
+    except Exception as e:  # noqa: BLE001
+        XT_AVAILABLE = False
+        _xt_import_error = str(e)
+        logger.warning(f"xtquant 加载失败（实盘不可用，已降级为模拟）：{e}")
+        return False
 
 STATUS_MAP = {
     48: OrderStatus.PENDING, 49: OrderStatus.SUBMITTED,
@@ -65,48 +97,83 @@ STATUS_MAP = {
 }
 
 
-class _XtCallback(XtQuantTraderCallback):
-    """miniQMT 回调适配器 — 桥接 xtquant 事件到 BrokerCallback"""
-    
+# ---- 回调：方法体抽成模块级函数，模拟盘用占位类、实盘用真正的 xtquant 子类 ----
+# 这样模块加载期无需 import xtquant 基类；实盘加载成功后才由 _build_live_callback
+# 生成继承自真实 XtQuantTraderCallback 的子类。
+def _cb_on_disconnected(self):
+    logger.warning("⛓️‍💥 miniQMT 连接断开")
+    self._broker._connected = False
+    self._broker._notify_disconnected()
+
+def _cb_on_stock_order(self, order):
+    """委托回报"""
+    o = _parse_xt_order(order)
+    self._broker._update_order_cache(o)
+    self._broker._notify_order(o)
+
+def _cb_on_stock_trade(self, trade):
+    """成交回报"""
+    o = _parse_xt_order(trade)
+    o.status = OrderStatus.FILLED if trade.m_traded_volume >= trade.m_order_volume else OrderStatus.PARTIAL
+    o.filled_quantity = trade.m_traded_volume
+    self._broker._update_order_cache(o)
+    self._broker._notify_trade(o)
+
+def _cb_on_stock_asset(self, asset):
+    """资金变动"""
+    self._broker._query_asset_cache = {
+        "total_asset": asset.m_total_asset,
+        "available_cash": asset.m_available_cash,
+        "frozen_cash": asset.m_frozen_cash,
+        "market_value": asset.m_market_value,
+    }
+
+def _cb_on_stock_position(self, position):
+    """持仓变动"""
+    pass
+
+def _cb_on_account_error(self, code, msg):
+    logger.error(f"miniQMT 错误 [{code}]: {msg}")
+    self._broker._notify_error(code, msg)
+
+
+class _XtCallback:
+    """模拟盘 / 未加载 xtquant 时使用的占位回调（不继承 xtquant 基类）。
+
+    xtquant 的 ``register_callback`` 按方法名派发事件，因此占位类的同名方法在
+    模拟盘下不会被调用，不影响逻辑；实盘下由 ``_build_live_callback`` 生成真正的
+    xtquant 子类回调来替换它。
+    """
+    on_disconnected = _cb_on_disconnected
+    on_stock_order = _cb_on_stock_order
+    on_stock_trade = _cb_on_stock_trade
+    on_stock_asset = _cb_on_stock_asset
+    on_stock_position = _cb_on_stock_position
+    on_account_error = _cb_on_account_error
+
     def __init__(self, broker: "YuekaiBroker"):
-        super().__init__()
         self._broker = broker
-    
-    def on_disconnected(self):
-        logger.warning("⛓️‍💥 miniQMT 连接断开")
-        self._broker._connected = False
-        self._broker._notify_disconnected()
-    
-    def on_stock_order(self, order):
-        """委托回报"""
-        o = _parse_xt_order(order)
-        self._broker._update_order_cache(o)
-        self._broker._notify_order(o)
-    
-    def on_stock_trade(self, trade):
-        """成交回报"""
-        o = _parse_xt_order(trade)
-        o.status = OrderStatus.FILLED if trade.m_traded_volume >= trade.m_order_volume else OrderStatus.PARTIAL
-        o.filled_quantity = trade.m_traded_volume
-        self._broker._update_order_cache(o)
-        self._broker._notify_trade(o)
-    
-    def on_stock_asset(self, asset):
-        """资金变动"""
-        self._broker._query_asset_cache = {
-            "total_asset": asset.m_total_asset,
-            "available_cash": asset.m_available_cash,
-            "frozen_cash": asset.m_frozen_cash,
-            "market_value": asset.m_market_value,
-        }
-    
-    def on_stock_position(self, position):
-        """持仓变动"""
-        pass
-    
-    def on_account_error(self, code, msg):
-        logger.error(f"miniQMT 错误 [{code}]: {msg}")
-        self._broker._notify_error(code, msg)
+
+
+def _build_live_callback(broker: "YuekaiBroker"):
+    """实盘回调：继承真正的 XtQuantTraderCallback 子类，复用上面的方法体。"""
+    base = XtQuantTraderCallback  # 已由 ensure_xtquant 设为真实基类
+    if base is None:
+        return _XtCallback(broker)
+
+    class _LiveCallback(base):  # type: ignore[misc, valid-type]
+        on_disconnected = _cb_on_disconnected
+        on_stock_order = _cb_on_stock_order
+        on_stock_trade = _cb_on_stock_trade
+        on_stock_asset = _cb_on_stock_asset
+        on_stock_position = _cb_on_stock_position
+        on_account_error = _cb_on_account_error
+
+        def __init__(self):
+            super().__init__()
+            self._broker = broker
+
+    return _LiveCallback()
 
 
 def _parse_xt_order(raw) -> Order:
@@ -191,21 +258,22 @@ class YuekaiBroker(BrokerAPI):
             logger.info("🧪 已连接【模拟盘】（无需 xtquant / QMT）")
             return True
 
-        # —— xtquant 缺失 ——
-        if not XT_AVAILABLE:
+        # —— 实盘依赖惰性加载（仅此时才碰原生 xtquant）——
+        if not ensure_xtquant():
             if mode == "live":
                 self._simulated = False
                 self._connected = False
-                self._last_error = "xtquant 未安装，无法连接实盘"
-                logger.error("❌ 实盘模式需要 xtquant（当前未安装）。"
+                self._last_error = f"xtquant 加载失败：{_xt_import_error or '未知错误'}"
+                logger.error("❌ 实盘模式需要 xtquant，但加载失败（"
+                             f"{_xt_import_error or '未知错误'}）。"
                              "请将 xtquant 放入 site-packages 并启动 QMT 客户端后重试。")
                 return False
             # auto：降级模拟
             self._simulated = True
-            self._sim_reason = "xtquant 未安装，自动降级为模拟"
+            self._sim_reason = "xtquant 加载失败，自动降级为模拟"
             self._connected = True
             self._notify_connected()
-            logger.warning("⚠️ xtquant 未安装，已自动降级为【模拟盘】")
+            logger.warning("⚠️ xtquant 加载失败，已自动降级为【模拟盘】")
             return True
 
         # —— 有 xtquant：走实盘连接 ——
@@ -214,12 +282,14 @@ class YuekaiBroker(BrokerAPI):
             self._last_error = f"QMT路径不存在: {qmt_path}"
             logger.error(self._last_error)
             return False
-        
+
         try:
             logger.info(f"🔗 连接粤开证券 miniQMT → {qmt_path}")
-            
+
             self._session_id = int(time.time() * 1000) % 1000000000
             self._trader = XtQuantTrader(str(Path(qmt_path)), self._session_id)
+            # 用真正的 xtquant 回调子类替换占位回调
+            self._callback = _build_live_callback(self)
             self._trader.register_callback(self._callback)
             
             # 启动交易线程
@@ -378,7 +448,7 @@ class YuekaiBroker(BrokerAPI):
             return None
         
         try:
-            price_type = ORDER_TYPE_MAP.get(order_type, xtconstant.FIX_PRICE)
+            price_type = ORDER_TYPE_MAP.get(order_type, 11)  # 11 == xtconstant.FIX_PRICE
             direction = xtconstant.STOCK_BUY if side == OrderSide.BUY else xtconstant.STOCK_SELL
             
             # quantity 必须是 100 的整数倍（A股）
