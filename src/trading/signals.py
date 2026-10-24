@@ -21,6 +21,7 @@ class StrategyMode(str, Enum):
     QUANT_MULTI = "multi"       # 多因子量化
     QUANT_MR = "mean_rev"       # 均值回归
     HYBRID = "hybrid"           # AI+量化融合
+    ENSEMBLE = "ensemble"       # 多策略投票融合（所有策略同时投票）
 
 
 @dataclass
@@ -147,10 +148,85 @@ class QuantSignalGenerator:
             return self._mean_rev_signal(df, code, name)
         elif self.mode == StrategyMode.HYBRID:
             return self._hybrid_signal(df, code, name)
+        elif self.mode == StrategyMode.ENSEMBLE:
+            return self.generate_ensemble(df, code, name)
         else:
             # AI_ONLY — 不走这里，由 AutoTrader 的 ai_predict_fn 处理
             return None
-    
+
+    def generate_ensemble(
+        self, df: pd.DataFrame, code: str, name: str
+    ) -> Optional[QuantSignal]:
+        """多策略投票融合：所有策略同时投票，方向一致才下手。
+
+        为什么不是「选一个策略」
+        ----------------------
+        单策略在不同市场状态下轮流失效：趋势市多因子强、震荡市均值回归强、
+        AI 融合需要量价配合。固定选一个，等于把赌注压在「当前是哪种市」上。
+        让它们同时投票、只在方向一致时下手，能天然过滤单一策略的假信号，
+        并把一致度作为置信度交给下游调仓。
+        """
+        legs: List[QuantSignal] = []
+        for fn, tag in (
+            (self._multi_factor_signal, "multi_factor"),
+            (self._mean_rev_signal, "mean_rev"),
+            (self._hybrid_signal, "hybrid"),
+        ):
+            try:
+                s = fn(df, code, name)
+            except Exception as e:  # noqa: BLE001
+                # 单个策略挂掉不该让整只票失去机会（AI 腿尤其容易缺模型/数据）
+                logger.debug(f"策略 {tag} 在 {code} 上失败：{e}")
+                continue
+            if s is None or s.signal == 0:
+                continue
+            s.strategy = tag
+            legs.append(s)
+
+        if not legs:
+            return None
+
+        buy = sum(1 for s in legs if s.signal == 1)
+        sell = sum(1 for s in legs if s.signal == -1)
+        if buy == sell:
+            # 完全分歧 → 不下手。分歧本身就是不确定性的信号，
+            # 硬选一个方向只是在用掷骰子代替判断。
+            return None
+
+        direction = 1 if buy > sell else -1
+        aligned = [s for s in legs if s.signal == direction]
+
+        # 按各自置信度加权平均得分，避免弱信号的票靠数量取胜
+        weights = [max(float(s.agreement or 0.0), 1e-6) for s in aligned]
+        wsum = sum(weights)
+        score = sum(s.score * w for s, w in zip(aligned, weights)) / wsum
+        agreement = len(aligned) / len(legs)
+
+        reasons: List[str] = []
+        for s in aligned:
+            reasons.extend(f"[{s.strategy}] {r}" for r in s.reasons[:2])
+        reasons.append(f"多策略投票 {len(aligned)}/{len(legs)}（买{buy}/卖{sell}）")
+
+        return QuantSignal(
+            code=code,
+            name=name,
+            score=round(float(score), 2),
+            agreement=round(agreement, 3),
+            signal=direction,
+            prob_up=sum(s.prob_up for s in aligned) / len(aligned),
+            prob_neutral=sum(s.prob_neutral for s in aligned) / len(aligned),
+            prob_down=sum(s.prob_down for s in aligned) / len(aligned),
+            xgb_signal=next((s.xgb_signal for s in aligned if s.xgb_signal), 0),
+            source="ensemble",
+            strategy="+".join(s.strategy for s in aligned),
+            reasons=reasons,
+            quant_details={
+                "votes": {"buy": buy, "sell": sell, "total": len(legs)},
+                "legs": [s.strategy for s in legs],
+                "leg_scores": {s.strategy: s.score for s in legs},
+            },
+        )
+
     def generate_all(self) -> List[QuantSignal]:
         """批量生成所有自选股的信号"""
         if not self._watchlist:

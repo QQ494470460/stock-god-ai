@@ -148,11 +148,22 @@ def test_sizer_volatility_target_uses_provider():
         base_risk_fraction=0.02,
         volatility_target_pct=0.15,
     )
-    # vol=0.8 → frac = min(0.15/0.8=0.1875, base*2=0.04) = 0.04（波动率目标法封顶 2 倍基准）
+    # 本用例原在断言旧实现的「封顶 2 倍基准」：frac = min(0.15/0.8, 0.02*2) = 0.04。
+    # 那个封顶的危害是——vol=0.8 与 vol=0.3 会拿到**完全相同**的仓位（都是 0.04），
+    # 波动率目标法形同虚设。修复后按 target / (vol × √N) 推导，区分度真实。
     sizer = PositionSizer(cfg, vol_provider=lambda c: 0.8)
     qty, budget = sizer.size(OrderSide.BUY, price=10.0, total_equity=1_000_000.0, code="X")
-    # 强度=1 → budget = 1e6 * 0.04
-    assert budget == pytest.approx(1_000_000.0 * 0.04, rel=1e-6)
+
+    expected_frac = 0.15 / (0.8 * (cfg.max_positions ** 0.5))
+    assert budget == pytest.approx(1_000_000.0 * expected_frac, rel=1e-6)
+    # vol_provider 确实被用上（若没用会退化成 base_risk_fraction=0.02 → 20000）
+    assert budget != pytest.approx(1_000_000.0 * 0.02, rel=1e-6)
+
+    # 立身之本：低波动应比高波动拿到更多仓位（修复前两者相等）
+    _, budget_low_vol = PositionSizer(
+        cfg, vol_provider=lambda c: 0.4
+    ).size(OrderSide.BUY, price=10.0, total_equity=1_000_000.0, code="X")
+    assert budget_low_vol > budget
 
 
 def test_sizer_volatility_target_unknown_vol_falls_back_to_fixed():

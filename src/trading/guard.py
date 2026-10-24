@@ -739,10 +739,25 @@ class PositionSizer:
                 except Exception:  # noqa: BLE001
                     annualized_vol = None
             if annualized_vol:
-                # 波动率越高，预算越小：budget_frac = target / vol（封顶 base 的 2 倍）
-                vol = max(annualized_vol, 1e-6)
-                frac = min(self.config.volatility_target_pct / vol,
-                           self.config.base_risk_fraction * 2)
+                # 波动率越高，预算越小。
+                #
+                # ⚠️ 原实现是 target/vol 再封顶 base_risk_fraction*2（=0.04）。
+                # A 股个股年化波动率普遍 0.25~0.60，target/vol 恒大于 0.04，
+                # 于是**每只票都吃满同一个上限**——既没有区分度，又等于把
+                # 固定比例法的仓位直接翻倍。
+                #
+                # 现改由 sizing 按「组合目标 / (个股波动 × √N)」推导，
+                # 高波动票真的买得少（详见该函数文档）。
+                from src.trading.sizing import volatility_target_fraction
+
+                frac = volatility_target_fraction(
+                    self.config.volatility_target_pct,
+                    annualized_vol,
+                    n_positions=getattr(self.config, "max_positions", 1) or 1,
+                    max_single_pct=max_single_pct,
+                )
+                if frac <= 0:  # 异常输入兜底，退回固定比例法
+                    frac = self.config.base_risk_fraction
             else:
                 # 未知波动率（无历史）→ 优雅降级为固定比例法，绝不用极小值 vol 撑爆仓位
                 frac = self.config.base_risk_fraction

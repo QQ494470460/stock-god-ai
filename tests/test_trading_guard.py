@@ -214,9 +214,18 @@ def test_position_sizer_volatility_target(tmp_path):
     s = PositionSizer(cfg)
     qty, budget = s.size(OrderSide.BUY, 10.0, 1_000_000, signal_strength=1.0,
                          annualized_vol=0.30)
-    # frac = min(0.15/0.30, 0.02*2)=min(0.5,0.04)=0.04 → budget 40000
-    assert budget == pytest.approx(40_000.0)
-    assert qty == 4000
+    # 修复前 frac = min(0.15/0.30, 0.02*2) = 0.04 —— 恒等于封顶值，
+    # 波动率目标法退化成「固定比例 × 2」，**完全没有区分度**（本用例当时
+    # 就在锁定这个缺陷行为）。
+    # 修复后 frac = target / (vol × √N) = 0.15 / (0.30 × √20) ≈ 0.1118
+    expected_frac = 0.15 / (0.30 * (cfg.max_positions ** 0.5))
+    assert budget == pytest.approx(1_000_000 * expected_frac)
+    assert qty == 11100
+
+    # 立身之本：波动率翻倍 → 仓位减半（修复前两者都是 40000，完全一样）
+    _, budget_high_vol = s.size(OrderSide.BUY, 10.0, 1_000_000,
+                                signal_strength=1.0, annualized_vol=0.60)
+    assert budget_high_vol == pytest.approx(budget / 2, rel=0.01)
 
 
 def test_position_sizer_kelly(tmp_path):

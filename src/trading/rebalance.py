@@ -74,6 +74,7 @@ def compute_rebalance_orders(
     lot_size: int = 100,
     allow_buy: bool = True,
     allow_sell: bool = True,
+    risk_scale: float = 1.0,
 ) -> List[RebalanceIntent]:
     """计算调仓订单意图（卖单在前，买单在后）。
 
@@ -86,6 +87,9 @@ def compute_rebalance_orders(
         min_trade_amount: 小于该金额（元）的意图丢弃，避免碎单
         lot_size: 一手股数
         allow_buy / allow_sell: 允许的方向（用于"只减不增"等场景）
+        risk_scale: 组合敞口系数 0~1，由组合回撤连续推导（见
+            ``src/trading/sizing.py``）。1.0=满仓参与，0.3=只用 30% 建仓、
+            其余留现金。**不是清仓**——始终保留一部分敞口在场。
 
     Returns:
         List[RebalanceIntent]，已排序为「先卖后买」。
@@ -100,6 +104,9 @@ def compute_rebalance_orders(
         return []
 
     total_asset = float(account.total_asset)
+    # 可投敞口：回撤越深，实际动用的总资产越少（连续渐进降仓，非清仓）。
+    # 系数由 src.trading.sizing.portfolio_risk_scale 按组合回撤推导。
+    deployable = total_asset * min(max(float(risk_scale), 0.0), 1.0)
     reserve = float(min(max(plan.cash_reserve_pct, 0.0), 0.95))
     pos_map: Dict[str, Position] = {
         p.code: p for p in (positions or []) if getattr(p, "quantity", 0) > 0
@@ -151,7 +158,7 @@ def compute_rebalance_orders(
             price = price_of(t.code)
             if price <= 0:
                 continue
-            tgt_val = total_asset * t.weight
+            tgt_val = deployable * t.weight
             cur_val = float(getattr(pos, "market_value", 0) or (pos.quantity * price))
             if tgt_val <= 0:
                 continue
@@ -184,7 +191,7 @@ def compute_rebalance_orders(
             if price <= 0:
                 logger.debug(f"调仓：{t.code} 无可用价格，跳过买入")
                 continue
-            tgt_val = total_asset * t.weight
+            tgt_val = deployable * t.weight
             cur_val = float(getattr(pos, "market_value", 0) or (pos.quantity * price)) if pos else 0.0
             if cur_val >= tgt_val * (1.0 - band_pct):
                 continue  # 已达目标（含容忍带）

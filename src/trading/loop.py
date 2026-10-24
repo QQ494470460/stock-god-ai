@@ -97,6 +97,10 @@ class LoopConfig:
     weighting: str = "equal"             # equal / score
     enable_rebalance: bool = True        # 是否执行目标调仓
     enable_stop_orders: bool = True      # 是否执行止盈止损
+    # 组合回撤 → 连续渐进降仓（**不是**清仓）。回测实证：触线全清能把回撤
+    # 从 -34% 压到 -14%，但年化也从 +26% 掉到 +4.7%、夏普腰斩，故保留敞口在场。
+    enable_risk_scaling: bool = True
+    risk_scale_floor: float = 0.30       # 最深回撤时仍保留的敞口比例（绝不为 0）
     band_pct: float = 0.25               # 调仓容忍带
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     max_orders_per_tick: int = 10        # 单 tick 最多下多少单（防雪崩）
@@ -635,11 +639,13 @@ class TradingLoop:
             return
         from src.trading.rebalance import compute_rebalance_orders
 
+        risk_scale = self._portfolio_risk_scale(account)
         intents = compute_rebalance_orders(
             self.plan, positions, account, prices,
             band_pct=self.config.band_pct,
             min_trade_amount=self.config.min_trade_amount,
             allow_buy=True, allow_sell=True,
+            risk_scale=risk_scale,
         )
         report.n_intents = len(intents)
         if not intents:
@@ -659,6 +665,40 @@ class TradingLoop:
                 report.n_executed += 1
             else:
                 report.n_blocked += 1
+
+    def _portfolio_risk_scale(self, account) -> float:
+        """按组合当前回撤推导敞口系数（连续渐进降仓，非清仓）。
+
+        用 guard 记录的峰值权益与当前权益算峰谷回撤，再交给
+        ``sizing.portfolio_risk_scale`` 线性映射到 [floor, 1.0]。
+
+        取不到峰值/权益时返回 1.0（不降仓）—— **数据缺失不能当成「回撤很深」**
+        而误砍仓位，这一点与「未知波动率时降级为固定比例」同源。
+        """
+        if not self.config.enable_risk_scaling:
+            return 1.0
+        try:
+            from src.trading.sizing import drawdown_pct, portfolio_risk_scale
+
+            peak = float(getattr(self.guard.safety._state, "peak_equity", 0) or 0)
+            equity = float(getattr(account, "total_asset", 0) or 0)
+            if peak <= 0 or equity <= 0:
+                return 1.0
+            dd = drawdown_pct(equity, peak)
+            scale = portfolio_risk_scale(
+                dd,
+                self.guard.config.max_portfolio_drawdown_pct,
+                floor=self.config.risk_scale_floor,
+            )
+            if scale < 1.0:
+                logger.info(
+                    f"📉 组合回撤 {dd:.2f}% → 敞口系数 {scale:.2f}"
+                    f"（连续降仓，保留 {scale:.0%} 仓位在场）"
+                )
+            return scale
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"敞口系数计算失败，按满仓处理：{e}")
+            return 1.0
 
     # ------------------------------------------------------------------
     # ③ 收盘结算

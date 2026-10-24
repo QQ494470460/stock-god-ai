@@ -542,10 +542,23 @@ def _run() -> int:
                     print("\n✅ 今日已结算，退出")
                     break
 
-            # 可中断的等待
+            # 可中断的等待。
+            # 非交易日（周末/节假日）市场没有新信息，每 30s 全量跑一遍 tick
+            # 纯属空转——实测周六一上午仍在持续重载纸账户并刷日志。
+            # 这里把轮询拉长到 10 分钟一次：保留心跳与自愈能力，但不再空转。
+            # 判定失败时保守退回原间隔，绝不因为日历接口异常而停摆。
+            wait = interval
+            try:
+                from datetime import datetime as _dt
+                from src.trading.calendar import is_trading_day
+                if not is_trading_day(_dt.now().date()):
+                    wait = max(interval, 600.0)
+            except Exception:  # noqa: BLE001
+                wait = interval
+
             slept = 0.0
-            while slept < interval and not _stop_requested:
-                time.sleep(min(0.5, interval - slept))
+            while slept < wait and not _stop_requested:
+                time.sleep(min(0.5, wait - slept))
                 slept += 0.5
     finally:
         try:
