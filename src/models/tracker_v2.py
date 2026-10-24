@@ -265,6 +265,58 @@ def _fetch_benchmark_return(start_date: pd.Timestamp, end_date: pd.Timestamp) ->
 
 # ============ 核心验证 ============
 
+# 覆盖率门槛：低于此值的批次不足以代表模型能力，标记为不可靠。
+# 没有这道门槛时，「20 只票只验到 1 只」照样算出 accuracy=0 并进入滑窗，
+# 于是 should_retrain 的均值判断会建立在 1 只票的样本上。
+MIN_COVERAGE = 0.6
+MIN_CHECKED = 8
+
+
+def signal_is_correct(
+    signal: int,
+    actual_return: float,
+    benchmark_return=None,
+) -> bool:
+    """判定单次预测的方向正确性（按超额收益，而非绝对收益）。
+
+    为什么必须用超额
+    ----------------
+    选股给的是**看多候选**，其价值应以「是否跑赢基准」衡量：
+    大盘 -5% 时个股 -1%（跑赢 4%）是有效选股；大盘 +5% 时个股 +1%
+    （跑输 4%）反而是失败的选股。
+
+    旧实现写成了 ``actual > 0`` 的绝对判定 —— 注释写着「阈值用跑赢基准
+    更公平」，实现却与之相反。后果已在线上复现：2026-10-15 基准 -3.11%，
+    推荐组合跑赢 +1.09%，却被判 accuracy=0.0；该值进入
+    ``performance.t5.accuracy`` 后近三批均值仅 11.1%，触发「风格漂移
+    建议重训」，且在 (0, 0.45] 区间时会由 ``_evolve_threshold`` 自动收紧
+    选股阈值（收紧方向无需人工批准）。
+
+    Parameters
+    ----------
+    signal : 1=看多，-1=看空，0=中性
+    actual_return : 个股区间收益率
+    benchmark_return : 同期基准收益率；为 None 或缺席时退化为绝对收益判定
+
+    Returns
+    -------
+    方向是否正确
+    """
+    if benchmark_return is None:
+        return (signal == 1 and actual_return > 0) or (
+            signal == -1 and actual_return < 0)
+
+    excess = actual_return - benchmark_return
+    return (signal == 1 and excess > 0) or (signal == -1 and excess < 0)
+
+
+def coverage_is_reliable(checked: int, total: int) -> bool:
+    """本次验证的样本覆盖是否足以代表模型能力。"""
+    if not total or not checked:
+        return False
+    return checked >= MIN_CHECKED and (checked / total) >= MIN_COVERAGE
+
+
 def verify_predictions(
     scan_date: str,
     horizon: int = 5,
@@ -346,9 +398,12 @@ def verify_predictions(
     # ---- 指标计算 ----
     detail_rows = []
     port_rets = []
-    correct = checked = 0
+    correct = checked = abs_correct = 0
     xgb_c = xgb_n = 0
     score_buckets = {">=55": [], "45-55": [], "<45": []}
+
+    # 基准为 NaN（取不到指数）时无法算超额，退化到绝对口径并如实标注
+    bench_scalar = float(bench) if not np.isnan(bench) else None
 
     for p in preds:
         code = p.get("code", "")
@@ -359,18 +414,18 @@ def verify_predictions(
         score = float(p.get("score", 50))
         xs = int(p.get("xgb_signal", signal))
 
-        # 方向正确性（选股场景：看多才算预测，阈值用"跑赢基准"更公平）
-        ok = (signal == 1 and actual > 0) or (signal == -1 and actual < 0)
+        # 方向正确性：有基准按超额收益判定（详见 signal_is_correct）
+        ok = signal_is_correct(signal, actual, bench_scalar)
         if ok:
             correct += 1
+        # 绝对口径仅留作人工对照，不参与任何自动化决策
+        if signal_is_correct(signal, actual, None):
+            abs_correct += 1
         checked += 1
-
-        def _sig_ok(sig, ret):
-            return (sig == 1 and ret > 0) or (sig == -1 and ret < 0)
 
         if xs != 0:
             xgb_n += 1
-            xgb_c += int(_sig_ok(xs, actual))
+            xgb_c += int(signal_is_correct(xs, actual, bench_scalar))
 
         # 分桶按 2026-10-10 单模型化后实测分布校准；旧值 80/60 会让所有记录都落进 "<45" 桶
         b = ">=55" if score >= 55 else ("45-55" if score >= 45 else "<45")
@@ -409,7 +464,17 @@ def verify_predictions(
         "total_recommended": len(preds),
         "checked": checked,
         "correct": correct,
+        # accuracy 现按「跑赢基准」口径；基准不可得时退化为绝对口径
         "accuracy": round(correct / checked, 4) if checked else None,
+        # 同值的显式字段名：accuracy 的语义已经变更，另给一个自解释的名字，
+        # 让下游（evolution.record_verification）可以显式取「跑赢基准」口径，
+        # 不必依赖对 accuracy 语义的理解。
+        "excess_accuracy": round(correct / checked, 4) if checked else None,
+        # 绝对收益口径，仅供人工对照，**不得用于自动化决策**（熊市系统性失真）
+        "absolute_accuracy": round(abs_correct / checked, 4) if checked else None,
+        "coverage": round(checked / len(preds), 4) if preds else 0.0,
+        "reliable": coverage_is_reliable(checked, len(preds)),
+        "benchmark_used": bench_scalar is not None,
         "avg_return": round(avg_ret, 4),
         "benchmark_return": round(bench, 4) if not np.isnan(bench) else None,
         "excess_return": round(excess, 4) if excess is not None else None,

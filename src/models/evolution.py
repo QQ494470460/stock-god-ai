@@ -179,7 +179,12 @@ class EvolutionEngine:
 
         # 记录分窗口性能（副作用），本函数不再负责「记录」这件事
         self.record_verification(verification)
-        accuracy = verification.get("accuracy") or 0
+        # 阈值进化同样必须站在「跑赢基准」的口径上：拿熊市失真的绝对准确率
+        # 喂进来，会自动收紧选股门槛（收紧方向无需人工批准，
+        # 详见 _evolve_threshold 的安全边界说明）。
+        accuracy = verification.get("excess_accuracy")
+        if accuracy is None:
+            accuracy = verification.get("accuracy") or 0
 
         # ---- 推荐阈值进化 ----
         # （模型权重进化已随单模型改造下线，不再有两模型权重可调）
@@ -208,7 +213,24 @@ class EvolutionEngine:
             lookback = int(lookback)
         except (TypeError, ValueError):
             lookback = 5
-        accuracy = verification.get("accuracy")
+
+        # 覆盖率不足的批次不入库：否则「20 只票只验到 1 只」也算一条记录，
+        # 污染 20 次滑窗，进而左右 should_retrain 的均值判定。
+        # 仅当显式标记为 False 才跳过 —— 旧记录没有该字段，须照旧收录。
+        if verification.get("reliable") is False:
+            logger.debug(
+                f"t{lookback} 验证样本覆盖率不足，跳过记录："
+                f"checked={verification.get('checked')}/"
+                f"{verification.get('total_recommended')}"
+            )
+            return f"t{lookback}"
+
+        # 优先取「跑赢基准」口径的准确率。tracker_v2 修复后按超额收益判定，
+        # 熊市里不再系统性失真为 0（详见 signal_is_correct 的说明）。
+        # 缺该字段时退回 accuracy（历史记录 / 基准不可得场景）。
+        accuracy = verification.get("excess_accuracy")
+        if accuracy is None:
+            accuracy = verification.get("accuracy")
         if accuracy is None:
             return f"t{lookback}"
 

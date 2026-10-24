@@ -81,10 +81,20 @@ def collect(history) -> list[tuple[str, str, dict]]:
         for key, v in verifs.items():
             if not isinstance(v, dict):
                 continue
-            if v.get("accuracy") is None:
+            # 与 evolution.record_verification 保持同一套口径，避免「同一个
+            # verification 两条入库路径结果不一致」：
+            #   1) 覆盖率不足的批次不入库（否则 checked=1 的 1.0 会进滑窗）；
+            #   2) 优先取「跑赢基准」口径的准确率。
+            # 只显式否决 reliable=False —— 历史记录没有该字段时照旧收录。
+            if v.get("reliable") is False:
+                continue
+            acc = v.get("excess_accuracy")
+            if acc is None:
+                acc = v.get("accuracy")
+            if acc is None:
                 continue
             sort_key = f"{scan_date}|{v.get('verified_at') or ''}"
-            rows.append((sort_key, _window_key(v, str(key)), v))
+            rows.append((sort_key, _window_key(v, str(key)), dict(v, accuracy=acc)))
     rows.sort(key=lambda r: r[0])
     return rows
 
