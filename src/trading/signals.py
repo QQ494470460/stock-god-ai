@@ -53,6 +53,7 @@ class QuantSignalGenerator:
         self._quant = None       # QuantEngine (lazy)
         self._fetcher = None     # DataFetcher (lazy)
         self._predictor = None   # AI predictor (lazy)
+        self._credibility = None # StrategyCredibility (lazy)
         
         # 策略参数
         self.multi_min_score: float = 55.0     # 多因子最低综合分
@@ -154,6 +155,26 @@ class QuantSignalGenerator:
             # AI_ONLY — 不走这里，由 AutoTrader 的 ai_predict_fn 处理
             return None
 
+    @property
+    def credibility(self):
+        """在线策略信誉（EWMA 跟踪每个策略标签的方向一致性）。
+
+        默认启用是安全的：未观测过的标签权重恒为 1.0，与「不使用信誉」完全
+        等价；只有积累了真实战绩后，准的策略话语权才会自然变大。
+        """
+        if self._credibility is None:
+            from src.trading.intelligence import StrategyCredibility
+            self._credibility = StrategyCredibility()
+        return self._credibility
+
+    def observe_outcome(self, tag: str, entry_strength: float,
+                        realized_return: float) -> None:
+        """回灌一笔真实战绩，让信誉随表现演化（绝不抛异常）。"""
+        try:
+            self.credibility.observe(tag, entry_strength, realized_return)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"信誉更新失败（已忽略）：{e}")
+
     def generate_ensemble(
         self, df: pd.DataFrame, code: str, name: str
     ) -> Optional[QuantSignal]:
@@ -196,8 +217,20 @@ class QuantSignalGenerator:
         direction = 1 if buy > sell else -1
         aligned = [s for s in legs if s.signal == direction]
 
-        # 按各自置信度加权平均得分，避免弱信号的票靠数量取胜
-        weights = [max(float(s.agreement or 0.0), 1e-6) for s in aligned]
+        # 权重 = 策略自身置信度 × 该策略的**历史信誉权重**。
+        # 后者来自 StrategyCredibility 的 EWMA 战绩：近期越准权重越大，
+        # 于是投票不是人人一票，而是按历史表现加权 —— 策略会随战绩自我调优。
+        # 未观测过的标签信誉权重恒为 1.0，与不使用信誉完全等价（安全默认）。
+        def _cred_w(tag: str) -> float:
+            try:
+                return float(self.credibility.weight(tag))
+            except Exception:  # noqa: BLE001
+                return 1.0
+
+        weights = [
+            max(float(s.agreement or 0.0), 1e-6) * _cred_w(s.strategy)
+            for s in aligned
+        ]
         wsum = sum(weights)
         score = sum(s.score * w for s, w in zip(aligned, weights)) / wsum
         agreement = len(aligned) / len(legs)
@@ -224,6 +257,10 @@ class QuantSignalGenerator:
                 "votes": {"buy": buy, "sell": sell, "total": len(legs)},
                 "legs": [s.strategy for s in legs],
                 "leg_scores": {s.strategy: s.score for s in legs},
+                # 便于追溯：这一票是「谁、带多少信誉权重」投出来的
+                "leg_credibility": {
+                    s.strategy: round(_cred_w(s.strategy), 4) for s in legs
+                },
             },
         )
 
@@ -506,7 +543,8 @@ def create_strategy_generator(
     """快捷创建策略信号生成器
     
     Args:
-        mode: "ai" / "multi" / "mean_rev" / "hybrid"
+        mode: "ai" / "multi" / "mean_rev" / "hybrid" / "ensemble"
+            （ensemble = 三策略同时投票 + 按历史信誉加权，推荐）
         watchlist_codes: 额外股票代码
         **kwargs: 策略参数覆盖
     
@@ -518,6 +556,7 @@ def create_strategy_generator(
         "multi": StrategyMode.QUANT_MULTI,
         "mean_rev": StrategyMode.QUANT_MR,
         "hybrid": StrategyMode.HYBRID,
+        "ensemble": StrategyMode.ENSEMBLE,
     }
     
     gen = QuantSignalGenerator(mode=mode_map.get(mode, StrategyMode.HYBRID))

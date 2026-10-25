@@ -147,3 +147,44 @@ def test_generate_dispatches_to_ensemble_mode():
 
     assert r is not None
     assert r.source == "ensemble"
+
+
+# ---------------------------------------------------------------- 策略信誉加权
+
+def test_unknown_tag_credibility_is_neutral():
+    """没观测过的策略按中性权重 1.0 —— 启用信誉不会改变冷启动行为。"""
+    g = _gen()
+    assert g.credibility.weight("never_seen") == pytest.approx(1.0)
+
+
+def test_observe_outcome_raises_weight_of_accurate_strategy():
+    g = _gen()
+    base = g.credibility.weight("x")
+    for _ in range(200):
+        g.observe_outcome("x", 1.0, 0.02)  # 看多且赚 → 命中
+
+    assert g.credibility.weight("x") > base + 0.3
+
+
+def test_credibility_shifts_vote_toward_track_record():
+    """分数高的策略若战绩差，话语权应当下降。
+
+    multi_factor 给 90 分但连错，mean_rev 给 50 分但连对 →
+    融合分应明显偏向 mean_rev，而不是被高分绑架。
+    """
+    g = _gen()
+    _bind(g, _sig(1, score=90.0, agreement=0.5),
+             _sig(1, score=50.0, agreement=0.5), None)
+
+    before = g.generate_ensemble(_df(), "600000", "测试")
+    assert before.score == pytest.approx(70.0, abs=0.5), "冷启动应等权（信誉均 1.0）"
+
+    for _ in range(200):
+        g.observe_outcome("mean_rev", 1.0, 0.02)        # 看多且赚
+        g.observe_outcome("multi_factor", 1.0, -0.02)   # 看多却亏
+
+    after = g.generate_ensemble(_df(), "600000", "测试")
+
+    assert after.score < before.score - 5, "战绩差的 90 分策略不该继续主导"
+    cred = after.quant_details["leg_credibility"]
+    assert cred["mean_rev"] > cred["multi_factor"]
