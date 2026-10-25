@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
@@ -53,6 +54,21 @@ try:  # 与 calendar.py 一致：打包/测试环境下 config 可能不在 sys.
 except Exception:  # noqa: BLE001
     ROOT_DIR = Path(__file__).resolve().parent.parent.parent
     DATA_DIR = ROOT_DIR / "data"
+
+# 策略信誉引擎的持久化快照（由 guard 每个有效 tick 落盘，看板只读不写）。
+CRED_STATE_PATH = DATA_DIR / "credibility_state.json"
+
+# 测试环境下不落盘：sync_credibility_from_paper 原本是「零 IO」方法，测试套件里
+# 大量实例化 guard 并调用它，若真实写盘会污染生产 data/ 目录。
+#
+# 注意：必须在**调用时**判定，不能在模块 import 时算一次 —— pytest 的
+# PYTEST_CURRENT_TEST 是「每个用例执行期间」才注入的，而 guard 模块在收集
+# （import）阶段就被导入了，那时该变量还不存在，import-time 的快照永远是 False
+# （实测：曾因此让一次回归把 data/credibility_state.json 写成 momentum n=30）。
+# 用 `"pytest" in sys.modules` 作为判据最稳：跑 pytest 时它必然已导入。
+def _running_under_pytest() -> bool:
+    import sys
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
 
 # ======================================================================
@@ -1091,6 +1107,8 @@ class RiskSupervisor:
             return
         self._credibility.observe(tag, entry_strength, realized_return)
         self._ic_weights = self._credibility.weights()
+        if self._credibility.is_dirty() and not _running_under_pytest():
+            self._credibility.save_state(CRED_STATE_PATH)
 
     def sync_credibility_from_paper(self, paper) -> None:
         """从纸账户成交历史增量同步策略信誉（Batch 3）。
@@ -1124,6 +1142,10 @@ class RiskSupervisor:
                 self._credibility.observe(tag, entry_strength, ret)
                 self._cred_fed.add(key)
             self._ic_weights = self._credibility.weights()
+            # 只有真的喂入新样本（dirty）才落盘，避免每 tick 空写；
+            # 测试环境下不落盘（保持 sync 零 IO，避免污染生产 data/）
+            if self._credibility.is_dirty() and not _running_under_pytest():
+                self._credibility.save_state(CRED_STATE_PATH)
         except Exception:  # noqa: BLE001  // 学习失败绝不中断主流程
             pass
 

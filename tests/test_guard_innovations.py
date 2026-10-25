@@ -321,3 +321,41 @@ def test_vol_control_never_suppresses_exit(sup):
     assert sup._adjust_signal_strength("loop", 1.0, is_exit=True) == 1.0
     # 新开仓信号打折
     assert sup._adjust_signal_strength("loop", 1.0, is_exit=False) < 1.0
+
+
+# ----------------------------------------------------------------------
+# 策略信誉落盘：pytest 下绝不写盘（曾因 import-time 判据失效污染生产 data/）
+# ----------------------------------------------------------------------
+def _paper_with_closed_trade():
+    from types import SimpleNamespace
+    return SimpleNamespace(trade_history=[
+        SimpleNamespace(side="buy", pnl=0.0, pnl_pct=0.0, strategy="rebalance",
+                        trade_id="B1", close_id="", code="000001",
+                        filled_at="2026-10-20T10:00:00", ai_score=55.0),
+        SimpleNamespace(side="sell", pnl=100.0, pnl_pct=1.0, strategy="rebalance",
+                        trade_id="S1", close_id="B1", code="000001",
+                        filled_at="2026-10-21T10:00:00", ai_score=0.0),
+    ])
+
+
+def test_sync_credibility_does_not_write_under_pytest(sup, tmp_path, monkeypatch):
+    """回归护栏：判据必须在**调用时**取，否则 import-time 快照恒为 False，
+    一次 `pytest` 就把生产 data/credibility_state.json 覆盖成测试数据。"""
+    import src.trading.guard as g
+    target = tmp_path / "cred.json"
+    monkeypatch.setattr(g, "CRED_STATE_PATH", target, raising=False)
+    sup.sync_credibility_from_paper(_paper_with_closed_trade())
+    assert not target.exists(), "pytest 下绝不应落盘"
+    assert sup._credibility.count("rebalance") == 1  # 但内存信誉照常更新
+
+
+def test_sync_credibility_persists_when_not_under_pytest(sup, tmp_path, monkeypatch):
+    import json
+    import src.trading.guard as g
+    target = tmp_path / "cred.json"
+    monkeypatch.setattr(g, "CRED_STATE_PATH", target, raising=False)
+    monkeypatch.setattr(g, "_running_under_pytest", lambda: False)
+    sup.sync_credibility_from_paper(_paper_with_closed_trade())
+    assert target.exists()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["scores"]["rebalance"]["n"] == 1

@@ -17,8 +17,12 @@
 
 from __future__ import annotations
 
+import datetime
+import json
 import math
-from typing import Dict, Optional
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 
 class StrategyCredibility:
@@ -50,6 +54,10 @@ class StrategyCredibility:
         self.neutral = float(neutral)
         # tag -> EWMA 分（∈[0,1]）
         self._score: Dict[str, float] = {}
+        # tag -> 已观测样本数（供看板展示「近期战绩」样本量）
+        self._n: Dict[str, int] = {}
+        # 脏标记：仅在 observe 后才需要落盘（避免每 tick 空写）
+        self._dirty: bool = False
 
     def observe(
         self,
@@ -74,14 +82,89 @@ class StrategyCredibility:
             return
         prev = self._score.get(tag, self.neutral)
         self._score[tag] = prev + self.alpha * (hit - prev)
+        self._n[tag] = int(self._n.get(tag, 0)) + 1
+        self._dirty = True
 
     def weight(self, tag: str) -> float:
         s = self._score.get(tag, self.neutral)
         return self.floor + (self.cap - self.floor) * s
 
+    def score(self, tag: str) -> float:
+        """返回该标签的原始 EWMA 信誉分（∈[0,1]，中性 0.5），供 UI 直接展示。"""
+        return float(self._score.get(tag, self.neutral))
+
     def weights(self) -> Dict[str, float]:
         """返回所有已观测标签的权重表（供 ensemble.fuse_strategies 的 ic_weights）。"""
         return {t: self.weight(t) for t in self._score}
 
+    def count(self, tag: str) -> int:
+        """返回该标签已观测的样本数（供看板展示「近期战绩」样本量）。"""
+        return int(self._n.get(tag, 0))
+
+    def snapshot(self) -> Dict[str, Any]:
+        """导出当前所有已观测标签的信誉快照（score/weight/n + 元参数）。"""
+        return {
+            "halflife": self.halflife,
+            "floor": self.floor,
+            "cap": self.cap,
+            "neutral": self.neutral,
+            "scores": {
+                t: {
+                    "score": round(float(self._score.get(t, self.neutral)), 6),
+                    "weight": round(float(self.weight(t)), 6),
+                    "n": int(self._n.get(t, 0)),
+                }
+                for t in self._score
+            },
+        }
+
+    def is_dirty(self) -> bool:
+        """是否有自上次落盘以来新观测到的样本（guard 用它做写盘节流）。"""
+        return self._dirty
+
+    def save_state(self, path) -> None:
+        """把信誉快照原子落盘（.tmp + os.replace），任何异常静默吞掉。
+
+        仅当 ``is_dirty()`` 为真才应调用（见 guard 的落盘节流）；调用成功后清除
+        dirty 标记。
+        """
+        try:
+            p = Path(path)
+            data = self.snapshot()
+            data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+            self._dirty = False
+        except Exception:  # noqa: BLE001  // 落盘失败绝不能影响主流程
+            pass
+
+    def load_state(self, path) -> None:
+        """从落盘快照恢复信誉（score/n），失败静默忽略。
+
+        注意：只恢复 score/n，不覆盖本实例的 halflife/floor/cap（权重仍按构造参数算）。
+        看板侧只读加载、从不写回，因此不会与 guard 的落盘互相覆盖。
+        """
+        try:
+            p = Path(path)
+            if not p.exists():
+                return
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            scores = raw.get("scores") or {}
+            if not isinstance(scores, dict):
+                return
+            for tag, v in scores.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    self._score[tag] = float(v.get("score", self.neutral))
+                    self._n[tag] = int(v.get("n", 0))
+                except (TypeError, ValueError):
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+
     def reset(self) -> None:
         self._score.clear()
+        self._n.clear()
+        self._dirty = False

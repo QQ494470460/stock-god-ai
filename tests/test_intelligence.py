@@ -5,6 +5,7 @@
 """
 
 import sys
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -107,3 +108,88 @@ def test_credibility_weights_dict_and_reset():
     assert set(w.keys()) == {"a", "b"}
     c.reset()
     assert c.weights() == {}
+
+
+# ----------------------------------------------------------------------
+# 信誉快照 / 落盘 / 样本计数（可视化与跨重启持久化的基础）
+# ----------------------------------------------------------------------
+def test_credibility_tracks_sample_count():
+    c = StrategyCredibility()
+    assert c.count("momentum") == 0
+    for _ in range(7):
+        c.observe("momentum", 1.0, 0.03)
+    assert c.count("momentum") == 7
+    assert c.count("unseen") == 0
+
+
+def test_credibility_snapshot_shape():
+    c = StrategyCredibility(halflife=12, floor=0.4, cap=1.6)
+    for _ in range(10):
+        c.observe("momentum", 1.0, 0.04)
+    snap = c.snapshot()
+    assert snap["halflife"] == 12
+    assert snap["floor"] == 0.4 and snap["cap"] == 1.6
+    assert "momentum" in snap["scores"]
+    s = snap["scores"]["momentum"]
+    assert set(s.keys()) == {"score", "weight", "n"}
+    assert s["n"] == 10
+    assert 0.0 <= s["score"] <= 1.0
+
+
+def test_credibility_dirty_flag_cleared_on_save(tmp_path):
+    c = StrategyCredibility()
+    c.observe("x", 1.0, 0.05)
+    assert c.is_dirty() is True
+    c.save_state(tmp_path / "cred.json")
+    assert c.is_dirty() is False
+    # 落盘后无新观测，再调 save 不会抛、且不重设 dirty
+    c.save_state(tmp_path / "cred.json")
+    assert c.is_dirty() is False
+
+
+def test_credibility_save_load_roundtrip(tmp_path):
+    p = tmp_path / "cred.json"
+    c = StrategyCredibility(halflife=15, floor=0.5, cap=1.5)
+    for _ in range(20):
+        c.observe("momentum", 1.0, 0.04)
+    for _ in range(5):
+        c.observe("defensive", 1.0, -0.05)
+    c.save_state(p)
+    assert p.exists()
+
+    c2 = StrategyCredibility(halflife=15, floor=0.5, cap=1.5)
+    c2.load_state(p)
+    assert c2.count("momentum") == 20
+    assert c2.count("defensive") == 5
+    # score 落盘时四舍五入到 6 位，重载后允许极小误差
+    assert c2.score("momentum") == pytest.approx(c.score("momentum"), abs=1e-5)
+    assert c2.weight("momentum") == pytest.approx(c.weight("momentum"), abs=1e-5)
+    # 未知标签加载后仍中性
+    assert c2.weight("unseen") == pytest.approx(1.0)
+
+
+def test_credibility_load_missing_file_is_noop():
+    c = StrategyCredibility()
+    c.load_state("/nonexistent/path/cred.json")  # 不应抛
+    assert c.weights() == {}
+    assert c.is_dirty() is False
+
+
+def test_credibility_load_corrupt_file_is_noop(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{ not valid json", encoding="utf-8")
+    c = StrategyCredibility()
+    c.load_state(p)  # 不应抛
+    assert c.weights() == {}
+
+
+def test_credibility_load_ignores_malformed_entry(tmp_path):
+    p = tmp_path / "weird.json"
+    p.write_text(json.dumps({
+        "scores": {"good": {"score": 0.8, "weight": 1.2, "n": 3},
+                   "bad": "not-a-dict"}
+    }), encoding="utf-8")
+    c = StrategyCredibility()
+    c.load_state(p)
+    assert c.count("good") == 3
+    assert "bad" not in c.weights()

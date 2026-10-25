@@ -1665,6 +1665,119 @@ section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="
 
 st.markdown(_THEME_CSS, unsafe_allow_html=True)
 
+
+# ========== 策略信誉引擎可视化 ==========
+def load_credibility_snapshot() -> dict:
+    """读策略信誉引擎的持久化快照（fail-safe，看板只读不写）。
+
+    来源：交易闭环 guard 在每个有效 tick 调 ``sync_credibility_from_paper`` 后，
+    把 ``StrategyCredibility`` 落盘到 ``data/credibility_state.json``。文件缺失 /
+    损坏 / 空都返回 ``{}``，由上层决定展示空状态——绝不能让看板 500。
+    """
+    try:
+        from config.settings import DATA_DIR
+        cred_path = Path(DATA_DIR) / "credibility_state.json"
+    except Exception:  # noqa: BLE001
+        cred_path = Path(__file__).resolve().parent.parent.parent / "data" / "credibility_state.json"
+    if not cred_path.exists():
+        return {}
+    try:
+        raw = json.loads(cred_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    scores = raw.get("scores") or {}
+    if not isinstance(scores, dict) or not scores:
+        return {}
+    return {
+        "scores": scores,
+        "halflife": raw.get("halflife"),
+        "floor": raw.get("floor"),
+        "cap": raw.get("cap"),
+        "updated_at": raw.get("updated_at"),
+    }
+
+
+def render_credibility_panel() -> None:
+    """🛡️ 策略信誉引擎：把每个策略标签的「方向一致性(EWMA) → 权重」表现可视化。
+
+    数据来自 ``load_credibility_snapshot()``（guard 落盘的只读快照）。
+    """
+    st.markdown('<div class="section-title">🛡️ 策略信誉引擎 · 权重表现</div>', unsafe_allow_html=True)
+    st.caption(
+        "信誉引擎用每笔已平仓交易的「信号方向 vs 实际盈亏」一致性，以 EWMA 为每个策略标签"
+        "维护一个信誉分，再映射成多策略集成的权重：近期越准 → 权重越高、话语权越大；"
+        "未知标签按中性 1.0 处理。"
+    )
+
+    snap = load_credibility_snapshot()
+    scores = snap.get("scores", {})
+
+    if not scores:
+        st.markdown(
+            '<div class="empty"><div class="empty-icon">🛡️</div>'
+            '<div>策略信誉引擎已启用，但尚无已平仓战绩可展示。</div>'
+            '<div style="font-size:.75rem;color:#94a3b8;">'
+            '闭环交易产生平仓后，这里会显示各策略标签的方向一致性、权重与样本数。'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # 数据新鲜度提示（闭环未运行时 = 最近一次落盘）
+    up = snap.get("updated_at")
+    if up:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(up)).total_seconds()
+            if age < 60:
+                age_s = f"{age:.0f} 秒前"
+            elif age < 3600:
+                age_s = f"{age / 60:.0f} 分钟前"
+            else:
+                age_s = f"{age / 3600:.1f} 小时前"
+            st.caption(f"📌 快照更新于 {age_s}（闭环未运行时为最近一次落盘）")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 概览统计
+    n_tags = len(scores)
+    total_n = sum(int(s.get("n", 0)) for s in scores.values())
+    boosted = [t for t, s in scores.items() if float(s.get("weight", 1.0)) > 1.0]
+    penalized = [t for t, s in scores.items() if float(s.get("weight", 1.0)) < 1.0]
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("已观测策略", n_tags)
+    o2.metric("累计样本", total_n)
+    o3.metric("权重↑被信任", len(boosted))
+    o4.metric("权重↓被压制", len(penalized))
+
+    # 每标签一张卡（按权重降序）
+    tags = sorted(scores.keys(), key=lambda t: float(scores[t].get("weight", 1.0)), reverse=True)
+    hl = snap.get("halflife") or 20
+    for tag in tags:
+        s = scores[tag]
+        score = float(s.get("score", 0.5))
+        weight = float(s.get("weight", 1.0))
+        n = int(s.get("n", 0))
+        arrow = "▲" if weight > 1.0 else ("▼" if weight < 1.0 else "＝")
+        w_color = "#10b981" if weight > 1.0 else ("#ef4444" if weight < 1.0 else "#64748b")
+        score_pct = max(0.0, min(1.0, score)) * 100
+        bar_color = "#5b21b6" if score >= 0.5 else "#ef4444"
+        st.markdown(
+            f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;'
+            f'padding:0.8rem 1rem;margin-bottom:0.6rem;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+            f'<b style="color:#1e293b;font-size:1rem;">{tag}</b>'
+            f'<span style="color:{w_color};font-weight:700;">权重 {weight:.2f} {arrow}</span></div>'
+            f'<div style="font-size:0.72rem;color:#64748b;margin:0.4rem 0 0.2rem;">方向一致性（EWMA）</div>'
+            f'<div style="background:#e2e8f0;border-radius:6px;height:8px;width:100%;overflow:hidden;">'
+            f'<div style="background:{bar_color};height:8px;width:{score_pct:.0f}%;border-radius:6px;"></div></div>'
+            f'<div style="font-size:0.72rem;color:#64748b;margin-top:0.3rem;">'
+            f'信誉分 <b style="color:#1e293b;">{score:.2f}</b> · 集成权重 <b style="color:#1e293b;">{weight:.2f}</b>'
+            f' · 样本 {n} · 半衰期 {hl} 笔</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ========== 侧边栏 ==========
 with st.sidebar:
     # 预测口径 / 调度开关：在侧边栏里算一次，全局所有页面（含页头徽标）复用。
@@ -3915,7 +4028,9 @@ elif page == "📐 量化模型":
         badges=[("violet", "Quant Engine")],
     )
 
-    quant_tab1, quant_tab2, quant_tab3 = st.tabs(["📊 多因子评分", "🔄 均值回归", "⚖️ 风险平价"])
+    quant_tab1, quant_tab2, quant_tab3, quant_tab4 = st.tabs(
+        ["📊 多因子评分", "🔄 均值回归", "⚖️ 风险平价", "🛡️ 策略信誉"]
+    )
 
     # ========== Tab 1: 多因子评分 ==========
     with quant_tab1:
@@ -4171,6 +4286,11 @@ elif page == "📐 量化模型":
                         sr3.metric("夏普比率", f"{(port_basic.mean()*252-0.03)/(port_basic.std()*(252**0.5)):.2f}")
                         sr4.metric("组合年化收益(ERC)", f"{port_erc.mean()*252*100:.2f}%")
                         sr5.metric("组合年化波动(ERC)", f"{port_erc.std()*(252**0.5)*100:.2f}%")
+
+
+    # ========== Tab 4: 策略信誉引擎 ==========
+    with quant_tab4:
+        render_credibility_panel()
 
 
 # ========== ⚙️ 设置页 ==========
