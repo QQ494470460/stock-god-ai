@@ -124,6 +124,25 @@ def _ensure_scheduler_running():
         logger.debug(f"调度自动拉起跳过: {e}")
 
 
+def _loop_stale_threshold_min(now=None) -> float:
+    """闭环心跳的「算不算停了」阈值（分钟）。
+
+    必须跟着闭环自己的心跳间隔走：闭环在**非交易日**会把轮询拉长到 10 分钟
+    一次（避免周末空转），所以休市时 10 分钟没心跳是正常的；而交易日是
+    30 秒一次，用 30 分钟的阈值就等于放任它死了半小时才报警。
+
+    拿不到日历时退回宽松值 30 分钟 —— 宁可漏报，也别在休市日误报「闭环挂了」
+    （误报会让人习惯性忽略告警条，比漏报更危险）。
+    """
+    try:
+        from src.trading.calendar import is_trading_day
+        if is_trading_day((now or datetime.now()).date()):
+            return 5.0
+    except Exception:  # noqa: BLE001
+        pass
+    return 30.0
+
+
 def _scheduler_daemon_heartbeat():
     """读常驻调度进程的心跳 ``data/scheduler_heartbeat.json``。
 
@@ -1023,17 +1042,7 @@ def render_today_status() -> None:
     if d.get("loop"):
         lp = d["loop"]
         stale_min = lp["age_min"]
-        # 阈值必须跟着闭环自己的心跳间隔走。闭环在**非交易日**会把轮询拉长到
-        # 10 分钟一次（避免周末空转），所以休市时 10 分钟没心跳是正常的；
-        # 但交易日是 30 秒一次，用 30 分钟的阈值就等于放任它死了半小时才报警。
-        # 拿不到日历就退回宽松值：宁可漏报，不可在休市日误报"闭环挂了"。
-        thr_min = 30.0
-        try:
-            from src.trading.calendar import is_trading_day
-            if is_trading_day(datetime.now().date()):
-                thr_min = 5.0
-        except Exception:  # noqa: BLE001
-            pass
+        thr_min = _loop_stale_threshold_min()
         # value 尽量短（定宽卡片单行显示）：明细放 sub
         if stale_min <= thr_min:
             val, tone = "运行中", "up"
