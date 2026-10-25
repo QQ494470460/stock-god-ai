@@ -151,7 +151,7 @@ except Exception:  # noqa: BLE001
 
 _stop_requested = False
 # 单实例锁的文件句柄：进程存活期间一直持有，退出（含崩溃）由 OS 自动释放
-_instance_lock_handle = None
+_instance_lock_fd = None
 
 
 def acquire_single_instance(lock_path: Path) -> bool:
@@ -161,67 +161,25 @@ def acquire_single_instance(lock_path: Path) -> bool:
     加了开机自启之后，最容易出现「计划任务拉了一份 + 你手动又开一份」，
     而且两边的风控/纸账户各有一份内存副本，对账也会乱。
 
-    用 OS 级文件锁（Windows msvcrt / POSIX flock）而不是 PID 文件：
-    进程无论正常退出还是崩溃，操作系统都会释放锁，不会留下"假死锁"。
-    注意不能用 ``os.kill(pid, 0)`` 探活 —— Windows 上它会真的
-    TerminateProcess，把正在跑的进程杀掉。
+    实现在 ``src.core.singleton`` —— 闭环、收盘后调度常驻进程、批处理
+    探针三处共用同一份，避免口径分叉（详见该模块的文档）。
     """
-    global _instance_lock_handle
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    existed = lock_path.exists()
-    try:
-        # 必须可写打开（POSIX 的 flock 同样要求可写句柄）。
-        # ⚠️ 别把「打开失败」当成主要的占用判据：实测在 Windows 上
-        # ``os.open(O_RDWR)`` 在别人持锁时**照样成功** —— 字节区间锁只拦
-        # 对锁定区间的读写，不拦 open。真正挡住第二个实例的是下面的
-        # ``msvcrt.locking(LK_NBLCK)`` 抛 OSError。
-        # （``open(path, "a+")`` 走 C 运行时 fopen，共享模式不同，它才会报
-        #   PermissionError；两个 API 语义不一样，混用会得出错误结论。）
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    except PermissionError:
-        print(f"⚠️  {lock_path} 正被另一个实例锁定（写打开被拒）", file=sys.stderr)
+    global _instance_lock_fd
+    from src.core.singleton import LOCK_DISABLED, acquire_lock
+    fd = acquire_lock(lock_path)
+    if fd is None:
         return False
-    except OSError as e:
-        if existed:
-            print(f"⚠️  无法打开单实例锁 {lock_path}: {e}", file=sys.stderr)
-            return False
-        print(f"⚠️  无法创建单实例锁 {lock_path}: {e}（锁不可用，继续运行）",
-              file=sys.stderr)
-        return True          # 连锁文件都建不出来：宁可能跑，不可不跑
-    f = os.fdopen(fd, "r+", encoding="utf-8")
-    try:
-        f.seek(0)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-        else:                # pragma: no cover - POSIX
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        f.close()
-        return False
-
-    try:
-        f.seek(0)
-        f.truncate()
-        f.write(f"pid={os.getpid()}\nsince={datetime.now().isoformat(timespec='seconds')}\n")
-        f.flush()
-    except OSError:
-        pass
-    _instance_lock_handle = f
+    if fd != LOCK_DISABLED:
+        _instance_lock_fd = fd
     return True
 
 
 def release_single_instance() -> None:
     """主动释放单实例锁（测试与优雅退出用；正常崩溃由 OS 释放）。"""
-    global _instance_lock_handle
-    f = _instance_lock_handle
-    _instance_lock_handle = None
-    if f is not None:
-        try:
-            f.close()
-        except OSError:
-            pass
+    global _instance_lock_fd
+    from src.core.singleton import release_lock
+    release_lock(_instance_lock_fd)
+    _instance_lock_fd = None
 
 
 def _on_signal(signum, _frame):  # pragma: no cover - 信号路径
@@ -515,6 +473,7 @@ def _run() -> int:
 
         n = 0
         exit_code = 0
+        intentional_stop = False
         while not _stop_requested:
             try:
                 rep = loop.tick()
@@ -534,12 +493,14 @@ def _run() -> int:
 
             if limit and n >= limit:
                 print(f"\n✅ 已达周期上限（{n}），退出")
+                intentional_stop = True
                 break
 
             if args.until_close:
                 st = loop.get_status()
                 if st.get("settled_today"):
                     print("\n✅ 今日已结算，退出")
+                    intentional_stop = True
                     break
 
             # 可中断的等待。
@@ -561,6 +522,18 @@ def _run() -> int:
                 time.sleep(min(0.5, wait - slept))
                 slept += 0.5
     finally:
+        # 「我是主动退出的」留痕：被动终止（任务管理器结束、会话回收、系统关机）
+        # 也会产生退出码 0，而启动器一看到 0 就永久放弃自动重启 —— 结果是
+        # 闭环死到下次开机，表面上却一切正常。主动退出才落这个标记。
+        # 详见 scripts\run_loop_daemon.bat 的 rc==0 分支。
+        if intentional_stop or _stop_requested or args.preview:
+            try:
+                from config.settings import DATA_DIR as _dd
+                (Path(_dd) / ".run_loop.stopped").write_text(
+                    f"{datetime.now().isoformat(timespec='seconds')}\n",
+                    encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
         try:
             loop.stop(timeout=5.0)
         except Exception:  # noqa: BLE001

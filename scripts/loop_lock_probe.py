@@ -6,12 +6,17 @@
     ``run_loop_daemon.bat`` 无法用 ``if errorlevel 1`` 判断「实例是不是
     已经在跑」。唯一可靠的通道是**进程退出码**，于是把探测放进 Python。
 
-⚠️ 这里必须复用 ``run_loop.acquire_single_instance`` 的**真实机制**：
-    Windows 上 ``os.open(path, O_RDWR)`` 在别人持锁时**照样成功**（字节区间锁
-    只拦读写，不拦 open）。真正挡住第二个实例的是 ``msvcrt.locking(LK_NBLCK)``
-    抛 ``OSError``。曾经用「可写打开是否成功」来判定，结果永远判成「空闲」。
-    注意 ``open(path, "a+")``（C 运行时 fopen）的共享模式不同，它才会报
-    ``PermissionError`` —— 两个 API 语义不一样，别混用。
+⚠️ 这里必须复用主程序的**真实机制**，所以直接调用
+``src.core.singleton.probe_lock`` —— 与 ``run_loop.acquire_single_instance``
+是同一个实现，两个进程不可能对「锁是否空闲」得出不同结论。
+
+（曾经复制过一份，两处口径分叉：一处用「``os.open`` 是否成功」，
+在 Windows 上别人持锁时**照样成功**，于是探针永远报「空闲」，
+两个实例同时在跑却毫无察觉。）
+
+用法（一个探针服务所有常驻进程，避免每个进程复制一份、口径再次分叉）：
+    pythonw scripts\\loop_lock_probe.py                              # 交易闭环
+    pythonw scripts\\loop_lock_probe.py --name .scheduler_daemon.lock  # 收盘后调度
 
 退出码：
     0  锁空闲（或锁文件根本建不出来，宁可能跑不可不跑）
@@ -20,49 +25,37 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "data" / ".run_loop.lock"
 
+# 本脚本以 ``pythonw scripts\loop_lock_probe.py`` 直接执行，sys.path[0] 是
+# scripts/，拿不到 src 包。少了这段，下面的 import 会抛 ModuleNotFoundError。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 
 def probe(lock_path: Path = LOCK_PATH) -> int:
     """返回 0 = 可启动；1 = 已有实例。"""
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # 连 data/ 都建不出来：这是主程序该炸的错，探针不背这个锅，交给它自己判断。
+        from src.core.singleton import probe_lock
+    except Exception:  # noqa: BLE001
+        # 探针自己炸了也不能挡住闭环 —— fail-open，交给主程序的锁去判。
         return 0
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    except PermissionError:
-        return 1
-    except OSError:
-        # 连锁文件都建不出来：交给主程序自己判断，不在这里拦死。
-        return 0
-
-    f = os.fdopen(fd, "r+", encoding="utf-8")
-    try:
-        f.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return 1
-    finally:
-        # 关闭句柄即释放锁，不会把锁留给启动器后面的真实实例。
-        f.close()
-    return 0
+    return 0 if probe_lock(lock_path) else 1
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="常驻进程单实例锁探针")
+    ap.add_argument("--name", default="",
+                    help="data/ 下的锁文件名；不给则用 .run_loop.lock")
+    ns = ap.parse_args(argv)
+    if ns.name:
+        return probe(ROOT / "data" / ns.name)
     return probe()
 
 

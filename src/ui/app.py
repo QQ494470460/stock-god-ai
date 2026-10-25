@@ -104,7 +104,8 @@ from src.models.tracker_v2 import save_predictions, get_accuracy_summary
 from src.models.llm import deepseek
 from src.models.evolution import evolution
 from config.settings import config as app_config
-from config.settings import save_scheduler_state, save_ml_state, save_agent_state
+from config.settings import (save_scheduler_state, save_ml_state, save_agent_state,
+                             save_pick_ensemble_state)
 from src.scheduler.auto_scheduler import start_scheduler, is_running
 
 
@@ -121,6 +122,30 @@ def _ensure_scheduler_running():
             start_scheduler()
     except Exception as e:  # noqa: BLE001  非 Streamlit 上下文或导入失败时静默跳过
         logger.debug(f"调度自动拉起跳过: {e}")
+
+
+def _scheduler_daemon_heartbeat():
+    """读常驻调度进程的心跳 ``data/scheduler_heartbeat.json``。
+
+    ⚠️ 别用文件 mtime 判断存活 —— 进程被杀时文件会**保留最后的内容**，
+    看上去"刚刚还活着"，实际早就死了。必须用文件里的 ``ts`` 算年龄。
+    """
+    try:
+        from config.settings import DATA_DIR
+        p = Path(DATA_DIR) / "scheduler_heartbeat.json"
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        try:
+            d["age_sec"] = (datetime.now()
+                            - datetime.fromisoformat(str(d.get("ts") or ""))
+                            ).total_seconds()
+        except Exception:  # noqa: BLE001
+            d["age_sec"] = None
+        return d
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"调度心跳读取失败: {e}")
+        return None
 from src.ui.trading_ui import render_autotrade_page
 from src.ui.agent_page import render_agent_page
 from src.ui.common import (
@@ -998,8 +1023,19 @@ def render_today_status() -> None:
     if d.get("loop"):
         lp = d["loop"]
         stale_min = lp["age_min"]
+        # 阈值必须跟着闭环自己的心跳间隔走。闭环在**非交易日**会把轮询拉长到
+        # 10 分钟一次（避免周末空转），所以休市时 10 分钟没心跳是正常的；
+        # 但交易日是 30 秒一次，用 30 分钟的阈值就等于放任它死了半小时才报警。
+        # 拿不到日历就退回宽松值：宁可漏报，不可在休市日误报"闭环挂了"。
+        thr_min = 30.0
+        try:
+            from src.trading.calendar import is_trading_day
+            if is_trading_day(datetime.now().date()):
+                thr_min = 5.0
+        except Exception:  # noqa: BLE001
+            pass
         # value 尽量短（定宽卡片单行显示）：明细放 sub
-        if stale_min <= 30:
+        if stale_min <= thr_min:
             val, tone = "运行中", "up"
         elif stale_min <= 24 * 60:
             val, tone = f"停 {stale_min / 60:.1f}h", "warn"
@@ -4332,6 +4368,19 @@ def render_safety_panel():
                 stop_scheduler()
         st.rerun()
 
+    # 多策略复核开关（持久化，与调度 enabled 同文件但互不覆盖）
+    _ens = st.checkbox(
+        "选股时启用多策略复核（量化三策略投票）",
+        value=bool(getattr(sc, "pick_ensemble", False)),
+        key="sch_pick_ensemble",
+        help="开启后，每日推荐会先由 AI 打分，再交给量化三策略（多因子／均值回归／"
+             "AI+量价融合）投票复核：集体看空则剔除，一致看多则按一致度加权提分（上限 +10%）。"
+             "缺数据、无共识、全票否决三种情况一律保留原候选，绝不会把推荐清空。",
+    )
+    if _ens != bool(getattr(sc, "pick_ensemble", False)):
+        save_pick_ensemble_state(_ens)
+        st.rerun()
+
     if not app_config.scheduler.enabled:
         st.warning("⚠️ 调度总开关未启用：勾选上方「启用收盘后自动化调度」后再点「启动调度」。")
 
@@ -4362,6 +4411,34 @@ def render_safety_panel():
             st.caption("试跑不写推荐报告，RankIC 回填按 19:15 的定时作业跑；"
                        "需立刻补点请用 scripts/rolling_ic_backfill.py。")
     st.caption(f"调度状态：{'🟢 运行中' if is_running() else '⚪ 未运行'}")
+
+    # 常驻调度进程存活证据 —— 作业挂了的表现只是「今天没有新报告」，
+    # 极易被当成"今天没行情"，所以必须显式把年龄摆出来。
+    hb = _scheduler_daemon_heartbeat()
+    if hb is None:
+        st.warning(
+            "⚠️ 未检测到常驻调度进程（无 data/scheduler_heartbeat.json）。\n\n"
+            "三个收盘后作业（18:30 数据更新 / 18:45 每日推荐 / 19:00 进化验证）"
+            "目前没有自己的常驻载体：看板一关，第二天就没有推荐、交易计划为空、"
+            "闭环无事可做。\n\n"
+            "治理：开机启动项 `StockGodAI-Scheduler.vbs`（启动文件夹）＋ "
+            "`scripts\\tasks\\install_tasks.bat`（10 分钟看门狗）。"
+        )
+    else:
+        age = hb.get("age_sec")
+        nxt = {j["id"]: j.get("next_run") for j in (hb.get("jobs") or [])}
+        next_pick = nxt.get('daily_pick') or '—'
+        if age is None:
+            # 时间戳解析不出来时不要谎报"已停 X 秒"，只说读不出来
+            st.error("🔴 常驻调度进程心跳时间戳无法解析（下次选股未知）")
+        elif age > 180:
+            st.error(f"🔴 常驻调度进程心跳已停 {age:.0f} 秒（下次选股 {next_pick}）")
+        else:
+            st.success(f"🟢 常驻调度进程存活（pid {hb.get('pid')}，心跳 {age:.0f}s 前）"
+                       f"｜下次选股 {next_pick}")
+        if not hb.get("holding"):
+            st.info("ℹ️ 常驻进程尚未接管 APScheduler（当前由看板持有 "
+                    "data/.scheduler.lock，或调度未启用）—— 接管最多需 5 分钟。")
 
 
 

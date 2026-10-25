@@ -161,7 +161,10 @@ def _job_daily_pick_impl(dry_run: bool = False) -> Dict:
                   "status": "ok", "n_passed": 0, "pushed": False,
                   "plan_date": "", "plan_targets": 0, "error": None}
     try:
-        _, report = generate_daily_picks(write_report=not dry_run)
+        _, report = generate_daily_picks(
+            write_report=not dry_run,
+            use_ensemble=bool(app_config.scheduler.pick_ensemble),
+        )
         info["n_passed"] = report.get("n_passed", 0)
         info["status"] = report.get("status", "ok")
         info["error"] = report.get("error")

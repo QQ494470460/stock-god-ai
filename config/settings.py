@@ -260,6 +260,10 @@ class SchedulerConfig:
     report_dir: str = "data/daily_reports"
     max_picks: int = 20
     pick_pool: str = "zz500"
+    # 多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票后
+    # 「集体看空则剔除、一致看多则加权」。默认关，需显式开启；
+    # 开关持久化在 config/scheduler_state.json（与 enabled 一起）。
+    pick_ensemble: bool = False
     # 推送（可选，默认关闭）
     push_enabled: bool = False
     push_webhook_url: str = ""                  # 留空则不推送
@@ -362,25 +366,58 @@ _SCHEDULER_STATE_FILE = CONFIG_DIR / "scheduler_state.json"
 
 
 def load_scheduler_state() -> None:
-    """启动时把持久化的调度开关载入 config.scheduler.enabled。"""
+    """启动时把持久化的调度开关载入 config.scheduler.enabled / pick_ensemble。"""
     try:
         p = _SCHEDULER_STATE_FILE
         if p.exists():
             data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "enabled" in data:
-                config.scheduler.enabled = bool(data["enabled"])
+            if isinstance(data, dict):
+                if "enabled" in data:
+                    config.scheduler.enabled = bool(data["enabled"])
+                if "pick_ensemble" in data:
+                    config.scheduler.pick_ensemble = bool(data["pick_ensemble"])
     except Exception:  # noqa: BLE001  持久化文件损坏不应拖垮启动
         pass
 
 
 def save_scheduler_state(enabled: bool) -> None:
-    """持久化调度开关（仅 enabled 这一个布尔值）。"""
+    """持久化调度开关。
+
+    注意：这里是**整份覆盖写**，必须把 pick_ensemble 一起带上。否则用户
+    在别处改了复核开关、再点一次「启动调度」，复核就被悄悄关掉了。
+    """
     try:
         p = _SCHEDULER_STATE_FILE
         p.write_text(
-            json.dumps({"enabled": bool(enabled)}, ensure_ascii=False, indent=2),
+            json.dumps({"enabled": bool(enabled),
+                        "pick_ensemble": bool(config.scheduler.pick_ensemble)},
+                       ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def save_pick_ensemble_state(on: bool) -> None:
+    """单独持久化「多策略复核」开关（不触碰调度 enabled）。
+
+    必须先 load_scheduler_state()，否则会把 enabled 写成代码默认值 False，
+    用户下次打开看板会发现「调度怎么自己关了」。
+    """
+    try:
+        p = _SCHEDULER_STATE_FILE
+        cur = {"enabled": bool(config.scheduler.enabled)}
+        try:
+            if p.exists():
+                old = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(old, dict) and "enabled" in old:
+                    cur["enabled"] = bool(old["enabled"])
+        except Exception:  # noqa: BLE001
+            pass
+        cur["pick_ensemble"] = bool(on)
+        p.write_text(json.dumps(cur, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+        config.scheduler.pick_ensemble = bool(on)
     except Exception:  # noqa: BLE001
         pass
 

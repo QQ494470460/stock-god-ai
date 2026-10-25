@@ -41,9 +41,16 @@ set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
 set "LOG=%ROOT%\logs\run_loop.log"
 set "LLOG=%ROOT%\logs\launcher.log"
+set "MARK=%ROOT%\data\.run_loop.stopped"
 
 cd /d "%ROOT%" || exit 1
 if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
+
+REM Clear the previous round's "intentional stop" marker.
+REM Without this, a single Ctrl+C leaves the marker behind and the next
+REM launcher start sees it, decides "it wanted to stop" and gives up -
+REM so the loop would never self-heal again.
+if exist "%MARK%" del /q "%MARK%" >nul 2>&1
 
 REM rotate the launcher log above 1MB
 if exist "%LLOG%" (
@@ -76,8 +83,16 @@ set "rc=!ERRORLEVEL!"
 echo ===== loop exited code=!rc! ===== >> "%LLOG%"
 
 if "!rc!"=="0" (
-    echo ===== clean exit 0: launcher stops auto-restart ===== >> "%LLOG%"
-    exit /b 0
+    REM Exit code 0 says nothing about intent: ending the process in Task
+    REM Manager, a reclaimed session or a system shutdown all end with 0 too.
+    REM Only run_loop.py itself writes data\.run_loop.stopped when it stops
+    REM on purpose. No marker means "it should not have died" - keep pulling.
+    if exist "%MARK%" (
+        echo ===== intentional stop marker found: loop asked to stop, launcher exits ===== >> "%LLOG%"
+        del /q "%MARK%" >nul 2>&1
+        exit /b 0
+    )
+    echo ===== exit 0 WITHOUT stop marker: treated as abnormal, self-heal ===== >> "%LLOG%"
 )
 if "!rc!"=="3" (
     echo ===== another instance is running, launcher exits ===== >> "%LLOG%"

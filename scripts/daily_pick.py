@@ -29,6 +29,7 @@
     py -3.12 scripts/daily_pick.py --top 30 --min-score 52
     py -3.12 scripts/daily_pick.py --pool hs300
     py -3.12 scripts/daily_pick.py --build-plan         # 选完立刻刷新交易计划
+    py -3.12 scripts/daily_pick.py --ensemble           # 多策略投票复核候选
     py -3.12 scripts/daily_pick.py --json               # 机器可读
 
 退出码：0 = 有达标标的；3 = 选股成功但无标的（空仓是合法结果，不是错误）；
@@ -63,6 +64,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--build-plan", action="store_true",
                     help="选完立刻据此刷新交易计划（写 data/trade_plans/）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出报告")
+    ap.add_argument("--ensemble", action="store_true",
+                    help="启用多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票，"
+                         "集体看空则剔除、一致看多则加权提分（默认关闭）")
     return ap.parse_args()
 
 
@@ -76,6 +80,7 @@ def main() -> int:
         max_picks=args.top or None,
         min_score=args.min_score,
         write_report=True,
+        use_ensemble=args.ensemble,
     )
 
     if args.json:
@@ -89,6 +94,11 @@ def main() -> int:
         print(f"  有效阈值   {rep['min_score']:.1f}")
         print(f"  市场状态   {rep.get('regime') or '未知'}")
         print(f"  生成时间   {rep['generated_at']}")
+        ens = rep.get("ensemble")
+        if ens:
+            tag = "⚠️ 全部被否决→原样保留" if ens.get("fallback") else (
+                f"否决 {ens['vetoed']}｜提分 {ens['boosted']}｜数据不足跳过 {ens['skipped']}")
+            print(f"  多策略复核 {ens['before']} → {ens['after']} 只（{tag}）")
         picks = rep.get("picks") or []
         if picks:
             print()

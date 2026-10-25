@@ -75,3 +75,6 @@ QClaw.lnk
 
 # 盯盘面板的最近查看记录（本机运行态，非源码）
 config/watch_last.json
+
+# 调度器测试替身写报告/日志的临时目录（tests/test_scheduler.py 的 _cfg()）
+tests/_sched_tmp/

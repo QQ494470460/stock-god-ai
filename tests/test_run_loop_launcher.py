@@ -1,4 +1,4 @@
-"""启动器与单实例探针的回归测试。
+r"""启动器与单实例探针的回归测试。
 
 这些用例存在的理由都是「真出过事」：
 
@@ -14,6 +14,11 @@
 3. 探针曾经用「``os.open(O_RDWR)`` 是否成功」判占用，但 Windows 上字节区间
    锁**不拦 open**、只拦读写，结果永远判成「空闲」。必须真的去
    ``msvcrt.locking`` 抢一下。
+
+4. 启动器曾经「看到退出码 0 就永久放弃自启」。但被任务管理器结束、会话被
+   回收、系统关机，进程**同样以 0 收场** —— 于是闭环死到下次开机，而日志里
+   只有一句人畜无害的「clean exit 0」。现在 0 必须配上
+   ``data\.run_loop.stopped`` 才算主动退出。
 """
 
 from __future__ import annotations
@@ -105,6 +110,50 @@ def test_daemon_bat_does_not_use_timeout_for_delay():
     text = BAT.read_text(encoding="ascii")
     assert "timeout /t" not in text, "无头环境不能用 timeout 做延时，请用 ping"
     assert "ping -n" in text
+
+
+# --------------------------------------------------------------------------
+# 4) 「退出码 0 不等于主动退出」—— 必须配 stop marker 才允许放弃自启
+# --------------------------------------------------------------------------
+
+
+def test_daemon_bat_clears_stop_marker_on_startup():
+    """启动器开头必须清掉上一轮的 stop marker。
+
+    不清理的话：用户一次 Ctrl+C 留下标记 → 下次开机启动器刚拉起就看到它 →
+    立刻判定"刚才是主动停的" → 闭环再也不会自愈。
+    """
+    text = BAT.read_text(encoding="ascii")
+    idx = text.index('if exist "%MARK%" del')
+    assert idx < text.index(":loop"), "清标记必须发生在启动循环之前"
+
+
+def test_daemon_bat_requires_marker_before_giving_up():
+    """rc==0 时，只有存在 stop marker 才 exit /b 0；否则必须继续自愈。"""
+    text = BAT.read_text(encoding="ascii")
+    block = text[text.index('if "!rc!"=="0"'):]
+    block = block[:block.index('if "!rc!"=="3"')]
+    assert 'if exist "%MARK%"' in block, "rc==0 分支没有检查 stop marker"
+    # 没有标记时要落下来继续走到退避重试，而不是 exit
+    assert "exit /b 0" in block
+    assert block.index('if exist "%MARK%"') < block.index("exit /b 0"), \
+        "顺序必须是「先看标记 → 再决定退出」"
+
+
+def test_daemon_bat_logs_missing_marker_as_abnormal():
+    text = BAT.read_text(encoding="ascii")
+    assert "WITHOUT stop marker" in text, "无标记却以 0 退出时必须留痕，否则无从判断它被外部杀过"
+
+
+def test_run_loop_writes_marker_only_on_intentional_stop():
+    """被动终止绝不能留标记，否则启动器会以为闭环自己想停。"""
+    src = (ROOT / "scripts" / "run_loop.py").read_text(encoding="utf-8")
+    lines = [ln for ln in src.splitlines() if ".run_loop.stopped" in ln]
+    assert len(lines) == 1, f"期望只有一处写 stop marker，实际 {len(lines)}"
+    idx = src.index(".run_loop.stopped")
+    guard = src[max(0, idx - 400):idx]
+    assert "intentional_stop" in guard and "_stop_requested" in guard, \
+        "写标记必须被「主动退出」条件包住"
 
 
 # --------------------------------------------------------------------------

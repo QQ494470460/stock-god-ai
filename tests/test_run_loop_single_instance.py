@@ -53,10 +53,10 @@ def test_lock_file_records_pid(tmp_path):
     import os
     lock = tmp_path / ".run_loop.lock"
     assert run_loop.acquire_single_instance(lock) is True
-    # 自己持有锁时其他句柄读不了被锁字节，用已持有的句柄读
-    h = run_loop._instance_lock_handle
-    h.seek(0)
-    content = h.read()
+    # 自己持有锁时其他句柄读不了被锁字节，必须用自己持有的 fd 读
+    fd = run_loop._instance_lock_fd
+    os.lseek(fd, 0, os.SEEK_SET)          # os.pread 在 Windows 上不存在
+    content = os.read(fd, 4096).decode("utf-8")
     assert f"pid={os.getpid()}" in content
     assert "since=" in content
 
@@ -79,30 +79,35 @@ def test_write_open_denied_is_treated_as_locked(tmp_path, monkeypatch):
     PermissionError（Windows 拒绝任何可写打开）。当时那段把它归到
     「锁不可用 → fail-open」，于是第二个实例照常启动、照常 tick、还覆盖了心跳。
     「写打开被拒」必须是 fail-CLOSED。
+
+    锁的实现已抽到 ``src.core.singleton``，注入点也必须跟着搬过去 ——
+    否则 monkeypatch 打在旧位置，测试会「通过了但什么都没测到」。
     """
+    import src.core.singleton as sg
+
     lock = tmp_path / ".run_loop.lock"
     lock.write_text("pid=99999\n")          # 文件已存在 = 疑似别人在用
-
-    real_open = run_loop.os.open
 
     def _denied(path, flags, *a, **k):
         raise PermissionError(13, "Permission denied", str(path))
 
-    monkeypatch.setattr(run_loop.os, "open", _denied)
-    try:
-        assert run_loop.acquire_single_instance(lock) is False, \
-            "写打开被拒却放行了 —— 会造成双实例重复下单"
-    finally:
-        monkeypatch.setattr(run_loop.os, "open", real_open)
+    monkeypatch.setattr(sg.os, "open", _denied)
+    assert run_loop.acquire_single_instance(lock) is False, \
+        "写打开被拒却放行了 —— 会造成双实例重复下单"
 
 
 def test_open_error_without_file_fails_open(tmp_path, monkeypatch):
     """锁文件根本建不出来（如只读目录）时放行 —— 宁可能跑，不可不跑。"""
+    import src.core.singleton as sg
+
     lock = tmp_path / "readonly" / ".run_loop.lock"
     lock.parent.mkdir()
 
     def _noent(path, flags, *a, **k):
         raise FileNotFoundError(2, "No such file or directory", str(path))
 
-    monkeypatch.setattr(run_loop.os, "open", _noent)
+    before = run_loop._instance_lock_fd
+    monkeypatch.setattr(sg.os, "open", _noent)
     assert run_loop.acquire_single_instance(lock) is True
+    # 锁不可用时不该把哨兵值当成真句柄留下来，否则 release 会去关 -1
+    assert run_loop._instance_lock_fd == before

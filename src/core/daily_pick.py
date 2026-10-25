@@ -67,6 +67,86 @@ def _annotate_reason(reason: str, market_regime: Optional[str]) -> str:
     return f"{base}（{ctx}）" if ctx else base
 
 
+def _apply_ensemble_vote(
+    df: pd.DataFrame,
+    stock_data: Dict[str, pd.DataFrame],
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """用多策略投票复核 AI 候选。
+
+    返回 ``(候选, 统计)``。统计里 ``fallback=True`` 表示「全部被否决 → 原样返回」，
+    必须与「一票都没否决」区分开：否则报表显示 20→20、否决 0 只，
+    值班的人会以为复核很干净，实际是它整个失效了。
+
+
+    为什么是「复核」而不是「替换」
+    ----------------------------
+    AI 打分是本系统的主航道，量化三策略（多因子 / 均值回归 / AI+量价融合）
+    只做两件事：集体看空则**否决**，一致看多则按一致度**加权**。
+
+    三条不误伤的兜底（缺一不可）：
+    * 行情不足 60 根 K 线 → 保留（拿不到数据不惩罚候选）；
+    * 策略无共识（分歧或全无信号）→ 保留；
+    * **全部被否决则直接返回原始候选** —— 绝不让一次数据抖动把推荐清空，
+      与 rebalance「空计划=按兵不动、绝不误会成清仓」是同一条原则。
+    """
+    from src.trading.signals import QuantSignalGenerator, StrategyMode
+
+    code_col = ("代码" if "代码" in df.columns
+                else ("code" if "code" in df.columns else None))
+    score_col = ("评分" if "评分" in df.columns
+                 else ("score" if "score" in df.columns else None))
+    empty_stats = {"before": 0, "after": 0, "vetoed": 0, "boosted": 0,
+                   "skipped": 0, "fallback": False}
+    if code_col is None or score_col is None or len(df) == 0:
+        return df, empty_stats
+
+    gen = QuantSignalGenerator(mode=StrategyMode.ENSEMBLE)
+    kept = []
+    n_vetoed = n_boosted = n_skipped = 0
+    for _, row in df.iterrows():
+        code = str(row[code_col])
+        # 注意：不能用 `a or b` 取 DataFrame 兜底 —— 会触发真值歧义
+        data = stock_data.get(code)
+        if data is None:
+            data = stock_data.get(code.zfill(6))
+        if data is None or len(data) < 60:
+            n_skipped += 1
+            kept.append(row)
+            continue
+        try:
+            sig = gen.generate_ensemble(data, code, str(row.get("名称", code)))
+        except Exception:  # noqa: BLE001
+            n_skipped += 1
+            kept.append(row)
+            continue
+        if sig is None or sig.signal == 0:
+            kept.append(row)          # 无共识 → 留着，不否决也不提分
+            continue
+        if sig.signal < 0:
+            n_vetoed += 1             # 三策略集体看空 → 否决
+            continue
+        new_row = row.copy()
+        # 一致度越高提分越多，上限 +10%（复核是辅助，不喧宾夺主）
+        new_row[score_col] = round(
+            float(row[score_col]) * (0.9 + 0.2 * min(max(sig.agreement, 0.0), 1.0)),
+            1,
+        )
+        n_boosted += 1
+        kept.append(new_row)
+
+    if not kept:
+        # 全票否决 → 原样返回，并把 fallback 标出来，别假装「什么问题都没有」
+        return df, {"before": len(df), "after": len(df), "vetoed": n_vetoed,
+                    "boosted": 0, "skipped": n_skipped, "fallback": True}
+    out = pd.DataFrame(kept).reset_index(drop=True)
+    try:
+        out = out.sort_values(score_col, ascending=False).reset_index(drop=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return out, {"before": len(df), "after": len(out), "vetoed": n_vetoed,
+                 "boosted": n_boosted, "skipped": n_skipped, "fallback": False}
+
+
 def generate_daily_picks(
     pool: Optional[str] = None,
     max_picks: Optional[int] = None,
@@ -75,9 +155,13 @@ def generate_daily_picks(
     predictor_inst=None,
     evolution_inst=None,
     write_report: bool = True,
+    use_ensemble: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     收盘后自动生成每日推荐。
+
+    use_ensemble: 用多策略投票对 AI 候选做一次复核（否决 + 加权）。
+        默认关闭，启用需显式传入（或 CLI ``--ensemble``）。
 
     Returns
     -------
@@ -163,6 +247,16 @@ def generate_daily_picks(
                     df["最新价"] = df[col].map(_last_close)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"参考价补充失败（不影响推荐）: {e}")
+
+        # 多策略复核（默认关）。AI 打分是主航道，量化三策略只做「否决 + 加权」：
+        # 集体看空才剔除、一致看多才提分；拿不到数据的一律保留，
+        # 绝不因为数据缺失而误杀整批候选。
+        if use_ensemble and len(df):
+            try:
+                df, ens = _apply_ensemble_vote(df, stock_data)
+                report["ensemble"] = ens
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"多策略复核失败（保留原候选）：{e}")
 
         # 市场状态刷新（写入进化引擎，供阈值自适应）
         try:

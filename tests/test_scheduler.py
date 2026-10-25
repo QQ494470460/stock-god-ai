@@ -149,13 +149,33 @@ def patched(monkeypatch, tmp_path):
 
 
 def _cfg():
-    """构造一个把 report_dir 指向 tmp 的轻量配置替身"""
+    """构造一个把产物都指向 tests/_sched_tmp 的轻量配置替身。
+
+    ⚠️ 这个替身必须随真实 ``SchedulerConfig`` 一起长：少一个字段，
+    调度作业就会在运行时抛 ``AttributeError``（``pick_ensemble`` 那次一下
+    炸了四个用例）。``test_config_stub_mirrors_real_scheduler_config`` 会
+    自动把这条钉住。
+    """
+    _tmp = str(Path(__file__).resolve().parent / "_sched_tmp")
+
     class S:
         class scheduler:
             pick_pool = "zz500"
             max_picks = 20
-            report_dir = str(Path(__file__).resolve().parent / "_sched_tmp")
+            report_dir = _tmp
             enabled = False
+            pick_ensemble = False
+            # 以下字段本身用不到，但调度代码会读，缺了照样炸
+            data_update_cron = "30 18 * * mon-fri"
+            daily_pick_cron = "45 18 * * mon-fri"
+            evolution_cron = "0 19 * * mon-fri"
+            rolling_ic_cron = "15 19 * * mon-fri"
+            industry_map_cron = "0 * * * *"
+            timezone = "Asia/Shanghai"
+            # 指向 tmp，别让作业把 scheduler_runs_*.jsonl 写进生产 logs/
+            log_file = _tmp + "/scheduler.log"
+            push_enabled = False
+            push_webhook_url = ""
         class ml:
             auto_threshold_adjust = True
         class trading_loop:
@@ -169,6 +189,27 @@ def _cfg():
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------
+
+def test_config_stub_mirrors_real_scheduler_config():
+    """替身配置必须与真实 SchedulerConfig 的字段保持镜像。
+
+    回归：给调度加了 ``pick_ensemble`` 后，``_job_daily_pick_impl`` 在读它时
+    抛 ``AttributeError``，四个作业用例全红。替身少一个字段就能让整组测试
+    在你没碰过的地方炸掉，所以这里把「镜像」本身钉成断言。
+    """
+    # 只校验调度代码**真正读取**的字段：替身本来就刻意只镜像必要字段，
+    # 要求 1:1 全量一致会逼着替身背上一堆用不到的 cron，反而更难维护。
+    import re
+
+    src = (ROOT / "src" / "scheduler" / "auto_scheduler.py").read_text(encoding="utf-8")
+    used = set(re.findall(r"app_config\.scheduler\.([a-z_]+)", src))
+    stub = {k for k in vars(_cfg().scheduler) if not k.startswith("_")}
+    missing = sorted(used - stub)
+    assert not missing, (
+        f"配置替身缺少调度代码会读取的字段 {missing}：真实配置新增了开关，"
+        "替身没跟上，调度作业会在运行时抛 AttributeError。"
+    )
+
 
 def test_registry_scans_models():
     infos = scan_models()
