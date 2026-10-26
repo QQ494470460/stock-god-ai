@@ -188,3 +188,79 @@ def test_credibility_shifts_vote_toward_track_record():
     assert after.score < before.score - 5, "战绩差的 90 分策略不该继续主导"
     cred = after.quant_details["leg_credibility"]
     assert cred["mean_rev"] > cred["multi_factor"]
+
+
+# ---------------------------------------------------------------- 落盘信誉接入
+# 背景：`QuantSignalGenerator.credibility` 此前是个纯内存实例，恒为中性 1.0，
+# 于是 quant_details 的 leg_credibility 永远显示 1.0、看不出谁真的更准。
+# 现在它会只读加载 guard 落盘的 data/credibility_state.json；但测试环境必须
+# 跳过，否则用例会依赖生产 data/ 的当前内容而失真。
+
+def _write_state(tmp_path, scores):
+    import json
+    p = tmp_path / "credibility_state.json"
+    p.write_text(json.dumps({"scores": scores}), encoding="utf-8")
+    return p
+
+
+def test_credibility_loads_persisted_state_outside_pytest(tmp_path, monkeypatch):
+    """非测试环境：新建生成器应带上落盘的真实信誉（score/n）。"""
+    from src.trading import signals as _sg
+
+    p = _write_state(tmp_path, {
+        "multi_factor": {"score": 0.9, "n": 12},
+        "mean_rev": {"score": 0.2, "n": 5},
+    })
+    monkeypatch.setattr(_sg, "_cred_state_path", lambda: p)
+    monkeypatch.setattr(_sg, "_running_under_pytest", lambda: False)
+
+    g = _gen()
+    assert g.credibility.count("multi_factor") == 12
+    assert g.credibility.weight("multi_factor") == pytest.approx(1.4, abs=1e-6)
+    assert g.credibility.weight("mean_rev") == pytest.approx(0.7, abs=1e-6)
+
+
+def test_credibility_skips_state_under_pytest(tmp_path, monkeypatch):
+    """pytest 下即使落盘文件存在也必须跳过 —— 保证用例 hermetic。"""
+    from src.trading import signals as _sg
+
+    p = _write_state(tmp_path, {"multi_factor": {"score": 0.9, "n": 12}})
+    monkeypatch.setattr(_sg, "_cred_state_path", lambda: p)
+    # 不覆盖 _running_under_pytest：pytest 下它应为 True
+
+    g = _gen()
+    assert g.credibility.count("multi_factor") == 0
+    assert g.credibility.weight("multi_factor") == pytest.approx(1.0)
+
+
+def test_credibility_load_missing_state_is_neutral(tmp_path, monkeypatch):
+    from src.trading import signals as _sg
+
+    monkeypatch.setattr(_sg, "_cred_state_path", lambda: tmp_path / "nope.json")
+    monkeypatch.setattr(_sg, "_running_under_pytest", lambda: False)
+
+    g = _gen()
+    assert g.credibility.weight("multi_factor") == pytest.approx(1.0)
+
+
+def test_leg_credibility_uses_persisted_weights(tmp_path, monkeypatch):
+    """端到端：quant_details.leg_credibility 应反映落盘权重，而非恒为 1.0。"""
+    from src.trading import signals as _sg
+
+    p = _write_state(tmp_path, {
+        "multi_factor": {"score": 0.9, "n": 12},
+        "mean_rev": {"score": 0.5, "n": 3},
+    })
+    monkeypatch.setattr(_sg, "_cred_state_path", lambda: p)
+    monkeypatch.setattr(_sg, "_running_under_pytest", lambda: False)
+
+    g = _gen()
+    _bind(g, _sig(1, score=60.0, agreement=0.8),
+             _sig(1, score=60.0, agreement=0.8), None)
+
+    out = g.generate_ensemble(_df(), "600000", "测试")
+
+    assert out is not None
+    cred = out.quant_details["leg_credibility"]
+    assert cred["multi_factor"] == pytest.approx(1.4, abs=1e-3)
+    assert cred["mean_rev"] == pytest.approx(1.0, abs=1e-3)

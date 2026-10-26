@@ -15,6 +15,27 @@ from loguru import logger
 import numpy as np
 import pandas as pd
 
+try:  # 与 guard.py 一致：打包/测试环境下 config 可能不在 sys.path 顶层
+    from config.settings import DATA_DIR as _DATA_DIR
+except Exception:  # noqa: BLE001
+    _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def _cred_state_path() -> Path:
+    """策略信誉状态文件（与 guard 落盘的 CRED_STATE_PATH 同一份，本模块只读）。"""
+    return Path(_DATA_DIR) / "credibility_state.json"
+
+
+def _running_under_pytest() -> bool:
+    """测试环境跳过读盘，保证用例 hermetic、不依赖生产 data/ 的当前内容。
+
+    必须在**调用时**判定：pytest 的 PYTEST_CURRENT_TEST 只在用例执行期间存在，
+    模块 import 阶段还没有；用 ``"pytest" in sys.modules`` 最稳。
+    """
+    import os
+    import sys
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+
 
 class StrategyMode(str, Enum):
     AI_ONLY = "ai"              # 纯 AI 预测
@@ -165,6 +186,11 @@ class QuantSignalGenerator:
         if self._credibility is None:
             from src.trading.intelligence import StrategyCredibility
             self._credibility = StrategyCredibility()
+            # 接入 guard 落盘的真实战绩（只读）：此前这个实例恒为中性 1.0，
+            # 使得 quant_details 的 leg_credibility 完全无法反映真实权重。
+            # 测试环境跳过，避免用例依赖生产 data/ 而失真。
+            if not _running_under_pytest():
+                self._credibility.load_state(_cred_state_path())
         return self._credibility
 
     def observe_outcome(self, tag: str, entry_strength: float,
