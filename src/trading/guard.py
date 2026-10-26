@@ -58,6 +58,9 @@ except Exception:  # noqa: BLE001
 # 策略信誉引擎的持久化快照（由 guard 每个有效 tick 落盘，看板只读不写）。
 CRED_STATE_PATH = DATA_DIR / "credibility_state.json"
 
+# 当日买入换手累计（跨进程重启必须保留，否则「重启一次预算就满血」）。
+TURNOVER_STATE_PATH = DATA_DIR / "turnover_state.json"
+
 # 测试环境下不落盘：sync_credibility_from_paper 原本是「零 IO」方法，测试套件里
 # 大量实例化 guard 并调用它，若真实写盘会污染生产 data/ 目录。
 #
@@ -934,6 +937,7 @@ class RiskSupervisor:
         industry_map: Optional[Dict[str, str]] = None,
         adv_provider: Optional[Callable[[str], Optional[float]]] = None,
         risk_monitor=None,
+        turnover_file: Optional[Path] = None,
     ):
         self.broker = broker
         self.config = config or GuardConfig()
@@ -959,8 +963,16 @@ class RiskSupervisor:
                 self._adv_provider = None
 
         # 当日买入换手累计（用于 max_daily_turnover_pct）
+        # ⚠️ 必须落盘：这是「当日已用预算」的记账，不是缓存。存在内存里的话，
+        # 常驻进程每重启一次预算就归零 —— 一天重启三次就能买出三倍换手，
+        # 而重启在生产里是常态（换代码、崩溃自愈、手工拉起）。
         self._turnover_day: str = ""
         self._turnover_amount: float = 0.0
+        self._turnover_file = (
+            Path(turnover_file) if turnover_file
+            else (None if _running_under_pytest() else TURNOVER_STATE_PATH)
+        )
+        self._load_turnover()
 
         # 组合尾部风险监控（相关性 VaR）。None = 不约束（测试/数据缺失时降级）。
         if risk_monitor is not None:
@@ -1505,10 +1517,23 @@ class RiskSupervisor:
         #    · 交易计划给了明确股数 → 用计划的（计划定数量）
         #    · 否则走通用仓位算法（固定比例 / 波动率目标 / 半 Kelly）
         existing_value = positions[code].market_value if code in positions else 0.0
+        # 清仓式卖出允许零股（A 股：卖出可不足一手，但须一次性卖光）。
+        # 只在「请求量 >= 可卖全量」时放开，部分卖出仍整手，否则实盘废单。
+        full_sellable = 0
+        if side == OrderSide.SELL and code in positions:
+            full_sellable = sellable_quantity(positions[code])
+        allow_odd_lot = (
+            side == OrderSide.SELL and full_sellable > 0
+            and explicit_quantity is not None
+            and int(explicit_quantity) >= full_sellable
+        )
         if explicit_quantity is not None and explicit_quantity > 0:
             # 计划数量同样要跟随 VaR 缩放，否则「计划定数量」会绕过尾部风险约束
             if var_scale < 1.0:
                 explicit_quantity = max(0, int(int(explicit_quantity) * var_scale))
+                # 被 VaR 缩过就不再是「清仓」了，零股豁免随之失效
+                if int(explicit_quantity) < full_sellable:
+                    allow_odd_lot = False
             qty, budget = self._size_explicit(
                 code, side, price, int(explicit_quantity),
                 account, positions, existing_value,
@@ -1522,10 +1547,12 @@ class RiskSupervisor:
                 code=code,
             )
         # 5.5 执行约束：流动性（ADV参与率）/ 单笔风险预算 / 当日换手预算
-        qty, limit_why = self._apply_execution_limits(code, side, price, qty, account)
+        qty, limit_why = self._apply_execution_limits(
+            code, side, price, qty, account, allow_odd_lot=allow_odd_lot)
         if limit_why:
             logger.info(f"[执行约束] {name or code} {side.value}: {limit_why}")
-        if qty < 100:
+        min_qty = 1 if allow_odd_lot else 100
+        if qty < min_qty:
             reason = limit_why or f"计算下单量不足1手 ({qty}股)"
             prop = self.gate.create(
                 code=code, name=name, side=side.value, price=price,
@@ -1567,24 +1594,31 @@ class RiskSupervisor:
           · 卖出 ≤ T+1 可卖量
           · 买入 ≤ 单票上限剩余额度（max_single_position_pct - 已持市值）
           · 买入 ≤ 可用现金
-          · 一律整手
+          · 买入一律整手；卖出**清仓时**允许零股（A 股规则），部分卖出仍整手
         """
         if price <= 0 or want_qty <= 0:
-            return 0, 0.0
-        qty = (int(want_qty) // lot) * lot
-        if qty <= 0:
             return 0, 0.0
 
         if side == OrderSide.SELL:
             pos = positions.get(code)
-            qty = min(qty, sellable_quantity(pos)) if pos else 0
-        else:
-            cap_value = (account.total_asset * self.config.max_single_position_pct
-                         - existing_value)
-            max_qty = int(max(0.0, cap_value) / price / lot) * lot
-            affordable = int(max(0.0, account.available_cash) / price / lot) * lot
-            qty = min(qty, max_qty, affordable)
+            full = sellable_quantity(pos) if pos else 0
+            # 请求量 >= 可卖全量 = 清仓：零股合法，不能取整
+            if full > 0 and int(want_qty) >= full:
+                qty = int(full)
+            else:
+                qty = (int(want_qty) // lot) * lot
+                if qty <= 0:
+                    return 0, 0.0
+            return qty, qty * price
 
+        qty = (int(want_qty) // lot) * lot
+        if qty <= 0:
+            return 0, 0.0
+        cap_value = (account.total_asset * self.config.max_single_position_pct
+                     - existing_value)
+        max_qty = int(max(0.0, cap_value) / price / lot) * lot
+        affordable = int(max(0.0, account.available_cash) / price / lot) * lot
+        qty = min(qty, max_qty, affordable)
         qty = max(0, (qty // lot) * lot)
         return qty, qty * price
 
@@ -1669,9 +1703,8 @@ class RiskSupervisor:
             if v > 0:
                 codes.append(c)
                 values.append(v)
-        if len(codes) < 2:
+        if len(codes) == 0:
             return 1.0, {}
-
         total = sum(values)
         if total <= 0:
             return 1.0, {}
@@ -1681,6 +1714,25 @@ class RiskSupervisor:
         if equity <= 0:
             return 1.0, {}
         weights = [v / equity for v in values]
+
+        # 单票满仓时也要算：这是最集中的状态，恰恰不能因为「凑不出协方差矩阵」
+        # 就跳过风险检查（旧实现 len<2 直接 return 1.0 = 静默不约束）。
+        if len(codes) == 1:
+            try:
+                var_pct = self._risk_monitor.var_pct_single(
+                    codes[0], weights[0], z=float(cfg.var_confidence_z))
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"单标的 VaR 计算失败（已忽略）: {e}")
+                return 1.0, {}
+            if var_pct is None:
+                return 1.0, {}
+            detail = {"var_pct": round(float(var_pct), 4), "avg_corr": 0.0, "n": 1}
+            cap = float(cfg.max_portfolio_var_pct)
+            if cap <= 0 or var_pct <= cap:
+                return 1.0, detail
+            scale = min(1.0, max(float(cfg.var_scale_floor), cap / float(var_pct)))
+            detail["scale"] = round(scale, 3)
+            return scale, detail
 
         try:
             res = self._risk_monitor.var_pct(
@@ -1705,6 +1757,40 @@ class RiskSupervisor:
         detail["scale"] = round(scale, 3)
         return scale, detail
 
+    def _load_turnover(self) -> None:
+        """从磁盘恢复「当日已用换手」。失败/跨日/文件缺失都等价于从 0 开始。"""
+        if not self._turnover_file:
+            return
+        try:
+            if not self._turnover_file.exists():
+                return
+            data = json.loads(self._turnover_file.read_text(encoding="utf-8"))
+            day = str(data.get("day") or "")
+            amt = float(data.get("amount") or 0)
+            today = datetime.now().strftime("%Y-%m-%d")
+            if day == today and amt > 0:
+                self._turnover_day = today
+                self._turnover_amount = amt
+                logger.info(f"📒 当日换手累计已恢复: ¥{amt:,.0f}（{today}）")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"换手状态读取失败（从 0 计）: {e}")
+
+    def _save_turnover(self) -> None:
+        """原子落盘当日换手累计。失败只告警 —— 记账坏了不能拖垮交易主流程。"""
+        if not self._turnover_file:
+            return
+        try:
+            self._turnover_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._turnover_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "day": self._turnover_day,
+                "amount": round(float(self._turnover_amount), 2),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._turnover_file)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"换手状态落盘失败（下次从头累计）: {e}")
+
     def _bump_turnover(self, amount: float) -> None:
         """累计当日买入金额（跨自然日自动清零），供换手预算约束使用。"""
         try:
@@ -1719,10 +1805,11 @@ class RiskSupervisor:
                 self._turnover_day = today
                 self._turnover_amount = 0.0
             self._turnover_amount += amt
+            self._save_turnover()
 
     def _apply_execution_limits(
         self, code: str, side: OrderSide, price: float, qty: int,
-        account: Optional[AccountInfo],
+        account: Optional[AccountInfo], allow_odd_lot: bool = False,
     ) -> Tuple[int, str]:
         """对已算好的下单量再施加三道执行约束，返回 ``(最终股数, 约束说明)``。
 
@@ -1736,6 +1823,9 @@ class RiskSupervisor:
 
         ADV 拿不到时只跳过第 1 条（不阻断交易）；任一条把数量压到 0 时返回原因，
         供 propose 明确记录「为什么没下」。
+
+        ``allow_odd_lot``：仅对**清仓式卖出**为 True —— A 股卖出允许不足一手，
+        但必须一次性把零股全部卖掉。买入永远整手，别把这个开关用到买侧。
         """
         cfg = self.config
         if not getattr(cfg, "execution_limits_enabled", True):
@@ -1745,7 +1835,9 @@ class RiskSupervisor:
 
         reasons: List[str] = []
         lot = 100
-        qty = int(qty // lot * lot)
+        odd_ok = bool(allow_odd_lot) and side == OrderSide.SELL
+        if not odd_ok:
+            qty = int(qty // lot * lot)
 
         # 1) 流动性约束
         adv = None
@@ -1767,6 +1859,14 @@ class RiskSupervisor:
         # 2) 风险预算（仅买入：卖出是减风险，不该被预算卡住）
         if side == OrderSide.BUY and account and account.total_asset > 0:
             stop_pct = max(float(cfg.risk_budget_stop_pct), 1e-4)
+            # 止损距离必须取**实际生效**的那条线（executor 里 ATR 会把 -5% 放宽到
+            # 最多 -15%）。用静态 5% 算预算而实际按 15% 止损，等于单笔风险超标 3 倍，
+            # 风险预算形同虚设 —— 这是「开了 ATR 之后」才会暴露的口径不一致。
+            try:
+                _line, _ = self.executor._effective_stop_lines(code)  # 负值，如 -12.5
+                stop_pct = max(stop_pct, abs(float(_line)) / 100.0)
+            except Exception:  # noqa: BLE001
+                pass
             risk_budget = float(account.total_asset) * float(cfg.max_risk_per_trade_pct)
             cap_qty = int(risk_budget / (price * stop_pct) // lot * lot)
             if cap_qty < qty:
@@ -1796,16 +1896,30 @@ class RiskSupervisor:
 
     # ---------- 频率限制 ----------
     def _check_rate_limit(self) -> str:
-        now = time.time()
-        with self._lock:
-            # 最小间隔
-            if now - self._last_order_ts < self.config.min_order_interval_sec:
-                return f"下单间隔过短(<{self.config.min_order_interval_sec}s)"
-            # 每分钟上限
-            self._orders_this_minute = [t for t in self._orders_this_minute if now - t < 60]
-            if len(self._orders_this_minute) >= self.config.max_orders_per_minute:
-                return f"每分钟委托数已达上限 {self.config.max_orders_per_minute}"
-        return ""
+        """取得一个下单时间片：**短间隔等待**，每分钟硬上限才拒绝。
+
+        旧实现把「两笔间隔不足」直接当拒绝原因返回。可闭环一次 tick 会连着下
+        多笔（一次调仓最多 10 笔），于是同一 tick 里只有第一笔能成交、其余 9 笔
+        静默变成 blocked —— 计划看起来"执行了"，实际只成交 1/10，下一轮 gap
+        重算又会重复同一幕，表现为「调仓永远补不到位」。
+
+        间隔是**节奏**约束（避免打爆柜台/被限流），不该退化成**丢弃**：这里改成
+        等到间隔满足再放行，最多等 ``min(interval, 5s)``；每分钟笔数上限仍然
+        硬拒绝（那是真正的容量约束）。
+        """
+        interval = max(0.0, float(self.config.min_order_interval_sec))
+        deadline = time.time() + min(interval, 5.0)
+        while True:
+            now = time.time()
+            with self._lock:
+                # 每分钟上限
+                self._orders_this_minute = [t for t in self._orders_this_minute if now - t < 60]
+                if len(self._orders_this_minute) >= self.config.max_orders_per_minute:
+                    return f"每分钟委托数已达上限 {self.config.max_orders_per_minute}"
+                gap = now - self._last_order_ts
+            if gap >= interval or now >= deadline:
+                return ""
+            time.sleep(min(interval - gap, 0.2))
 
     # ---------- 审批 + 执行 ----------
     def approve_and_execute(
@@ -1877,7 +1991,10 @@ class RiskSupervisor:
                     self._last_order_ts = time.time()
                     self._orders_this_minute.append(self._last_order_ts)
                 if side == OrderSide.BUY:
-                    self._bump_turnover(prop.quantity * prop.price)
+                    # 用**实际成交金额**（含滑点）记账：用委托价会系统性低估换手，
+                    # 高波动票每次少记十几个 bp，一天下来预算会「莫名剩一点」。
+                    _filled = float(getattr(rec, "amount", 0) or 0) if rec else 0.0
+                    self._bump_turnover(_filled or prop.quantity * prop.price)
                 self._emit("fill", {
                     "proposal_id": proposal_id, "code": code, "side": side.value,
                     "qty": prop.quantity, "price": prop.price, "paper": True,

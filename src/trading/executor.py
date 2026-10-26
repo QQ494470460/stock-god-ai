@@ -366,9 +366,19 @@ class TradeExecutor:
         quantity = risk_result.adjusted_quantity
         # 计划股数封顶：不改硬约束（卖出仍 ≤ T+1 可卖、买入仍 ≤ 仓位/现金），
         # 只把「想下多少」从通用算法收敛到计划值。否则部分止盈会被执行成清仓。
+        #
+        # 零股豁免：A 股卖出允许不足一手，但必须一次性卖光。当计划要的量
+        # >= 风控给出的可卖全量时，说明这是清仓 —— 此时不能整手取整，否则
+        # 150 股只能卖 100，剩 50 股永远清不掉（连止损都执行不了）。
+        allow_odd_lot = False
         if explicit_quantity is not None and int(explicit_quantity) > 0:
-            quantity = min(quantity, (int(explicit_quantity) // 100) * 100)
-        if quantity < 100:
+            want = int(explicit_quantity)
+            if side == OrderSide.SELL and want >= int(quantity) > 0:
+                allow_odd_lot = True
+                quantity = min(int(quantity), want)
+            else:
+                quantity = min(int(quantity), (want // 100) * 100)
+        if quantity < (1 if allow_odd_lot else 100):
             return False, f"❌ 计算下单量不足1手: {quantity}股", None
         
         # 8. 价格偏离检查

@@ -194,6 +194,26 @@ class PortfolioRiskMonitor:
         vol = portfolio_daily_vol(w, cov)
         return parametric_var_pct(vol, z), avg_pairwise_corr(rets)
 
+    def var_pct_single(
+        self, code: str, weight: float, z: float = 1.65,
+    ) -> Optional[float]:
+        """单标的组合的 1 日 VaR（占**总资产**比例）。
+
+        为什么需要单独一条路：多标的版本要求「可用标的 ≥ 2」，于是**满仓单票**
+        （最集中的状态！）时 VaR 约束会静默返回 None 而不生效 —— 风险最大的
+        场景恰好是唯一不检查的场景。单资产不需要协方差，直接 ``z·|w|·σ``。
+        """
+        closes = self.closes(str(code))
+        if closes is None or closes.size < 21:
+            return None
+        rets = daily_returns(closes)
+        if rets.size < 2:
+            return None
+        vol = float(np.std(rets, ddof=1))
+        if not np.isfinite(vol) or vol <= 0:
+            return None
+        return float(abs(float(weight)) * vol * float(z))
+
     def cov_and_vols(
         self, codes: Sequence[str], min_days: int = 21,
     ) -> Optional[Tuple[List[str], np.ndarray, np.ndarray]]:

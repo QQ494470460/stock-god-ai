@@ -55,7 +55,9 @@ atr_stop_max_pct: 15.0              # 再高波动也不允许宽于 15%（否�
 execution_limits_enabled: true
 max_participation_rate: 0.01        # 单笔金额 ≤ 20日平均成交额 × 1%
 max_risk_per_trade_pct: 0.005       # 单笔潜在亏损 ≤ 总资产 × 0.5%
-risk_budget_stop_pct: 0.05          # 换算用止损距离（对应 -5% 止损线）
+# 换算用的「止损距离」下限。实际预算取值 = max(本值, 该标的当日生效止损线)，
+# 开启 ATR 自适应止损后止损可放宽到 15%，仍按 5% 算预算 = 单笔风险超标 3 倍。
+risk_budget_stop_pct: 0.05          # 止损距离下限（有 ATR 时自动按更宽的实际线算）
 max_daily_turnover_pct: 0.30        # 当日买入总额 ≤ 总资产 × 30%
 
 # ---- 组合尾部风险（相关性 VaR）----

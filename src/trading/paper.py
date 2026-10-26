@@ -445,6 +445,29 @@ class PaperAccount:
     
     # ========== 交易操作 ==========
     
+    def _roll_day_if_needed(self) -> None:
+        """跨日滚动：解锁 T+1 + 重置当日基线。**任何读路径都应先调它**。
+
+        为什么读路径也要滚
+        ------------------
+        解锁原本只写在 ``buy`` / ``sell`` 里。常驻闭环跨日后，如果当天还没有
+        任何买入，``guard`` 取持仓 → ``sellable_quantity`` 仍返回「数量 - 昨日
+        买入量」→ 卖出在**信号预检阶段**就被「T+1 锁仓」拦下；而拦下就不会调用
+        ``sell()``，也就永远不会触发解锁 → 昨日买入的持仓**整天都卖不掉**，
+        包括止损。实测隐患：隔夜持仓的止损会静默失效，直到某次买入把它「唤醒」。
+
+        与 ``mark_to_market`` 共用 ``_lock`` 时的注意事项：``_save`` 只拿跨进程
+        锁 ``_xlock``（可重入），不碰 ``_lock``，因此这里不会再抢 ``_lock``。
+        """
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if today == self._last_reset_date:
+                return   # 绝大多数调用落在这一行，开销仅一次 strftime
+            with self._lock:
+                self._check_daily_reset()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"跨日滚动失败（继续用旧状态，可能影响 T+1 解锁）: {e}")
+
     def buy(self, code: str, name: str, price: float, quantity: int,
             strategy: str = "", ai_score: float = 0.0) -> Tuple[bool, str, Optional[TradeRecord]]:
         """买入（虚拟成交）"""
@@ -539,20 +562,31 @@ class PaperAccount:
     
     def sell(self, code: str, price: float, quantity: int,
              strategy: str = "", ai_score: float = 0.0) -> Tuple[bool, str, Optional[TradeRecord]]:
-        """卖出"""
+        """卖出
+
+        A 股规则：买入必须整手（100 股整数倍），**卖出允许不足一手，但必须
+        一次性把该标的的零股全部卖掉**。旧实现把卖出也强行整手取整，导致
+        「持有 150 股 → 只能卖 100 → 剩 50 股永远卖不掉」——这类零股来自
+        送股/配股/拆分，一旦卡住，连止损都无法执行（且每 tick 刷一条废单日志）。
+        """
         with self._lock:
             with _xlock(self):   # 跨进程串行：防止与看板 reset / 另一进程写入互相覆盖
                 self._load()     # 落盘前先对齐磁盘最新态（两进程共享同一份文件）
                 self._check_daily_reset()
-            
-            quantity = (quantity // 100) * 100
-            if quantity < 100:
-                return False, "不足1手", None
-            
+
             if code not in self.holdings:
                 return False, f"无 {code} 持仓", None
-            
+
             h = self.holdings[code]
+            held = int(h.get("quantity", 0) or 0)
+
+            if held > 0 and int(quantity) >= held:
+                # 清仓：零股一次性卖出是合法的，别取整
+                quantity = held
+            else:
+                quantity = (quantity // 100) * 100
+                if quantity < 100:
+                    return False, "不足1手（非清仓卖出必须整手）", None
 
             # T+1：可卖数量须扣除今日买入部分（不能只看 available，
             # 旧数据或券商返回值可能未扣减，这里统一用规则层兜住）
@@ -635,6 +669,9 @@ class PaperAccount:
     
     def mark_to_market(self, prices: Dict[str, float]):
         """按最新市价更新持仓市值"""
+        # 先滚日：常驻进程跨日后，若不在这里解锁，止盈止损会拿「昨日买入量」
+        # 当今日锁仓量，导致开盘第一轮止损全部被 T+1 拦掉。
+        self._roll_day_if_needed()
         with self._lock:
             # 当日首个有效行情 = 当日基线定格点。必须在 mark 之前取，
             # 否则买入/卖出改变现金后再定基线，会把当天第一笔的损益吞掉。
@@ -663,7 +700,13 @@ class PaperAccount:
         return (self.get_total_asset() / self.initial_cash - 1) * 100 if self.initial_cash > 0 else 0
     
     def get_positions(self) -> List[dict]:
-        """当前持仓列表"""
+        """当前持仓列表
+
+        先滚日再返回：guard 的 ``_positions()`` 直接从这条路取持仓，用于判断
+        T+1 可卖量。不滚日的话，跨日后「昨日买入」仍算今日锁定，止损会被
+        永久拦在预检阶段（详见 ``_roll_day_if_needed`` 的说明）。
+        """
+        self._roll_day_if_needed()
         return [
             {
                 "code": code,
