@@ -284,7 +284,11 @@ class TradingLoopConfig:
     max_positions: int = 10              # 目标持仓上限
     cash_reserve_pct: float = 0.10       # 现金保留比例
     weight_cap: float = 0.30             # 单票权重上限
-    weighting: str = "equal"             # equal / score
+    # equal / score / risk_parity / min_variance / vol_target
+    # 默认风险平价：等权与按评分加权都只看 alpha，不看波动与相关性，
+    # 会让组合风险集中在少数高波动标的上。数据不足时自动退回等权。
+    weighting: str = "risk_parity"
+    tilt_strength: float = 0.25          # 风险权重上叠加 alpha 倾斜（0=纯风险平价）
     enable_rebalance: bool = True        # 目标组合调仓开关
     enable_stop_orders: bool = True      # 止盈止损开关
     band_pct: float = 0.25               # 调仓容忍带

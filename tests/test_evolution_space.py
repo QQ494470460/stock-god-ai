@@ -178,7 +178,7 @@ def test_int_cast_rounds_instead_of_truncating():
 
 
 def test_category_only_accepts_choices():
-    spec = space.get_spec("trading_loop.weighting")     # equal | score
+    spec = space.get_spec("trading_loop.weighting")  # 风险平价/等权/评分/最小方差/波动率目标
     assert spec.cast("score") == "score"
     with pytest.raises(ParamError, match="不在允许集合"):
         spec.cast("momentum")
@@ -201,7 +201,8 @@ def test_domain_generation():
     assert all(isinstance(v, int) for v in ints)
 
     cats = space.sample_domain("trading_loop.weighting")
-    assert set(cats) == {"equal", "score"}
+    # 2026-10-26 起可选集合扩到 5 种（新增 risk_parity / min_variance / vol_target）
+    assert set(cats) == {"risk_parity", "equal", "score", "min_variance", "vol_target"}
 
     bools = space.sample_domain("trading_loop.enable_rebalance")
     assert set(bools) == {True, False}
