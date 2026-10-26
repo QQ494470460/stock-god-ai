@@ -146,6 +146,19 @@ class GuardConfig:
     max_single_position_pct: float = 0.30    # 单票最大仓位(占总资产)
     max_sector_pct: float = 0.50             # 单一行业最大集中度(占总资产)
 
+    # ---- 止盈止损（透传给 TradeExecutor 的 RiskConfig）----
+    # 放在这里而不是写死在 RiskConfig 默认值里，是为了「改配置即生效，无需改代码」。
+    # atr_stop_* 见 src/trading/stops.py：固定 -5% 止损在 A 股是结构性错误，
+    # 70% 年化波动的题材股日内振幅本身就有 5%，固定线等于开盘就被扫。
+    stop_loss_pct: float = -5.0
+    stop_profit_pct: float = 15.0
+    trailing_stop_pct: float = -3.0
+    atr_stop_enabled: bool = False
+    atr_stop_k: float = 2.0                  # 止损宽度 = max(|配置值|, k × ATR%)
+    atr_trailing_k: float = 1.5              # 移动止损用更紧的倍数
+    atr_stop_min_pct: float = 2.0            # 止损宽度下限(%)
+    atr_stop_max_pct: float = 15.0           # 止损宽度上限(%)
+
     # ---- 下单频率 ----
     min_order_interval_sec: float = 2.0      # 两笔委托最小间隔(秒)
     max_orders_per_minute: int = 10          # 每分钟最大委托数
@@ -258,6 +271,19 @@ class GuardConfig:
         fixed = float(self.max_daily_loss_abs or 0.0)
         pct = float(self.max_daily_loss_abs_pct or 0.0)
         if pct > 0:
+            # ⚠️ 耦合告警：金额线比比例线更紧时，比例线形同虚设。
+            # 2026-10-26 实测踩到：abs_pct=1.0 而 max_daily_loss_pct=3.0，
+            # 结果每天在 -1% 就熔断，3% 那条线一次都没机会生效，闭环下午全静默。
+            # 两条线是「或」的关系，紧的那条才是真实阈值 —— 必须显式提醒。
+            if pct < float(self.max_daily_loss_pct or 0.0) and not getattr(
+                self, "_warned_abs_vs_pct", False
+            ):
+                object.__setattr__(self, "_warned_abs_vs_pct", True)
+                logger.warning(
+                    f"⚠️ 单日亏损金额线({pct:.2f}% 权益) 比比例线"
+                    f"({self.max_daily_loss_pct:.2f}%) 更紧 → 实际生效阈值是 {pct:.2f}%。"
+                    f"如非本意，把 max_daily_loss_abs_pct 调到 >= max_daily_loss_pct 或设 0。"
+                )
             derived = max(0.0, float(equity or 0.0)) * pct / 100.0
             return max(fixed, derived)
         if fixed > 0:
@@ -950,6 +976,24 @@ class RiskSupervisor:
                 self._risk_monitor = None
 
         # 复用现有逐单风控执行器（防御纵深内层）
+        # risk_config 为 None 时按「本配置的止损段」构造，而不是用 RiskConfig 的
+        # 硬编码默认值 —— 否则 trading_guard.yaml 里的止损参数永远不会生效。
+        if risk_config is None:
+            try:
+                from src.trading.executor import RiskConfig
+                risk_config = RiskConfig(
+                    stop_loss_pct=float(self.config.stop_loss_pct),
+                    stop_profit_pct=float(self.config.stop_profit_pct),
+                    trailing_stop_pct=float(self.config.trailing_stop_pct),
+                    atr_stop_enabled=bool(self.config.atr_stop_enabled),
+                    atr_stop_k=float(self.config.atr_stop_k),
+                    atr_trailing_k=float(self.config.atr_trailing_k),
+                    atr_stop_min_pct=float(self.config.atr_stop_min_pct),
+                    atr_stop_max_pct=float(self.config.atr_stop_max_pct),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"按配置构造 RiskConfig 失败，改用默认值: {e}")
+                risk_config = None
         self.executor = TradeExecutor(broker, risk_config)
         self.risk_config = self.executor.config
 

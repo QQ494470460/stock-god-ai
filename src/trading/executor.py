@@ -31,6 +31,14 @@ class RiskConfig:
     stop_loss_pct: float = -5.0           # 止损线（%），如 -5%
     stop_profit_pct: float = 15.0         # 止盈线（%），如 +15%
     trailing_stop_pct: float = -3.0       # 移动止损（%，回撤多少触发）
+
+    # ATR 自适应止损（把上面的固定线换成「按个股波动归一」的宽度）
+    # 默认关闭：没有 ATR 数据时必须完全等价于旧行为，否则升级即变策略。
+    atr_stop_enabled: bool = False
+    atr_stop_k: float = 2.0               # 止损宽度 = k × ATR%（不小于配置的固定止损）
+    atr_trailing_k: float = 1.5           # 移动止损用更小的倍数（更紧）
+    atr_stop_min_pct: float = 2.0         # 止损宽度下限（%）
+    atr_stop_max_pct: float = 15.0        # 止损宽度上限（%）
     
     # 日内限制
     max_daily_trades: int = 20            # 日最大成交笔数
@@ -70,9 +78,12 @@ class TradeExecutor:
         self,
         broker: BrokerAPI,
         risk_config: Optional[RiskConfig] = None,
+        atr_provider=None,
     ):
         self.broker = broker
         self.config = risk_config or RiskConfig()
+        # ATR 提供者（可选，注入以便单测）。为 None 且配置开启时懒加载真实读盘版本。
+        self._atr_provider = atr_provider
         
         # 日内统计
         self._today_stats = {
@@ -94,6 +105,60 @@ class TradeExecutor:
         
         logger.info("🛡️ TradeExecutor 已初始化")
     
+    # ========== 自适应止损线 ==========
+
+    def _get_atr_provider(self):
+        """懒加载 ATR 提供者；失败返回 None（调用方自动退回固定止损）。"""
+        if self._atr_provider is not None:
+            return self._atr_provider
+        if not getattr(self.config, "atr_stop_enabled", False):
+            return None
+        try:
+            from src.trading.stops import AtrProvider
+
+            self._atr_provider = AtrProvider()
+            return self._atr_provider
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"ATR 提供者初始化失败，回退固定止损: {e}")
+            return None
+
+    def _effective_stop_lines(self, code: str) -> Tuple[float, float]:
+        """返回 (硬止损线, 移动止损线)，两者都是负数百分比。
+
+        未开启 ATR 或取不到数据时，**原样返回配置值** —— 这条 fail-open 路径
+        必须与旧行为逐字节等价，否则升级本身就成了策略变更。
+        """
+        base_stop = float(self.config.stop_loss_pct)
+        base_trail = float(self.config.trailing_stop_pct)
+        if not getattr(self.config, "atr_stop_enabled", False):
+            return base_stop, base_trail
+
+        prov = self._get_atr_provider()
+        if prov is None:
+            return base_stop, base_trail
+
+        try:
+            atr = prov.atr_pct(code)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ATR 取值失败 {code}: {e}")
+            return base_stop, base_trail
+        if atr is None:
+            return base_stop, base_trail
+
+        from src.trading.stops import adaptive_stop_pct, adaptive_trailing_pct
+
+        lo = float(getattr(self.config, "atr_stop_min_pct", 2.0))
+        hi = float(getattr(self.config, "atr_stop_max_pct", 15.0))
+        stop_line = adaptive_stop_pct(
+            base_stop, atr, k=float(self.config.atr_stop_k), floor_pct=lo, ceil_pct=hi
+        )
+        trail_line = adaptive_trailing_pct(
+            base_trail, atr, k=float(self.config.atr_trailing_k), floor_pct=lo, ceil_pct=hi
+        )
+        # 不做「硬止损 >= 移动止损」的强排序：两者触发条件不同（硬止损看浮亏、
+        # 移动止损只在 pnl>0 时才看回撤），移动止损天然更紧才是正确设计。
+        return stop_line, trail_line
+
     # ========== 止盈止损检查 ==========
     
     def check_stop_conditions(
@@ -149,8 +214,13 @@ class TradeExecutor:
             if qty <= 0:
                 continue
 
+            # 自适应止损线：ATR 有数据就按个股波动归一，没有就退回配置的固定线。
+            # 关键不变量：宽度只会 >= 配置值，绝不会比手动设定更紧 —— 升级 ATR
+            # 不会把仓位扫得更凶（那会让回测与实盘的止损频率突然翻倍）。
+            stop_line, trail_line = self._effective_stop_lines(pos.code)
+
             # 止损判断
-            if pnl_pct <= self.config.stop_loss_pct:
+            if pnl_pct <= stop_line:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"止损 {pnl_pct:.1f}%",
@@ -166,7 +236,7 @@ class TradeExecutor:
                     "quantity": qty,
                 })
             # 移动止损
-            elif pnl_pct > 0 and drawdown <= self.config.trailing_stop_pct:
+            elif pnl_pct > 0 and drawdown <= trail_line:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"移动止损 回撤{drawdown:.1f}% (最高+{(tracked_high/pos.avg_cost-1)*100:.1f}%)",

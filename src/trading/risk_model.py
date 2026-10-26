@@ -193,3 +193,30 @@ class PortfolioRiskMonitor:
         cov = covariance(rets)
         vol = portfolio_daily_vol(w, cov)
         return parametric_var_pct(vol, z), avg_pairwise_corr(rets)
+
+    def cov_and_vols(
+        self, codes: Sequence[str], min_days: int = 21,
+    ) -> Optional[Tuple[List[str], np.ndarray, np.ndarray]]:
+        """返回 ``(可用代码, 协方差矩阵, 各标的日波动率)``，供组合优化器用。
+
+        与 ``var_pct`` 共用一个读盘缓存。可用标的不足 2 只、或历史长度不够时
+        返回 None —— 让调用方回退等权，**绝不用残缺样本硬算权重**
+        （2 只票 10 天数据算出的风险平价与随机数没有区别）。
+        """
+        pairs = []
+        for c in codes:
+            closes = self.closes(str(c))
+            if closes is None or closes.size < max(int(min_days), 5):
+                continue
+            pairs.append((str(c), closes))
+        if len(pairs) < 2:
+            return None
+
+        usable, rets = returns_matrix(dict(pairs))
+        if rets.size == 0 or rets.shape[1] < 2:
+            return None
+        cov = covariance(rets)
+        if cov.size == 0:
+            return None
+        vols = np.asarray([float(np.std(rets[:, i], ddof=1)) for i in range(rets.shape[1])])
+        return usable, cov, vols

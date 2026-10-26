@@ -180,11 +180,55 @@ class TradePlan:
 # 权重分配
 # ----------------------------------------------------------------------------
 
+def _load_risk_stats(codes: List[str], data_dir: Optional[Path] = None) -> Optional[dict]:
+    """给风险加权收集协方差 / 波动率 / 目标波动。
+
+    全部 fail-safe：任何环节不可用都返回 None → 调用方回退等权。
+    **绝不**因为读不到数据就编造权重——那会让「风险平价」变成「随机加权」，
+    比等权更糟且更难排查。
+    """
+    codes = [str(c) for c in (codes or []) if c]
+    if len(codes) < 2:
+        return None
+    try:
+        from src.trading.risk_model import PortfolioRiskMonitor
+
+        mon = PortfolioRiskMonitor(data_dir=data_dir) if data_dir else PortfolioRiskMonitor()
+        got = mon.cov_and_vols(codes)
+        if got is None:
+            return None
+        usable, cov, vols = got
+
+        target_vol = None
+        try:
+            from config.settings import ROOT_DIR
+
+            gp = Path(ROOT_DIR) / "config" / "trading_guard.yaml"
+            if gp.exists():
+                from src.trading.guard import GuardConfig
+
+                target_vol = float(GuardConfig.from_yaml(str(gp)).volatility_target_pct)
+        except Exception:  # noqa: BLE001
+            target_vol = None
+
+        return {
+            "codes": list(usable),
+            "cov": cov,
+            "vols": vols,
+            "target_vol": target_vol,
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"风险统计加载失败，权重回退等权: {e}")
+        return None
+
+
 def _assign_weights(
     targets: List[PlanTarget],
     investable_pct: float,
     weighting: str = "equal",
     weight_cap: Optional[float] = None,
+    risk_stats: Optional[dict] = None,
+    tilt_strength: float = 0.25,
 ) -> None:
     """就地填充 target.weight。
 
@@ -192,11 +236,32 @@ def _assign_weights(
     weight_cap ：单票权重上限。设了它就与风控 guard 的 max_single_position_pct
                  对齐，避免「计划要 45%、风控只准 30%」的错配导致执行端缩量。
                  被截断后剩余额度**留在现金**（更保守），不强行摊给别人。
+    risk_stats ：风险统计（``{"codes", "cov", "vols"}``），``risk_parity`` /
+                 ``min_variance`` / ``vol_target`` 三种加权方式必需；缺失时
+                 优雅退回等权（不报错、不猜）。
+    tilt_strength：风险权重之上叠加 alpha 倾斜的力度（0=纯风险平价）。
+
+    为什么要有风险加权
+    ------------------
+    ``equal`` 与 ``score`` 都只看 alpha，不看波动与相关性：等权会让一只 70%
+    年化波动的题材股与一只 25% 的银行股拿一样多的钱（8 成风险来自前者）；
+    按评分加权更糟——模型偏爱动量，高分往往就是高波动，等于在波动最大的
+    地方下最重的注。风险平价让每只票贡献相同风险，组合的 VaR 与风控预算同源。
     """
     n = len(targets)
     if n == 0:
         return
-    if weighting == "score":
+
+    method = (weighting or "equal").lower()
+    if method in ("risk_parity", "min_variance", "vol_target"):
+        raw = _risk_weights(targets, method, risk_stats, weight_cap, tilt_strength)
+        if raw is not None:
+            for t, w in zip(targets, raw):
+                t.weight = investable_pct * float(w)
+            return  # 风险权重已在内部处理 cap，直接返回
+        method = "equal"  # 数据不足 → 退回等权
+
+    if method == "score":
         raw = [max(0.0, t.score) for t in targets]
         total = sum(raw)
         if total <= 0:
@@ -212,6 +277,81 @@ def _assign_weights(
     if weight_cap is not None and weight_cap > 0:
         for t in targets:
             t.weight = min(t.weight, float(weight_cap))
+
+
+def _risk_weights(
+    targets: List[PlanTarget],
+    method: str,
+    risk_stats: Optional[dict],
+    weight_cap: Optional[float],
+    tilt_strength: float,
+) -> Optional[List[float]]:
+    """按风险统计求权重；数据不可用时返回 None（调用方回退等权）。"""
+    if not risk_stats or not targets:
+        return None
+    codes = [str(c) for c in (risk_stats.get("codes") or [])]
+    cov = risk_stats.get("cov")
+    vols = risk_stats.get("vols")
+    if not codes:
+        return None
+
+    # 风险统计的标的集合必须覆盖计划全部标的，否则「缺价的那只」会拿到
+    # 未经风险调整的权重 —— 那正是最危险的一只（数据缺失往往意味着流动性差）。
+    pos = {c: i for i, c in enumerate(codes)}
+    if any(t.code not in pos for t in targets):
+        logger.debug("风险统计未覆盖全部标的，权重回退等权")
+        return None
+
+    idx = [pos[t.code] for t in targets]
+    scores = [float(t.score or 0.0) for t in targets]
+
+    try:
+        import numpy as np
+
+        from src.trading.optimizer import optimize_weights
+
+        sub_cov = None
+        if cov is not None and method in ("risk_parity", "min_variance"):
+            arr = np.asarray(cov, dtype=float)
+            if arr.ndim != 2 or arr.shape[0] < len(codes):
+                return None
+            sub_cov = arr[np.ix_(idx, idx)]
+
+        sub_vols = None
+        if vols is not None:
+            varr = np.asarray(vols, dtype=float)
+            if varr.size >= len(codes):
+                sub_vols = varr[idx]
+
+        target_vol = risk_stats.get("target_vol")
+        w = optimize_weights(
+            cov=sub_cov,
+            vols=sub_vols,
+            scores=scores,
+            method=method,
+            cap=weight_cap,
+            target_vol=float(target_vol) if target_vol else None,
+            tilt_strength=float(tilt_strength),
+        )
+        w = np.asarray(w, dtype=float)
+        if w.size != len(targets) or not np.all(np.isfinite(w)):
+            return None
+
+        # vol_target 允许 sum(w) < 1（波动高就少持仓，剩下的留现金）；
+        # 其余方法强制归一，避免因数值误差漏掉一小截资金。
+        total = float(w.sum())
+        if total <= 0:
+            return None
+        if method != "vol_target" and abs(total - 1.0) > 1e-6:
+            w = w / total
+        # 注：换手封顶需要「上一版计划权重」作为基准，计划层拿不到持仓口径的
+        # 旧权重，因此换手控制放在 rebalance / 执行侧做（那里的 band_pct 与
+        # max_daily_turnover_pct 才是正确的着力点），此处不做。
+        return [float(x) for x in w]
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"风险加权失败，回退等权: {e}")
+        return None
+
 
 
 # ----------------------------------------------------------------------------
@@ -332,6 +472,8 @@ def build_trade_plan(
     cash_reserve_pct: Optional[float] = None,
     weighting: str = "equal",
     weight_cap: Optional[float] = None,
+    risk_stats: Optional[dict] = None,
+    tilt_strength: float = 0.25,
     write: bool = True,
     plan_dir: Optional[Path] = None,
 ) -> TradePlan:
@@ -386,7 +528,10 @@ def build_trade_plan(
 
     # 3. 分配权重
     cash_reserve_pct = float(min(max(cash_reserve_pct, 0.0), 0.95))
-    _assign_weights(targets, 1.0 - cash_reserve_pct, weighting, weight_cap=weight_cap)
+    if weighting in ("risk_parity", "min_variance", "vol_target") and risk_stats is None:
+        risk_stats = _load_risk_stats([t.code for t in targets])
+    _assign_weights(targets, 1.0 - cash_reserve_pct, weighting, weight_cap=weight_cap,
+                    risk_stats=risk_stats, tilt_strength=tilt_strength)
 
     plan = TradePlan(
         plan_date=plan_date or resolve_target_date(),

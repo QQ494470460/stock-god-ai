@@ -41,6 +41,7 @@ class RebalanceIntent:
     target_weight: float = 0.0      # 目标权重
     current_value: float = 0.0      # 当前市值
     target_value: float = 0.0       # 目标市值
+    capped_by: str = ""             # 被什么约束封顶过（liquidity / 空=未封顶）
 
     @property
     def amount(self) -> float:
@@ -64,6 +65,25 @@ def _floor_lot(qty: float, lot_size: int = 100) -> int:
     return int(math.floor(qty / lot_size) * lot_size)
 
 
+def _liquidity_cap_qty(
+    adv_provider, code: str, price: float, participation: float, lot_size: int,
+) -> Optional[int]:
+    """可买股数上限（整手）；数据缺失返回 None = 不封顶（fail-open）。"""
+    try:
+        cap = adv_provider.max_order_quantity(
+            code, price, participation=participation, lot=lot_size
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"流动性上限取值失败 {code}: {e}")
+        return None
+    if cap is None:
+        return None
+    try:
+        return int(max(0, cap))
+    except (TypeError, ValueError):
+        return None
+
+
 def compute_rebalance_orders(
     plan: TradePlan,
     positions: Sequence[Position],
@@ -75,6 +95,8 @@ def compute_rebalance_orders(
     allow_buy: bool = True,
     allow_sell: bool = True,
     risk_scale: float = 1.0,
+    adv_provider=None,
+    participation: float = 0.01,
 ) -> List[RebalanceIntent]:
     """计算调仓订单意图（卖单在前，买单在后）。
 
@@ -90,6 +112,11 @@ def compute_rebalance_orders(
         risk_scale: 组合敞口系数 0~1，由组合回撤连续推导（见
             ``src/trading/sizing.py``）。1.0=满仓参与，0.3=只用 30% 建仓、
             其余留现金。**不是清仓**——始终保留一部分敞口在场。
+        adv_provider: 可选 ``AdvProvider``。给了就在**计划层**把买入量封顶到
+            「近 20 日平均成交额 × participation」换算出的股数。事前封顶比
+            事后拦截好：计划里显示的股数就是真能成交的股数，不会出现
+            「计划 8000 股 / 风控砍成 3200 / 日志里全是拦截」的来回打架。
+        participation: 单笔占 ADV 的上限比例，默认 1%。
 
     Returns:
         List[RebalanceIntent]，已排序为「先卖后买」。
@@ -208,6 +235,19 @@ def compute_rebalance_orders(
             qty = _floor_lot(spend / price, lot_size)
             if qty <= 0:
                 continue
+
+            # 流动性事前封顶：把「一次买不完」的量在计划里就摊薄，剩下的
+            # 交给后续 tick 的 gap 补仓（每次 tick 重新算 gap，天然分批）。
+            capped_by = ""
+            if adv_provider is not None:
+                cap_qty = _liquidity_cap_qty(adv_provider, t.code, price, participation, lot_size)
+                if cap_qty is not None and cap_qty < qty:
+                    qty = cap_qty
+                    capped_by = "liquidity"
+                    if qty <= 0:
+                        logger.debug(f"调仓：{t.code} 流动性上限低于一手，本轮跳过")
+                        continue
+
             amount = qty * price
             if amount < min_trade_amount:
                 continue
@@ -216,10 +256,13 @@ def compute_rebalance_orders(
             budget -= amount
             reason = ("目标组合新增，建仓" if cur_val <= 0
                       else f"低于目标仓位 {gap:.0f}元，补仓")
+            if capped_by == "liquidity":
+                reason += "（受流动性上限约束，分批建仓）"
             buys.append(RebalanceIntent(
                 code=t.code, name=t.name or t.code, side=OrderSide.BUY,
                 quantity=qty, price=round(price, 3), reason=reason,
                 target_weight=t.weight, current_value=cur_val, target_value=tgt_val,
+                capped_by=capped_by,
             ))
 
     return sells + buys

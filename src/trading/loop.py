@@ -94,7 +94,12 @@ class LoopConfig:
     max_positions: int = 10              # 目标持仓上限（与 guard 对齐）
     cash_reserve_pct: float = 0.10       # 现金保留比例
     weight_cap: float = 0.30             # 单票权重上限（= guard.max_single_position_pct）
-    weighting: str = "equal"             # equal / score
+    # equal / score / risk_parity / min_variance / vol_target
+    # 默认风险平价：等权与按评分加权都只看 alpha，不看波动与相关性，会让
+    # 组合的风险集中在少数高波动标的上；风险平价让每只票贡献相同风险，
+    # 与 guard 的 VaR 预算同源。数据不足时 build_trade_plan 自动退回等权。
+    weighting: str = "risk_parity"
+    tilt_strength: float = 0.25          # 风险权重上叠加 alpha 倾斜的力度（0=纯风险平价）
     enable_rebalance: bool = True        # 是否执行目标调仓
     enable_stop_orders: bool = True      # 是否执行止盈止损
     # 组合回撤 → 连续渐进降仓（**不是**清仓）。回测实证：触线全清能把回撤
@@ -493,6 +498,7 @@ class TradingLoop:
                 cash_reserve_pct=self.config.cash_reserve_pct,
                 weighting=self.config.weighting,
                 weight_cap=min(cap, self.config.weight_cap),
+                tilt_strength=self.config.tilt_strength,
                 write=True,
             )
             return plan
@@ -646,6 +652,8 @@ class TradingLoop:
             min_trade_amount=self.config.min_trade_amount,
             allow_buy=True, allow_sell=True,
             risk_scale=risk_scale,
+            adv_provider=self._adv_provider(),
+            participation=self._participation(),
         )
         report.n_intents = len(intents)
         if not intents:
@@ -699,6 +707,35 @@ class TradingLoop:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"敞口系数计算失败，按满仓处理：{e}")
             return 1.0
+
+    def _adv_provider(self):
+        """流动性上限提供者（计划层事前封顶用）；关闭或失败时返回 None。
+
+        与 ``guard._apply_execution_limits`` 共用同一份 ADV 数据：计划层先按上限
+        摊薄、执行层再兜一次。两处封顶不冲突——执行层拿到的量已在上限内，
+        不会出现「计划 8000 股 / 风控砍成 3200」的来回打架。
+        """
+        if getattr(self, "_adv_cache_done", False):
+            return self._adv_cache
+        self._adv_cache = None
+        self._adv_cache_done = True
+        try:
+            cfg = getattr(self.guard, "config", None)
+            if cfg is not None and not getattr(cfg, "execution_limits_enabled", True):
+                return None
+            from src.trading.liquidity import AdvProvider
+
+            self._adv_cache = AdvProvider()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"流动性提供者初始化失败，计划层不封顶：{e}")
+            self._adv_cache = None
+        return self._adv_cache
+
+    def _participation(self) -> float:
+        try:
+            return float(self.guard.config.max_participation_rate)
+        except Exception:  # noqa: BLE001
+            return 0.01
 
     # ------------------------------------------------------------------
     # ③ 收盘结算
@@ -1205,6 +1242,11 @@ class TradingLoop:
             self.plan, positions, account, prices,
             band_pct=self.config.band_pct,
             min_trade_amount=self.config.min_trade_amount,
+            # 预演必须与真实 tick 用同一套参数（敞口系数 + 流动性封顶），
+            # 否则「预演说买 8000 股、实盘只买 3200」这种不一致永远查不出来。
+            risk_scale=self._portfolio_risk_scale(account),
+            adv_provider=self._adv_provider(),
+            participation=self._participation(),
         ) if (self.plan and account) else []
 
         stops = []

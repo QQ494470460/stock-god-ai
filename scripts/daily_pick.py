@@ -67,6 +67,11 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--ensemble", action="store_true",
                     help="启用多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票，"
                          "集体看空则剔除、一致看多则加权提分（默认关闭）")
+    ap.add_argument("--weighting", default="",
+                    help="交易计划权重方式：equal | score | risk_parity | min_variance | "
+                         "vol_target（默认取 GuardConfig.weighting 或 equal）")
+    ap.add_argument("--tilt", type=float, default=None,
+                    help="风险权重之上叠加 alpha 倾斜的力度（0=纯风险平价，默认 0.5）")
     return ap.parse_args()
 
 
@@ -114,7 +119,13 @@ def main() -> int:
     # ---- 可选：立刻刷新交易计划 ----
     if args.build_plan:
         from src.trading.trade_plan import build_trade_plan
-        plan = build_trade_plan(write=True)
+
+        kwargs = {}
+        if args.weighting:
+            kwargs["weighting"] = args.weighting
+        if args.tilt is not None:
+            kwargs["tilt_strength"] = max(0.0, min(float(args.tilt), 1.0))
+        plan = build_trade_plan(write=True, **kwargs)
         if not args.json:
             print()
             print("📋 交易计划已刷新")
