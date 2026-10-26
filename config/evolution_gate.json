@@ -1,5 +1,5 @@
 {
   "_comment": "Walk-Forward 样本外门禁开关（防过拟合的最后一道闸）。默认关闭（fail-safe）。开启前必须先 `scripts/evolve.py --build-panel` 且面板足够长（≥ max(min_periods*3, 36) 天），否则 _walk_forward_verdict 会静默退化为「不拦」（等于没开）。设 require_walk_forward=true 后：候选除了通过 A/B 回测，还必须在按时间切分的多个样本外折上整体胜过当前参数（样本外胜折数 ≥ min_wf_folds），否则被拒。也可在单次回合用 --walk-forward / --no-walk-forward 临时覆盖。",
-  "require_walk_forward": false,
+  "require_walk_forward": true,
   "min_wf_folds": 3
 }

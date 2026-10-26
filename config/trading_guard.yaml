@@ -23,7 +23,9 @@ max_daily_loss_abs_pct: 1.0         # 金额线 = 权益 × 1.0%（≈¥5万 @50
 # ---- 持仓约束 ----
 max_positions: 20                   # 最大持仓只数
 max_single_position_pct: 0.30       # 单票最大仓位(占总资产比例)
-max_sector_pct: 0.50                # 单一行业最大集中度(占总资产比例)
+max_sector_pct: 0.30                # 单一行业最大集中度(占总资产比例)
+# 2026-10-26 由 0.50 收紧到 0.30：20 只持仓下 50% 意味着「两三个行业就能吃掉
+# 全部仓位」，等于没有集中度约束；30% 约等于「单行业最多 3~4 只」。
 
 # ---- 下单频率 ----
 min_order_interval_sec: 2.0          # 两笔委托最小间隔(秒)
@@ -31,8 +33,8 @@ max_orders_per_minute: 10           # 每分钟最大委托数
 
 # ---- 仓位规模 ----
 # 可选: fixed_fractional | volatility_target | kelly
-sizing_method: fixed_fractional
-base_risk_fraction: 0.02            # 每笔风险敞口占净值比例(固定比例法)
+sizing_method: volatility_target     # 2026-10-26 启用：高波动买得少（vol 未知时自动降级为固定比例）
+base_risk_fraction: 0.02            # 每笔风险敞口占净值比例(固定比例法/波动率法的降级兜底)
 volatility_target_pct: 0.15          # 年化波动率目标(波动率目标法)
 kelly_cap: 0.10                      # Kelly 仓位上限(半 Kelly 后再封顶)
 

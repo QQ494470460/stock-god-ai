@@ -1034,3 +1034,22 @@ def test_auto_halt_resume_path_still_cuts_losers_then_resumes(tmp_path):
     # 自动熔断应在条件清除后自愈（恢复交易能力），且未被「放行止损」改动破坏。
     assert sup.safety.halted is False, "自动熔断条件清除后应自愈恢复交易"
 
+
+
+def test_guard_config_from_yaml_parses_sizing_and_sector(tmp_path):
+    """风控开关来自 yaml：sizing_method / max_sector_pct 必须被正确解析。
+
+    这两个字段 2026-10-26 从「未启用」改为生产启用（波动率目标法 + 行业 30%），
+    若 from_yaml 漏解析，配置会静默失效、退回默认值。
+    """
+    p = tmp_path / "guard.yaml"
+    p.write_text(
+        "sizing_method: volatility_target\n"
+        "max_sector_pct: 0.3\n"
+        "volatility_target_pct: 0.15\n",
+        encoding="utf-8",
+    )
+    cfg = GuardConfig.from_yaml(str(p))
+    assert cfg.sizing_method == "volatility_target"
+    assert cfg.max_sector_pct == pytest.approx(0.3)
+    assert cfg.volatility_target_pct == pytest.approx(0.15)

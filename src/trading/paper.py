@@ -485,7 +485,13 @@ class PaperAccount:
                 old_qty = h["quantity"]
                 old_cost = h["avg_cost"]
                 new_qty = old_qty + quantity
-                new_cost = (old_cost * old_qty + amount) / new_qty if new_qty > 0 else 0
+                # 成本基准把**买入佣金资本化**：否则卖出算 pnl 时只扣了卖出费，
+                # 买入佣金凭空消失 → 每笔盈亏系统性高估一个佣金。券商的
+                # 「摊薄成本」也是含费口径，这里与之一致。
+                new_cost = (
+                    (old_cost * old_qty + amount + commission) / new_qty
+                    if new_qty > 0 else 0
+                )
                 h["quantity"] = new_qty
                 # T+1：今日买入的部分当日不可卖 —— available 保持不变，
                 # 只累加 today_quantity（次日 _check_daily_reset 时解锁）
@@ -498,7 +504,8 @@ class PaperAccount:
                     "quantity": quantity,
                     "available": 0,            # T+1：当日买入当日不可卖
                     "today_quantity": quantity,
-                    "avg_cost": fill_price,
+                    # 单位成本含佣金（= 总支出/股数），与卖出端 pnl 口径对齐
+                    "avg_cost": total_cost / quantity,
                     "market_value": amount,
                     "last_price": fill_price,
                 }

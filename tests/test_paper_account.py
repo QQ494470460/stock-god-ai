@@ -405,3 +405,61 @@ def test_reset_keeps_other_process_trade_on_disk(tmp_path):
     assert len(pa3.holdings) == 0, "重置应清仓"
     assert len(pa3.trade_history) == 1, "重置不得覆盖 pa1 的成交历史"
 
+
+
+# ======================================================================
+# 成本基准口径：买入佣金必须资本化（否则卖出 pnl 系统性高估一个佣金）
+# ======================================================================
+def test_buy_commission_is_capitalized_into_cost_basis(tmp_path):
+    pa = PaperAccount(initial_cash=1_000_000.0,
+                      account_file=tmp_path / "a.json",
+                      history_file=tmp_path / "h.json")
+
+    ok, _msg, rec = pa.buy("600519", "贵州茅台", 1500.0, 100)
+    assert ok and rec is not None
+
+    # 单位成本 = (成交金额 + 佣金) / 股数，与券商「摊薄成本」同口径
+    expected = (rec.amount + rec.commission) / rec.quantity
+    assert pa.holdings["600519"]["avg_cost"] == pytest.approx(expected, rel=1e-9)
+    assert rec.commission >= 5.0, "佣金有最低 5 元"
+
+
+def test_repeat_buy_blends_commission_into_average_cost(tmp_path):
+    pa = PaperAccount(initial_cash=1_000_000.0,
+                      account_file=tmp_path / "a.json",
+                      history_file=tmp_path / "h.json")
+
+    ok1, _m1, r1 = pa.buy("600519", "贵州茅台", 1500.0, 100)
+    ok2, _m2, r2 = pa.buy("600519", "贵州茅台", 1600.0, 100)
+    assert ok1 and ok2
+
+    cost1 = r1.amount + r1.commission
+    cost2 = r2.amount + r2.commission
+    expected = (cost1 + cost2) / (r1.quantity + r2.quantity)
+    assert pa.holdings["600519"]["avg_cost"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_sell_pnl_does_not_double_count_buy_commission(tmp_path):
+    """买入佣金已进成本，卖出 pnl 只需再扣卖出费，不应重复计买入佣金。"""
+    pa = PaperAccount(initial_cash=1_000_000.0,
+                      account_file=tmp_path / "a.json",
+                      history_file=tmp_path / "h.json")
+    _ok, _m, buy_rec = pa.buy("600519", "贵州茅台", 100.0, 1000)
+    # 模拟「昨日买入」：解锁 T+1，否则当日不可卖。必须落盘 ——
+    # sell() 开头会 _load() 对齐磁盘最新态，只改内存会被覆盖。
+    _h = pa.holdings["600519"]
+    _h["today_quantity"] = 0
+    _h["available"] = _h["quantity"]
+    pa._save()
+    ok, _m2, sell_rec = pa.sell("600519", 100.0, 1000)
+    assert ok
+
+    # 恒等式：pnl = 卖出净收入 - (买入金额 + 买入佣金) - 卖出佣金 - 印花税
+    # 若成本基准漏计买入佣金，这里会多出一笔 comm 的差额。
+    expected = (
+        sell_rec.amount
+        - (buy_rec.amount + buy_rec.commission)
+        - sell_rec.commission
+        - sell_rec.stamp_tax
+    )
+    assert sell_rec.pnl == pytest.approx(expected, rel=1e-9)
