@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable
 from loguru import logger
 
-from src.trading.broker import BrokerAPI, OrderSide
+from src.trading.broker import BrokerAPI, OrderSide, Order
 from src.trading.executor import TradeExecutor, RiskConfig
 from src.trading.yuekai import YuekaiBroker
 from src.trading.account import account_manager
@@ -187,6 +187,53 @@ class AutoTrader:
             agreement=agreement, side=side,
         )
 
+    def _execute_stops(self) -> List[Order]:
+        """执行止盈止损。
+
+        接入 guard 时必须走 guard 的审批链（propose_trade → approve_and_execute），
+        与主信号同源；否则 ``executor.execute_stop_orders`` 会**直接向券商下单**：
+        · 绕过熔断 / 频率限制 / 涨跌停停牌校验；
+        · PAPER 模式下绕开纸账户，成交不记账 → 账实分裂（幽灵持仓）。
+        未接入 guard 时保持原行为。
+        """
+        if self.guard is None:
+            return self.executor.execute_stop_orders()
+
+        guard = self.guard
+        try:
+            # 用 guard 视角的持仓（PAPER 下是纸账户，LIVE 下是券商持仓）
+            alerts = self.executor.check_stop_conditions(
+                positions=guard.positions())
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"止盈止损检查失败: {e}")
+            return []
+
+        orders: List[Order] = []
+        for a in alerts:
+            code = a.get("code", "")
+            name = a.get("name", code)
+            qty = int(a.get("quantity", 0) or 0)
+            if not code or qty <= 0:
+                continue
+            prop = guard.propose_trade(
+                code=code, name=name, side=OrderSide.SELL,
+                ai_score=50.0, agreement=1.0, strategy_tag="stop",
+                risk_exit=True, explicit_quantity=qty,
+            )
+            if prop.status == "blocked":
+                self._emit_event("risk_block", {
+                    "code": code, "name": name, "side": "sell",
+                    "reason": prop.reason or "止盈止损被安全中枢拦截",
+                })
+                continue
+            ok, _msg, order = guard.approve_and_execute(
+                prop.proposal_id, operator="auto(stop)")
+            if ok and order:
+                orders.append(order)
+                logger.warning(
+                    f"🛑 {a.get('reason', '止盈止损')}: {code} {order.quantity}股")
+        return orders
+
     # ========== 核心编排 ==========
     
     def scan_and_trade(self) -> List[dict]:
@@ -217,7 +264,7 @@ class AutoTrader:
         # 2. 止盈止损检查（优先）
         self._emit_event("scan_start", {"time": datetime.now().strftime("%H:%M:%S")})
         
-        stop_orders = self.executor.execute_stop_orders()
+        stop_orders = self._execute_stops()
         if stop_orders:
             self.stats["stops_triggered"] += len(stop_orders)
             for o in stop_orders:
@@ -470,7 +517,7 @@ class AutoTrader:
             while not self._stop_event.is_set():
                 try:
                     if self.broker.is_trading_time():
-                        stop_orders = self.executor.execute_stop_orders()
+                        stop_orders = self._execute_stops()
                         if stop_orders:
                             self.stats["stops_triggered"] += len(stop_orders)
                     else:

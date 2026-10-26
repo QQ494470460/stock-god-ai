@@ -71,6 +71,35 @@ def _running_under_pytest() -> bool:
     return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
 
+def _load_industry_map() -> Dict[str, str]:
+    """默认从 ``data/industry_map.json`` 装载行业映射。
+
+    为什么必须自动装载：行业集中度是本中枢的硬风控之一，但构造器此前的
+    ``industry_map or {}`` 意味着**调用方不传就恒为空** —— 于是
+    ``_check_portfolio_limits`` 里的行业检查被静默跳过（fail-open），
+    这条风控实际上从未生效。现在改为默认装载，缺失/损坏才退回空表并告警。
+
+    测试环境跳过：避免用例依赖生产 data/ 的当前内容（hermetic）。
+    """
+    if _running_under_pytest():
+        return {}
+    path = DATA_DIR / "industry_map.json"
+    try:
+        if not path.exists():
+            logger.warning(f"行业映射缺失（{path}）：行业集中度风控将被跳过")
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            clean = {str(k): str(v) for k, v in raw.items() if v}
+            if clean:
+                return clean
+        logger.warning("行业映射为空：行业集中度风控将被跳过")
+        return {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"行业映射载入失败（集中度风控跳过）: {e}")
+        return {}
+
+
 # ======================================================================
 # 武装模式
 # ======================================================================
@@ -862,7 +891,10 @@ class RiskSupervisor:
         self.broker = broker
         self.config = config or GuardConfig()
         self.paper_account = paper_account
-        self.industry_map = industry_map or {}
+        # 行业映射默认自动装载：不传就空表会让「行业集中度」风控静默失效
+        self.industry_map = (
+            industry_map if industry_map is not None else _load_industry_map()
+        )
 
         # 复用现有逐单风控执行器（防御纵深内层）
         self.executor = TradeExecutor(broker, risk_config)
@@ -1480,7 +1512,10 @@ class RiskSupervisor:
         if side == OrderSide.BUY:
             # 持仓只数
             active = [p for p in positions.values() if p.quantity > 0]
-            if len(active) >= self.config.max_positions:
+            # 只数上限只约束「是否新增一只有名有姓的新票」；给已有持仓加仓
+            # 并不会增加只数，若一并拦掉会让调仓/加仓永远无法把权重加到目标。
+            if (len(active) >= self.config.max_positions
+                    and code not in {p.code for p in active}):
                 return f"持仓只数已达上限 {self.config.max_positions}"
             # 行业集中度
             sector = self.industry_map.get(code, "")
@@ -1546,6 +1581,11 @@ class RiskSupervisor:
         if self.safety.mode == TradingMode.PAPER and self.paper_account:
             # 防御：执行前再跑一次信号预检（避免 propose→execute 之间状态变化）
             tick = self.broker.get_tick(code)
+            # 与 propose 阶段一致：PAPER 下券商行情不可用（本机没开 QMT 时恒如此）
+            # 要退回公开行情，否则 tick=None 会让「停牌/涨跌停」规则整段被跳过
+            # （fail-open），等于纸交易可以买停牌股。
+            if tick is None or getattr(tick, "last_price", 0) <= 0:
+                tick = self._paper_quote_fallback(code, tick)
             ok_sig, why_sig = self._precheck_signal(
                 code, name, side, prop.ai_score, prop.agreement, tick,
                 risk_exit=prop.risk_exit)
@@ -1591,10 +1631,13 @@ class RiskSupervisor:
             return False, msg, None
 
         # 实盘：复用 TradeExecutor（内层风控 + 券商下单）
+        # 必须把计划股数一并传下去：否则 executor 会按自己的通用仓位算法决定
+        # 数量，导致「部分止盈」变成整仓清仓、买入也不按计划预算。
         ok, msg, order = self.executor.execute_ai_signal(
             code=code, name=name, ai_score=prop.ai_score,
             agreement=prop.agreement, side=side,
             risk_exit=prop.risk_exit,
+            explicit_quantity=prop.quantity,
         )
         if ok and order:
             self.gate.mark_executed(proposal_id, order.order_id)

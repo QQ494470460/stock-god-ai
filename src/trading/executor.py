@@ -83,7 +83,10 @@ class TradeExecutor:
             "stop_reason": "",
         }
         self._last_order_time: Optional[datetime] = None
-        self._tracked_positions: Dict[str, Position] = {}  # 跟踪持仓用于止盈止损
+        # 移动止损用的历史最高价：code → high。
+        # 只存数字、绝不写回 Position —— 旧实现直接把高点写进持仓对象的
+        # current_price，会污染调用方（市值/盈亏），且清仓后不清除。
+        self._high_water: Dict[str, float] = {}
         self._lock = threading.Lock()
         
         # 重置每日统计
@@ -111,7 +114,14 @@ class TradeExecutor:
         alerts = []
         if positions is None:
             positions = self.broker.query_positions()
-        
+
+        # 只跟踪当前仍持有的标的：已清仓的必须立刻从高点表剔除。
+        # 不剔除的话，同一只票卖出后再买回，会拿上一轮的峰值当参照，
+        # 建仓当天就被判成「回撤」而直接触发移动止损（真实的废单来源）。
+        held = {p.code for p in positions if getattr(p, "quantity", 0) > 0}
+        for _code in [c for c in self._high_water if c not in held]:
+            self._high_water.pop(_code, None)
+
         for pos in positions:
             if pos.quantity <= 0:
                 continue
@@ -126,26 +136,26 @@ class TradeExecutor:
             # 计算盈亏比
             pnl_pct = (current_price / pos.avg_cost - 1) * 100 if pos.avg_cost > 0 else 0
             
-            # 跟踪历史最高价（移动止损用）
+            # 跟踪历史最高价（移动止损用）——单独存数字，不碰持仓对象
             key = pos.code
-            if key not in self._tracked_positions:
-                self._tracked_positions[key] = pos
-            
-            tracked_high = max(
-                self._tracked_positions[key].current_price,
-                current_price,
-            )
-            self._tracked_positions[key].current_price = tracked_high
+            tracked_high = max(float(self._high_water.get(key, 0.0) or 0.0), current_price)
+            self._high_water[key] = tracked_high
             
             drawdown = (current_price / tracked_high - 1) * 100 if tracked_high > 0 else 0
-            
+
+            # 可卖量必须过 T+1：当日买入的份额当日不可卖，止盈止损也不能例外
+            # （否则实盘必废单，纸交易会在 sell 里被二次拦截、白跑一轮）。
+            qty = sellable_quantity(pos)
+            if qty <= 0:
+                continue
+
             # 止损判断
             if pnl_pct <= self.config.stop_loss_pct:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"止损 {pnl_pct:.1f}%",
                     "action": "sell", "pnl_pct": pnl_pct,
-                    "quantity": pos.available,
+                    "quantity": qty,
                 })
             # 止盈判断
             elif pnl_pct >= self.config.stop_profit_pct:
@@ -153,7 +163,7 @@ class TradeExecutor:
                     "code": pos.code, "name": pos.name,
                     "reason": f"止盈 {pnl_pct:.1f}%",
                     "action": "sell", "pnl_pct": pnl_pct,
-                    "quantity": pos.available,
+                    "quantity": qty,
                 })
             # 移动止损
             elif pnl_pct > 0 and drawdown <= self.config.trailing_stop_pct:
@@ -161,7 +171,7 @@ class TradeExecutor:
                     "code": pos.code, "name": pos.name,
                     "reason": f"移动止损 回撤{drawdown:.1f}% (最高+{(tracked_high/pos.avg_cost-1)*100:.1f}%)",
                     "action": "sell", "pnl_pct": pnl_pct,
-                    "quantity": pos.available,
+                    "quantity": qty,
                 })
         
         return alerts
@@ -209,6 +219,7 @@ class TradeExecutor:
         side: OrderSide,
         max_amount: Optional[float] = None,
         risk_exit: bool = False,
+        explicit_quantity: Optional[int] = None,
     ) -> Tuple[bool, str, Optional[Order]]:
         """基于AI信号执行交易
         
@@ -221,6 +232,9 @@ class TradeExecutor:
             max_amount: 最大买入金额（元），None则自动计算
             risk_exit: 风控性离场（止盈止损/调仓清仓）。为 True 时卖出不受
                 「AI评分仍高不卖」约束，让止损纪律优先于模型观点。
+            explicit_quantity: 交易计划给定的目标股数。提供时按计划股数封顶，
+                避免「部分止盈」被执行成整仓清仓（旧实现完全丢弃计划数量）。
+                硬约束仍然生效：卖出 ≤ T+1 可卖量、买入 ≤ 仓位/现金上限。
         
         Returns:
             (success, message, order)
@@ -280,6 +294,10 @@ class TradeExecutor:
             return False, risk_result.reason, None
         
         quantity = risk_result.adjusted_quantity
+        # 计划股数封顶：不改硬约束（卖出仍 ≤ T+1 可卖、买入仍 ≤ 仓位/现金），
+        # 只把「想下多少」从通用算法收敛到计划值。否则部分止盈会被执行成清仓。
+        if explicit_quantity is not None and int(explicit_quantity) > 0:
+            quantity = min(quantity, (int(explicit_quantity) // 100) * 100)
         if quantity < 100:
             return False, f"❌ 计算下单量不足1手: {quantity}股", None
         
