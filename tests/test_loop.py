@@ -604,6 +604,32 @@ def test_settle_missing_baseline_backfills_not_zeroes_pnl(monkeypatch, tmp_path)
     assert loop._day_start_equity[today] == 900_000.0
 
 
+def test_settle_markdown_flags_halted_and_bad_equity():
+    """日报必须自己说清「当日是否熔断 / 权益是否可信」。
+
+    背景：2026-10-22 起连续熔断，而结算被熔断分支跳过 → 这几天**没有任何文件**
+    记录「系统是停摆的」。日报是用户唯一会主动翻的产物，必须把这两件事写在脸上，
+    否则一份格式完好的报告看起来就像「今天没行情，正常」。
+    """
+    base = {
+        "date": "2026-10-26", "settled_at": "2026-10-26T15:10:00",
+        "state": "settled", "guard_mode": "paper", "plan_date": "2026-10-26",
+        "equity": 1_000_000.0, "day_start_equity": 1_000_000.0,
+        "day_pnl": 0.0, "day_pnl_pct": 0.0, "equity_ok": True,
+        "cash": 1_000_000.0, "market_value": 0.0, "n_positions": 0,
+        "positions": [], "trades": [],
+        "stats": {"stops": 0, "intents": 0, "executed": 0, "blocked": 0},
+    }
+    normal = TradingLoop._settle_markdown(dict(base))
+    assert "熔断" not in normal and "取不到" not in normal
+
+    halted = TradingLoop._settle_markdown({**base, "state": "halted"})
+    assert "处于熔断态" in halted
+
+    bad = TradingLoop._settle_markdown({**base, "equity_ok": False})
+    assert "账户快照取不到" in bad
+
+
 # ======================================================================
 # 线程生命周期
 # ======================================================================
