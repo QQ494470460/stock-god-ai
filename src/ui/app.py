@@ -1697,6 +1697,132 @@ def load_credibility_snapshot() -> dict:
     }
 
 
+def _fmt_money_short(v) -> str:
+    """把元格式化成「亿 / 万」短标签（看板表格用）。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "N/A"
+    if x >= 1e8:
+        return f"{x / 1e8:.2f}亿"
+    if x >= 1e4:
+        return f"{x / 1e4:.1f}万"
+    return f"{x:,.0f}"
+
+
+def load_portfolio_risk_view(account_path=None, data_dir=None) -> dict:
+    """组合风险视图：1 日 VaR / 平均相关性 / 各标的 ADV 单笔上限。
+
+    口径要点：VaR 的权重是「市值 / 总资产」，不是「市值 / 持仓合计」。
+    低仓位本身就是低风险，归一化到持仓合计会把「只用 18% 仓位」误算成满仓风险。
+
+    fail-safe：任何异常返回 ``{}``，看板绝不因风险计算失败而崩；只读，不写状态。
+    """
+    try:
+        from pathlib import Path as _P
+
+        try:
+            from config.settings import ROOT_DIR as _ROOT
+        except Exception:  # noqa: BLE001
+            _ROOT = _P(__file__).resolve().parent.parent.parent
+        root = _P(_ROOT)
+
+        acct_path = (_P(account_path) if account_path
+                     else root / "data" / "paper_account.json")
+        acc = _status_read_json(acct_path)
+        if not isinstance(acc, dict):
+            return {}
+        holdings = acc.get("holdings") or {}
+        if not isinstance(holdings, dict) or not holdings:
+            return {}
+
+        cash = float(acc.get("cash") or 0)
+        codes, values = [], []
+        for code, h in holdings.items():
+            if not isinstance(h, dict):
+                continue
+            v = float(h.get("market_value") or 0)
+            if v <= 0:
+                v = float(h.get("quantity") or 0) * float(h.get("last_price") or 0)
+            if v > 0:
+                codes.append(str(code))
+                values.append(v)
+        mv = sum(values)
+        equity = cash + mv
+        if equity <= 0 or len(codes) == 0:
+            return {}
+
+        from src.trading.risk_model import PortfolioRiskMonitor
+        from src.trading.liquidity import AdvProvider, PARTICIPATION_DEFAULT
+
+        monitor = (PortfolioRiskMonitor(data_dir=data_dir)
+                   if data_dir else PortfolioRiskMonitor())
+        advp = AdvProvider(data_dir=data_dir) if data_dir else AdvProvider()
+
+        res = monitor.var_pct(codes, [v / equity for v in values])
+
+        cap = 0.025
+        try:
+            from src.trading.guard import GuardConfig
+            gp = root / "config" / "trading_guard.yaml"
+            if gp.exists():
+                cap = float(GuardConfig.from_yaml(str(gp)).max_portfolio_var_pct)
+        except Exception:  # noqa: BLE001
+            pass
+
+        rows = []
+        for c, v in zip(codes, values):
+            a = advp.adv_amount(c)
+            rows.append({
+                "code": c,
+                "weight": v / equity,
+                "adv": a,
+                "cap": (advp.max_order_value(c, PARTICIPATION_DEFAULT)
+                        if a else None),
+            })
+        return {
+            "equity": equity,
+            "invested_pct": mv / equity,
+            "var_pct": float(res[0]) if res else None,
+            "avg_corr": float(res[1]) if res else None,
+            "var_cap": cap,
+            "rows": rows,
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def render_portfolio_risk_panel() -> None:
+    """🛡️ 组合风险：把「相关性 VaR + 流动性上限」摊在看板上。"""
+    st.markdown(
+        '<div class="section-title">🛡️ 组合风险 · VaR 与流动性</div>',
+        unsafe_allow_html=True,
+    )
+    view = load_portfolio_risk_view()
+    if not view or not view.get("rows"):
+        st.caption("暂无持仓或历史数据，组合风险视图不可用。")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    var_pct = view.get("var_pct")
+    c1.metric("组合 1日95% VaR", f"{var_pct * 100:.2f}%" if var_pct is not None else "N/A")
+    corr = view.get("avg_corr")
+    c2.metric("平均相关性", f"{corr:.2f}" if corr is not None else "N/A")
+    c3.metric("仓位 / 总资产", f"{view['invested_pct'] * 100:.0f}%")
+
+    lines = ["| 标的 | 权重 | 近20日ADV | 单笔上限(1%) |", "|---|---|---|---|"]
+    for r in view["rows"]:
+        lines.append(
+            f"| {r['code']} | {r['weight'] * 100:.1f}% | "
+            f"{_fmt_money_short(r['adv'])} | {_fmt_money_short(r['cap'])} |"
+        )
+    st.markdown("\n".join(lines))
+    st.caption(
+        f"VaR 口径：参数法 95% 单尾、占总资产；上限 {view.get('var_cap', 0) * 100:.1f}%。"
+        "超上限时 guard 会按比例降低**新开仓**强度（不清仓）。"
+    )
+
+
 def render_credibility_panel() -> None:
     """🛡️ 策略信誉引擎：把每个策略标签的「方向一致性(EWMA) → 权重」表现可视化。
 
@@ -4028,8 +4154,8 @@ elif page == "📐 量化模型":
         badges=[("violet", "Quant Engine")],
     )
 
-    quant_tab1, quant_tab2, quant_tab3, quant_tab4 = st.tabs(
-        ["📊 多因子评分", "🔄 均值回归", "⚖️ 风险平价", "🛡️ 策略信誉"]
+    quant_tab1, quant_tab2, quant_tab3, quant_tab4, quant_tab5 = st.tabs(
+        ["📊 多因子评分", "🔄 均值回归", "⚖️ 风险平价", "🛡️ 策略信誉", "🧮 组合风险"]
     )
 
     # ========== Tab 1: 多因子评分 ==========
@@ -4291,6 +4417,9 @@ elif page == "📐 量化模型":
     # ========== Tab 4: 策略信誉引擎 ==========
     with quant_tab4:
         render_credibility_panel()
+
+    with quant_tab5:
+        render_portfolio_risk_panel()
 
 
 # ========== ⚙️ 设置页 ==========

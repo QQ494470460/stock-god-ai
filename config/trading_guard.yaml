@@ -31,6 +31,21 @@ max_sector_pct: 0.30                # 单一行业最大集中度(占总资产�
 min_order_interval_sec: 2.0          # 两笔委托最小间隔(秒)
 max_orders_per_minute: 10           # 每分钟最大委托数
 
+# ---- 执行约束（流动性 / 单笔风险预算 / 当日换手）----
+# 仓位比例只回答「最多放多少」，不回答「这笔能不能吃掉」。
+execution_limits_enabled: true
+max_participation_rate: 0.01        # 单笔金额 ≤ 20日平均成交额 × 1%
+max_risk_per_trade_pct: 0.005       # 单笔潜在亏损 ≤ 总资产 × 0.5%
+risk_budget_stop_pct: 0.05          # 换算用止损距离（对应 -5% 止损线）
+max_daily_turnover_pct: 0.30        # 当日买入总额 ≤ 总资产 × 30%
+
+# ---- 组合尾部风险（相关性 VaR）----
+# 名义分散 ≠ 风险分散：20 只同涨同跌的票，风险约等于 1 只加杠杆。
+var_monitor_enabled: true
+max_portfolio_var_pct: 0.025         # 组合 1 日 95% VaR 上限（占总资产 2.5%）
+var_confidence_z: 1.65               # 95% 单尾
+var_scale_floor: 0.40                # 超预算时最低缩到 40%（连续降仓，不清仓）
+
 # ---- 仓位规模 ----
 # 可选: fixed_fractional | volatility_target | kelly
 sizing_method: volatility_target     # 2026-10-26 启用：高波动买得少（vol 未知时自动降级为固定比例）
