@@ -187,3 +187,52 @@ def test_propose_trade_applies_participation_cap(tmp_path):
     )
     assert prop.status != "blocked", prop.reason
     assert prop.quantity == 1000
+
+
+# ----------------------------------------------------------------------
+# 4. 行业集中度必须把「本次下单额」算进去
+# ----------------------------------------------------------------------
+def test_sector_limit_includes_order_notional(tmp_path):
+    """行业集中度预检只看已有持仓，必须在下单量定下来后带金额复核一次。
+
+    回归背景：``_check_portfolio_limits`` 在第 4 步被调用，那时仓位还没算，
+    ``est_amount`` 恒为 0 —— 它只能比「已有持仓占多少」。于是「行业已占 29%、
+    上限 30%」时，一笔把该行业直接顶到 34% 的大单照样放行：单票上限管的是
+    **单只**，不是行业，两者没有互相兜住。
+    """
+    g = _guard(tmp_path, adv=None, max_sector_pct=0.30,
+               max_single_position_pct=0.50, max_positions=10)
+    g.industry_map = {"600000": "银行", "601988": "银行"}
+    g._positions = lambda: [Position(
+        code="600000", name="600000", quantity=29_000, available=29_000,
+        avg_cost=10.0, current_price=10.0, market_value=290_000.0,
+        pnl=0.0, pnl_pct=0.0, today_quantity=0,
+    )]
+
+    prop = g.propose_trade(
+        code="601988", name="601988", side=OrderSide.BUY,
+        ai_score=90.0, agreement=1.0, strategy_tag="ai",
+        explicit_quantity=5_000,          # 5 万 → 银行将从 29% 升到 34%
+    )
+    assert prop.status == "blocked", f"行业会超限却放行了: qty={prop.quantity}"
+    assert "银行" in prop.reason
+
+
+def test_sector_limit_allows_order_within_headroom(tmp_path):
+    """还有额度时必须放行 —— 复核不能变成「碰到上限就一律不买」。"""
+    g = _guard(tmp_path, adv=None, max_sector_pct=0.30,
+               max_single_position_pct=0.50, max_positions=10)
+    g.industry_map = {"600000": "银行", "601988": "银行"}
+    g._positions = lambda: [Position(
+        code="600000", name="600000", quantity=20_000, available=20_000,
+        avg_cost=10.0, current_price=10.0, market_value=200_000.0,
+        pnl=0.0, pnl_pct=0.0, today_quantity=0,
+    )]
+
+    prop = g.propose_trade(
+        code="601988", name="601988", side=OrderSide.BUY,
+        ai_score=90.0, agreement=1.0, strategy_tag="ai",
+        explicit_quantity=5_000,          # 20% + 5万 = 25% < 30%
+    )
+    assert prop.status != "blocked", prop.reason
+    assert prop.quantity == 5_000

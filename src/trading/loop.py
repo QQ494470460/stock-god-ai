@@ -765,11 +765,72 @@ class TradingLoop:
             return False
         return True
 
+    def _maybe_settle(self, now: datetime, account, positions, report: TickReport) -> bool:
+        """收盘结算的唯一入口：**任何** return 分支之前都必须先过它。
+
+        历史坑：结算原本只挂在 ④ 段，而 ③ 熔断分支在它之前就 ``return`` 了。
+        熔断不是「一 tick 的事」——它可能连续多天平息不下来，于是这些天的
+        结算报告一份都不落盘：日报断更、绩效曲线缺段、进化面板没有当日样本，
+        而这些恰恰是**判断系统是否还活着**的证据。结算纯记账，不涉及下单，
+        没有任何理由跟着风控一起冻结。
+
+        幂等：``_should_settle`` 内部有「今日报告已落盘即视为已结算」兜底，
+        熔断分支与 ④ 段各调一次也不会重复结算。
+        """
+        if not self._should_settle(now):
+            return False
+        try:
+            self._prices_for([p.code for p in positions])
+            prices = dict(self._price_cache)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"结算取价失败（按持仓现价结算）: {e}")
+            prices = {}
+        try:
+            self._settle(account, positions, prices, report)
+        except Exception as e:  # noqa: BLE001
+            # 结算异常绝不能把闭环打挂：报告写失败也要让状态机继续走，
+            # 否则第二天 _should_settle 会再次尝试（文件不存在），形成死循环重试。
+            logger.error(f"收盘结算失败（已跳过，下个 tick 重试）: {e}")
+            return False
+        self._set_state(LoopState.SETTLED)
+        report.state = self._state.value
+        self._last_report = report
+        return True
+
     def _settle(self, account, positions, prices, report: TickReport):
         today = _today().strftime("%Y-%m-%d")
-        equity = float(account.total_asset) if account else 0.0
-        start_eq = self._day_start_equity.get(today, equity)
-        day_pnl = equity - start_eq
+        # 账户快照的两种失效方式都必须挡住，否则报告会写出**假数据**：
+        #   · account 为 None（券商/纸账户读取失败）→ 旧实现 equity=0，
+        #     而 start_eq 是真实基线 ¥4.7M ⇒ day_pnl=-4.7M、day_pnl_pct=-100%，
+        #     日报渲染出来就是「今日爆仓」，用户只能靠翻代码才知道是取数失败。
+        #   · 当日基线缺失 → 旧实现回退到当前权益 ⇒ day_pnl 恒为 0，
+        #     把真实亏损静默抹平（比报错更危险：看起来一切正常）。
+        equity_ok = bool(account) and float(getattr(account, "total_asset", 0) or 0) > 0
+        raw_equity = float(account.total_asset) if equity_ok else 0.0
+
+        start_eq = self._day_start_equity.get(today)
+        try:
+            start_eq = float(start_eq) if start_eq is not None else None
+        except (TypeError, ValueError):
+            start_eq = None
+        if not start_eq or start_eq <= 0:
+            # 基线缺失：用当刻权益补建，并**落盘**，让同日后续 tick 不再走兜底。
+            start_eq = raw_equity
+            if raw_equity > 0:
+                self._day_start_equity[today] = raw_equity
+                try:
+                    self._save_runtime()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if equity_ok:
+            equity = raw_equity
+            day_pnl = equity - start_eq
+        else:
+            # 取不到账户 → 权益按基线计（当天视为「无变化」），并在报告里显式标注。
+            # 宁可写 0，也不能写一个看起来像爆仓的负数。
+            equity = float(start_eq or 0.0)
+            day_pnl = 0.0
 
         # 成交记录：纸交易读纸账户，实盘读结构化日志
         trades: List[dict] = []
@@ -794,6 +855,7 @@ class TradingLoop:
             "plan_date": self.plan.plan_date if self.plan else "",
             "equity": round(equity, 2),
             "day_start_equity": round(start_eq, 2),
+            "equity_ok": equity_ok,   # False = 账户快照取不到，权益为占位值
             "day_pnl": round(day_pnl, 2),
             "day_pnl_pct": round(day_pnl / start_eq * 100, 2) if start_eq else 0.0,
             "cash": round(float(account.available_cash), 2) if account else 0.0,
@@ -842,8 +904,11 @@ class TradingLoop:
             "stops": 0, "intents": 0, "executed": 0, "blocked": 0,
         }
         self._day_stats_key = today
-        report.note = (f"✅ 已收盘结算：当日盈亏 ¥{day_pnl:,.2f} "
-                       f"({snapshot['day_pnl_pct']:+.2f}%)")
+        # 追加而非覆盖：熔断分支现在也会走到这里，若直接覆盖，「🛑 已熔断」
+        # 这条提示就从当日最后一份 tick 报告里消失了 —— 而熔断恰恰是最该被看见的。
+        _settle_note = (f"✅ 已收盘结算：当日盈亏 ¥{day_pnl:,.2f} "
+                        f"({snapshot['day_pnl_pct']:+.2f}%)")
+        report.note = f"{report.note} | {_settle_note}" if report.note else _settle_note
 
         # 推送
         if self.config.notify:
@@ -1030,19 +1095,19 @@ class TradingLoop:
                                    f"熔断原因：{self.guard.safety._state.halt_reason}\n"
                                    f"时间：{now.isoformat(timespec='seconds')}",
                                    {"halted": True})
+                    # ★ 熔断期间仍必须结算 —— 这个 early-return 现在会越过 ④ 段，
+                    # 而熔断可以持续**多天**（实测 2026-10-22 起因回撤熔断，之后
+                    # data/loop_reports/ 一直停在 10-21，日报、绩效快照、进化面板
+                    # 的当日样本全部断更）。结算是记账，不是交易：它不该被风控冻结。
+                    if self._maybe_settle(now, account, positions, report):
+                        return report
                     self._last_report = report
                     return report
                 # 未熔断 → 允许下次再触发时重新推送（自愈/手动恢复后重熔断会再报一次）
                 self._halt_notified = False
 
             # --- ④ 收盘结算（不受交易时段限制） ---
-            if self._should_settle(now):
-                self._prices_for([p.code for p in positions])
-                prices = dict(self._price_cache)
-                self._settle(account, positions, prices, report)
-                self._set_state(LoopState.SETTLED)
-                report.state = self._state.value
-                self._last_report = report
+            if self._maybe_settle(now, account, positions, report):
                 return report
 
             # --- ⑤ 非交易时段：待命 ---

@@ -242,6 +242,30 @@ class PaperAccount:
             if px > 0:
                 h["market_value"] = round(qty * px, 2)
 
+            # T+1 字段不变量：0 <= available <= quantity，0 <= today_quantity <= quantity。
+            # 载入与落盘都走这里，所以任何来源（旧存档、手工编辑、外部注入、
+            # taskkill 打断的半截写入）造成的越界都会在下一个口子上被拉正。
+            #
+            # ⚠️ 越界不是「难看」而是「致命」：``sellable_quantity()`` 算的是
+            # ``max(0, min(available, quantity - today, quantity))``，available 为负
+            # 会被夹成 0 ⇒ 该标的当天 sellable=0 ⇒ 卖出在**预检阶段**就被
+            # 「T+1 锁仓」拦下（连止损都发不出去），且只有次日 reset 才自愈。
+            # 所以越界时不能简单夹到 0，而要按「quantity 是权威、今日买入量次之」
+            # 重建：available = quantity - today_quantity。
+            try:
+                _tq = int(h.get("today_quantity", 0) or 0)
+            except (TypeError, ValueError):
+                _tq = 0
+            _tq = max(0, min(_tq, qty))
+            try:
+                _avail = int(h.get("available", qty) or 0)
+            except (TypeError, ValueError):
+                _avail = qty
+            if _avail < 0 or _avail > qty:
+                _avail = qty - _tq
+            h["today_quantity"] = _tq
+            h["available"] = _avail
+
     def _read_json(self, path):
         """读 JSON（崩溃安全）：主文件损坏/截断时自动回滚 .bak。
 
@@ -615,10 +639,27 @@ class PaperAccount:
             
             # 更新持仓
             h["quantity"] -= quantity
-            h["available"] -= quantity
+            # available 必须夹在 [0, quantity]：历史存档 / 外部注入的 available
+            # 可能小于「quantity - today_quantity」，直接相减会变负；而
+            # ``sellable_quantity()`` 是 ``max(0, min(avail, qty-today, qty))``，
+            # 负值会被夹成 0 ⇒ 该标的**当天再也卖不掉**（包括止损），UI 还会显示
+            # 「可卖 -50 股」。这是一条静默失效链：不报错、不告警，只是从此不动。
+            try:
+                _avail = int(h.get("available", 0) or 0) - quantity
+            except (TypeError, ValueError):
+                _avail = 0
+            h["available"] = max(0, min(_avail, int(h["quantity"])))
             if h["quantity"] <= 0:
                 del self.holdings[code]
             else:
+                # 剩余仓位按**盘口价**重新标价（不是成交价：mark 用的是市场价，
+                # 滑点属于已实现的交易成本，已体现在现金里）。同时必须同步
+                # ``last_price`` —— ``_normalize_holdings`` 会按 quantity×last_price
+                # 重算市值，若只改 market_value，本次标价会在落盘时被
+                # 陈旧的 last_price 覆盖掉。看板手动卖出（不经 loop 的
+                # mark_to_market）正因此会把「卖出那一刻的标价」丢掉，
+                # 导致总资产/收益率继续按隔夜价算。
+                h["last_price"] = price
                 h["market_value"] = h["quantity"] * price
             
             # 回笼资金

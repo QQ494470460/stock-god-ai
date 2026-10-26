@@ -165,8 +165,16 @@ def compute_rebalance_orders(
             if qty <= 0:
                 logger.debug(f"调仓：{pos.code} 无可卖股（T+1 锁仓），本轮跳过")
                 continue
+            # 退出纪律 > 碎单过滤：跌出目标组合的仓位**必须走干净**。
+            # 旧实现在这里套用 min_trade_amount，于是「100 股 × ¥30 = ¥3000」
+            # 这类小仓位永远不满足最小金额 → 永久滞留在组合里，占着持仓名额、
+            # 每天被重新算一遍却从不执行，且因不在目标组合里也不会再被加仓，
+            # 只能等它自己涨过阈值（等于把纪律交给了运气）。
             if qty * price < min_trade_amount:
-                continue
+                logger.debug(
+                    f"调仓：{pos.code} 清仓金额 {qty * price:.0f} 元低于碎单阈值，"
+                    f"仍按退出纪律执行清仓"
+                )
             sells.append(RebalanceIntent(
                 code=pos.code, name=pos.name or pos.code, side=OrderSide.SELL,
                 quantity=qty, price=round(price, 3),

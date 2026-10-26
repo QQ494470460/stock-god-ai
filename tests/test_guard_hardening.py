@@ -340,3 +340,46 @@ def test_risk_budget_uses_static_stop_when_atr_off(tmp_path):
                risk_budget_stop_pct=0.05)
     qty, _ = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
     assert qty == 10_000        # 5% 止损 → 5000/(10*0.05)
+
+
+# ----------------------------------------------------------------------
+# 5. 行业映射缺失时集中度检查不能被整段跳过
+# ----------------------------------------------------------------------
+def test_unknown_sector_is_bucketed_not_skipped(tmp_path):
+    """映射查不到的标的必须归入同一个「未知行业」桶继续受约束。
+
+    回归背景（2026-10-26 实测）：``sector = industry_map.get(code, "")`` 之后
+    ``if sector:`` —— 查不到就整段放行（fail-open）。当时 industry_map 2616 条
+    只覆盖部分市场：当日 4 只选股里 603688 缺、2 只持仓里 300037 也缺，
+    这些买入完全不受集中度约束，而「不知道它是什么行业」本该按最保守假设处理。
+    """
+    g = _guard(tmp_path, max_sector_pct=0.30)
+    acct = _account(1_000_000.0)
+    positions = {"600000": _pos(40_000, price=10.0)}      # 未知行业已占 40%
+
+    why = g._check_portfolio_limits("300111", OrderSide.BUY, acct, positions)
+    assert why, "映射缺失时集中度检查被跳过了（fail-open）"
+    assert "未知行业" in why
+
+
+def test_unknown_sector_below_cap_still_passes(tmp_path):
+    """归桶不等于一刀切：未知行业合计仍在阈值内时必须放行。"""
+    g = _guard(tmp_path, max_sector_pct=0.30)
+    acct = _account(1_000_000.0)
+    positions = {"600000": _pos(10_000, price=10.0)}      # 10% < 30%
+    assert g._check_portfolio_limits("300111", OrderSide.BUY, acct, positions) == ""
+
+
+def test_known_sector_checked_against_same_sector_only(tmp_path):
+    """有映射时仍按「同行业」聚合，不会把不同行业混成一个桶。"""
+    g = _guard(tmp_path, max_sector_pct=0.30)
+    g.industry_map = {"600000": "银行", "300111": "医药"}
+    acct = _account(1_000_000.0)
+    positions = {"600000": _pos(40_000, price=10.0)}      # 银行 40%
+    # 买医药：与银行不同桶 → 放行
+    assert g._check_portfolio_limits("300111", OrderSide.BUY, acct, positions) == ""
+    # 再买银行：同桶已 40% ≥ 30% → 拦截
+    why = g._check_portfolio_limits("601988", OrderSide.BUY, acct, positions)
+    assert why == "" or "银行" in why   # 601988 无映射 → 进未知桶，不受银行约束
+    why2 = g._check_portfolio_limits("600000", OrderSide.BUY, acct, positions)
+    assert "银行" in why2

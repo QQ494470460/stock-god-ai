@@ -74,6 +74,11 @@ def _running_under_pytest() -> bool:
     return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
 
+# 行业映射缺失时的兜底桶名。所有「在 industry_map 里查不到」的标的都归到这里，
+# 让集中度检查对它们**依然生效**（fail-safe），而不是整段跳过（fail-open）。
+UNKNOWN_SECTOR = "__UNKNOWN__"
+
+
 def _load_industry_map() -> Dict[str, str]:
     """默认从 ``data/industry_map.json`` 装载行业映射。
 
@@ -1566,6 +1571,24 @@ class RiskSupervisor:
             })
             return prop
 
+        # 5.6 组合约束复核（带本次成交额）
+        # 第 4 步只能看「已有持仓」：那时 est_amount 还是 0，行业检查退化成
+        # 「已占多少」。于是「行业已占 29%、上限 30%」时，一笔把它顶到 50% 的
+        # 大单照样放行 —— 单票上限管的是单只，不是行业。这里用真实下单额再核一次。
+        if side == OrderSide.BUY and qty > 0:
+            block2 = self._check_portfolio_limits(
+                code, side, account, positions, delta_value=qty * price)
+            if block2:
+                prop = self.gate.create(
+                    code=code, name=name, side=side.value, price=price,
+                    quantity=0, est_amount=0.0, ai_score=ai_score,
+                    agreement=agreement, signal_strength=signal_strength,
+                    strategy_tag=strategy_tag, risk_exit=risk_exit,
+                )
+                self.gate.mark_blocked(prop, block2)
+                self._emit("risk_block", {"code": code, "reason": block2})
+                return prop
+
         prop = self.gate.create(
             code=code, name=name, side=side.value, price=price,
             quantity=qty, est_amount=qty * price, ai_score=ai_score,
@@ -1656,9 +1679,15 @@ class RiskSupervisor:
 
     def _check_portfolio_limits(
         self, code: str, side: OrderSide, account: AccountInfo,
-        positions: Dict[str, Position],
+        positions: Dict[str, Position], delta_value: float = 0.0,
     ) -> str:
-        """返回 "" 表示通过；否则返回拦截原因"""
+        """返回 "" 表示通过；否则返回拦截原因。
+
+        ``delta_value``：本次委托的预估成交额。第 4 步预检时还不知道下单量
+        （sizing 在后面），只能拿 0 去比「已有持仓」；于是「行业已占 29%、
+        上限 30%」时一笔能把它顶到 50% 的大单照样放行 —— 事后复核必须把这笔
+        算进去，见 ``propose_trade`` 的 5.6。
+        """
         if side == OrderSide.BUY:
             # 持仓只数
             active = [p for p in positions.values() if p.quantity > 0]
@@ -1668,17 +1697,43 @@ class RiskSupervisor:
                     and code not in {p.code for p in active}):
                 return f"持仓只数已达上限 {self.config.max_positions}"
             # 行业集中度
-            sector = self.industry_map.get(code, "")
-            if sector:
-                sector_val = sum(
-                    p.market_value for p in active
-                    if self.industry_map.get(p.code, "") == sector
-                )
-                # 估算新增
-                cap = account.total_asset * self.config.max_sector_pct
-                if sector_val >= cap:
-                    return f"行业 {sector} 集中度已达上限 {self.config.max_sector_pct*100:.0f}%"
+            # 未知行业归入**同一个**「未知」桶，而不是跳过检查。
+            # 旧实现 ``sector = industry_map.get(code, "")`` 后 ``if sector:``
+            # —— 映射缺失就直接放行（fail-open）。实测 2026-10-26：
+            # industry_map 2616 条只覆盖部分市场，当日 4 只选股里 603688 缺、
+            # 2 只持仓里 300037 也缺 ⇒ 这两笔买入完全不受行业集中度约束，
+            # 而「我不知道它是什么行业」恰恰应该按最保守的假设处理。
+            sector = self.industry_map.get(code, "") or UNKNOWN_SECTOR
+            if sector == UNKNOWN_SECTOR:
+                self._warn_missing_sector([code])
+            sector_val = sum(
+                p.market_value for p in active
+                if (self.industry_map.get(p.code, "") or UNKNOWN_SECTOR) == sector
+            )
+            # 估算新增：delta_value = 本次委托金额（预检时=0，复核时=实际下单额）
+            cap = account.total_asset * self.config.max_sector_pct
+            if sector_val + max(0.0, float(delta_value or 0.0)) >= cap:
+                label = "未知行业(映射缺失)" if sector == UNKNOWN_SECTOR else f"行业 {sector}"
+                return f"{label} 集中度已达上限 {self.config.max_sector_pct*100:.0f}%"
         return ""
+
+    def _warn_missing_sector(self, codes: List[str]) -> None:
+        """行业映射缺失一次性告警（同一代码只报一次，避免每 tick 刷日志）。"""
+        try:
+            bucket = getattr(self, "_missing_sector_warned", None)
+            if bucket is None:
+                bucket = set()
+                self._missing_sector_warned = bucket
+        except Exception:  # noqa: BLE001
+            return
+        fresh = [c for c in codes if c and c not in bucket]
+        if not fresh:
+            return
+        bucket.update(fresh)
+        logger.warning(
+            f"⚠️ 行业映射缺失 {len(fresh)} 只（{', '.join(fresh[:8])}）→ 已归入"
+            f"「未知行业」桶参与集中度检查。补全请跑 scripts/build_industry_map.py"
+        )
 
     def _portfolio_var_scale(self, account, positions) -> Tuple[float, dict]:
         """按持仓相关性估组合 1 日 VaR，超预算则给出新开仓缩放系数。

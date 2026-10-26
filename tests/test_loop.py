@@ -9,6 +9,7 @@
 """
 import sys
 import copy
+import json
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -519,6 +520,88 @@ def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, 
     assert snap["stats"]["blocked"] == n_ticks, snap["stats"]
     # 结算后当日累计已清零
     assert loop._day_stats["blocked"] == 0, loop._day_stats
+
+
+# ======================================================================
+# 结算路径的三种「静默失效」
+# ======================================================================
+
+def test_halted_loop_still_settles(monkeypatch, tmp_path, force_trading_time):
+    """熔断态也必须收盘结算。
+
+    回归背景（2026-10-26 实测）：``_tick_impl`` 的熔断分支在 ④ 收盘结算**之前**
+    就 ``return``，于是熔断期间的结算被整体跳过。而熔断不是一 tick 的事 ——
+    实测从 10-22 持续到 10-26，``data/loop_reports/`` 一直停在 10-21：
+    日报断更、绩效曲线缺段、进化面板没有当日样本，全都悄无声息。
+    结算是记账不是交易，不该被风控冻结。
+    """
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, notify=False))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.guard.kill_switch("测试熔断")
+
+    monkeypatch.setattr(loop, "_should_settle", lambda now: True)
+    rep = loop.tick()
+
+    files = list((Path(tmp_path) / "loop_reports").glob("loop_report_*.json"))
+    assert files, "熔断态下没有生成结算报告 —— 熔断把记账一起冻住了"
+    snap = json.loads(files[0].read_text(encoding="utf-8"))
+    assert snap["state"] == "halted"          # 报告如实记录「当时是熔断态」
+    assert "结算" in rep.note
+    assert "熔断" in rep.note                  # 熔断提示不被结算覆盖
+
+
+def test_settle_missing_account_does_not_fake_total_loss(monkeypatch, tmp_path):
+    """账户快照取不到时，绝不能写出「当日 -100%」。
+
+    旧实现 ``equity = account.total_asset if account else 0.0``，而 ``start_eq``
+    是真实基线：account 为 None ⇒ day_pnl = -4.7M、day_pnl_pct = -100%，
+    日报渲染出来就是「今日爆仓」。取数失败被伪装成灾难，比报错危险得多。
+    """
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False, notify=False))
+    today = loopmod._today().strftime("%Y-%m-%d")
+    loop._day_start_equity[today] = 1_000_000.0
+
+    rep = TickReport(at="15:10:00", state=loop.state.value)
+    loop._settle(None, [], {}, rep)
+
+    snap = json.loads(
+        (Path(tmp_path) / "loop_reports" / f"loop_report_{today.replace('-', '')}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert snap["equity_ok"] is False
+    assert snap["day_pnl"] == 0.0, f"账户缺失却算出当日盈亏 {snap['day_pnl']}"
+    assert snap["day_pnl_pct"] == 0.0
+    assert snap["equity"] == snap["day_start_equity"]
+
+
+def test_settle_missing_baseline_backfills_not_zeroes_pnl(monkeypatch, tmp_path):
+    """当日基线缺失时应**补建并落盘**，而不是静默把当日盈亏压成 0。
+
+    旧实现 ``start_eq = self._day_start_equity.get(today, equity)`` 取不到就
+    退回当前权益 ⇒ day_pnl 恒为 0，真实亏损被抹平（看起来一切正常）。
+    """
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+
+    b = FakeBroker(total=900_000.0, cash=900_000.0)
+    loop = mk_loop(broker=b, cfg=LoopConfig(auto_build_plan=False, notify=False))
+    today = loopmod._today().strftime("%Y-%m-%d")
+    loop._day_start_equity.pop(today, None)
+
+    rep = TickReport(at="15:10:00", state=loop.state.value)
+    loop._settle(b.query_account(), [], {}, rep)
+
+    snap = json.loads(
+        (Path(tmp_path) / "loop_reports" / f"loop_report_{today.replace('-', '')}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert snap["equity_ok"] is True
+    assert snap["day_start_equity"] == snap["equity"]
+    # 基线已被补建并落到运行态文件，同日后续 tick 不再走兜底
+    assert loop._day_start_equity[today] == 900_000.0
 
 
 # ======================================================================

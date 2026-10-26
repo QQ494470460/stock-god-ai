@@ -463,3 +463,83 @@ def test_sell_pnl_does_not_double_count_buy_commission(tmp_path):
         - sell_rec.stamp_tax
     )
     assert sell_rec.pnl == pytest.approx(expected, rel=1e-9)
+
+
+# ======================================================================
+# T+1 字段不变量 / 卖出市值口径
+# ======================================================================
+
+def test_load_clamps_t1_fields_into_range(tmp_path):
+    """载入时必须把 available / today_quantity 夹进 [0, quantity]。
+
+    来源可以是旧存档、手工编辑、外部注入，也可以是 ``taskkill /F`` 打断的
+    半截写入。越界值看起来只是显示难看，实际会**掐死止损**：
+    ``sellable_quantity()`` 是 ``max(0, min(available, quantity - today, quantity))``，
+    负 available 会被夹成 0 ⇒ 该标的当天 sellable=0 ⇒ 卖出在预检阶段就被
+    「T+1 锁仓」拦下，且永远不会自愈（只有次日 reset 才修）。
+    """
+    seed = {
+        "cash": 1000.0,
+        "holdings": {
+            "600519": {
+                "name": "贵州茅台", "quantity": 100,
+                "available": 9999,          # 越上界
+                "today_quantity": 5000,     # 越上界
+                "avg_cost": 100.0, "last_price": 100.0, "market_value": 10000.0,
+            },
+            "000001": {
+                "name": "平安银行", "quantity": 200,
+                "available": -80,           # 越下界（会让止损永久失效）
+                "today_quantity": -5,
+                "avg_cost": 10.0, "last_price": 10.0, "market_value": 2000.0,
+            },
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-15",
+    }
+    pa, _ = _new_account(tmp_path, seed=seed)
+
+    # 越界值按「quantity 权威、今日买入量次之」重建：available = quantity - today
+    assert pa.holdings["600519"]["today_quantity"] == 100   # 5000 → 100
+    assert pa.holdings["600519"]["available"] == 0          # 100 - 100
+    assert pa.holdings["000001"]["today_quantity"] == 0     # -5 → 0
+    assert pa.holdings["000001"]["available"] == 200        # 200 - 0（不是夹成 0！）
+    # 关键：可卖量必须回到「真实可卖」，而不是被负值夹死
+    from src.trading.rules import sellable_quantity
+    assert sellable_quantity(pa.holdings["000001"]) == 200
+    assert sellable_quantity(pa.holdings["600519"]) == 0
+
+
+def test_sell_refreshes_mark_and_keeps_available_in_range(tmp_path):
+    """卖出后剩余仓位必须同步刷新 ``last_price``（否则本次标价会被陈价覆盖）。
+
+    ``_normalize_holdings`` 每次落盘都按 ``quantity × last_price`` 重算市值，
+    卖出时若只改 ``market_value`` 而不动 ``last_price``，本次标价会在落盘那一刻
+    被**隔夜价**覆盖 —— 看板手动卖出（不经 loop 的 mark_to_market）正是这条路，
+    结果总资产/收益率继续按昨天的价算，且完全看不出来源。
+    """
+    from src.trading.rules import apply_slippage
+
+    seed = {
+        "cash": 0.0,
+        "holdings": {
+            "600519": {
+                "name": "贵州茅台", "quantity": 300, "available": 300,
+                "today_quantity": 0,
+                "avg_cost": 10.0, "last_price": 10.0, "market_value": 3000.0,
+            },
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-15",
+    }
+    pa, _ = _new_account(tmp_path, seed=seed)
+
+    ok, msg, rec = pa.sell("600519", 20.0, 100)
+    assert ok, msg
+    h = pa.holdings["600519"]
+    assert h["quantity"] == 200
+    assert h["available"] == 200                 # 不越界
+    assert rec.price == pytest.approx(apply_slippage(20.0, "sell", 20.0 * 100))
+    # 标价按盘口价 20（市场价），且落盘后不会被陈价 10 覆盖
+    assert h["last_price"] == 20.0
+    assert h["market_value"] == pytest.approx(200 * 20.0)
+    pa.reload()
+    assert pa.holdings["600519"]["market_value"] == pytest.approx(200 * 20.0)

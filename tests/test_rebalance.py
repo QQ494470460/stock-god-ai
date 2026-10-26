@@ -261,3 +261,25 @@ def test_intent_amount_and_dict():
     assert i.delta_value == 10_000.0
     d = i.to_dict()
     assert d["side"] == "buy" and d["amount"] == 10_000.0
+
+
+# ---------------------------------------------------------------- 退出纪律
+
+def test_exit_ignores_min_trade_amount():
+    """跌出目标组合的小仓位必须清掉 —— 退出纪律不能被碎单阈值吃掉。
+
+    回归背景：A 段（退出）套用了 ``min_trade_amount``，于是「100 股 × ¥30 =
+    ¥3000」这类小仓位永远不满足 ¥5000 门槛 ⇒ 永久滞留在组合里：占着持仓名额、
+    每天被重算一遍却从不执行，且因为不在目标组合里也不会被加仓，只能等它自己
+    涨过阈值（等于把纪律交给了运气）。碎单过滤是给**建仓**用的，不是退出用的。
+    """
+    plan = mk_plan([("600519", 0.30)])
+    positions = [mk_pos("600000", 100, 30.0, 30.0)]        # 仅 ¥3000
+    intents = compute_rebalance_orders(
+        plan, positions, mk_acct(cash=1_000_000.0), PRICES, min_trade_amount=5000.0)
+
+    sells = [i for i in intents if i.side == OrderSide.SELL]
+    assert len(sells) == 1, "小仓位退出被最小交易金额过滤掉了"
+    assert sells[0].code == "600000"
+    assert sells[0].quantity == 100                        # 全清，不是部分减
+    assert "跌出目标组合" in sells[0].reason
