@@ -210,8 +210,9 @@ def test_exit_reason_distribution_fixed_buckets_with_zero():
     ]
     erd = perf.exit_reason_distribution(trades)
     tags = [e["tag"] for e in erd]
-    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 其他
-    assert tags == ["rebalance", "stop_profit", "stop_loss", "trail_stop", "exit"], tags
+    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 旧标签 / 其他
+    assert tags == ["rebalance", "stop_profit", "stop_loss", "trail_stop",
+                    "stop", "exit"], tags
     by = {e["tag"]: e for e in erd}
     assert by["stop_profit"]["count"] == 1 and by["stop_profit"]["pnl"] == 100.0
     assert by["stop_loss"]["count"] == 1 and by["stop_loss"]["pnl"] == -200.0
@@ -219,6 +220,18 @@ def test_exit_reason_distribution_fixed_buckets_with_zero():
     # 从未触发的桶必须显式存在（0 值），这是这条指标存在的全部意义
     assert by["trail_stop"]["count"] == 0, "移动止损从未触发必须显式可见"
     assert by["exit"]["count"] == 0
+
+
+def test_exit_reason_distribution_legacy_stop_is_not_other():
+    """旧标签 "stop" 必须单列「风控离场(旧标签)」，绝不能并入「其他退出」。
+
+    在真实数据上验证过：9 笔亏损腿的历史标签是旧的 "stop"，若并入「其他退出」
+    会看起来像「根本没有止损」，直接误导归因。
+    """
+    trades = [{"side": "sell", "code": "A", "pnl": -5000.0, "strategy": "stop"}]
+    by = {e["tag"]: e for e in perf.exit_reason_distribution(trades)}
+    assert by["stop"]["count"] == 1 and by["stop"]["pnl"] == -5000.0
+    assert by["exit"]["count"] == 0, "旧 stop 被误归入其他退出"
 
 
 def test_exit_reason_distribution_unknown_tag_falls_to_exit():

@@ -402,6 +402,9 @@ EXIT_REASON_LABELS = {
     "stop_profit": "止盈",
     "stop_loss": "止损",
     "trail_stop": "移动止损",
+    # 2026-10-27 之前所有风控离场都记成笼统的 "stop"，分不清止盈/止损/移动止损。
+    # 单列「旧标签」桶：既不误导成「没有止损」，也不假装知道它到底是哪一种。
+    "stop": "风控离场(旧标签)",
     "exit": "其他退出",
 }
 
@@ -430,8 +433,8 @@ def exit_reason_distribution(trades: Sequence[dict]) -> List[dict]:
             "count": d["count"],
             "win_rate": round(d["wins"] / d["count"], 4) if d["count"] else 0.0,
         })
-    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 其他
-    order = ["rebalance", "stop_profit", "stop_loss", "trail_stop", "exit"]
+    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 旧标签 / 其他
+    order = ["rebalance", "stop_profit", "stop_loss", "trail_stop", "stop", "exit"]
     out.sort(key=lambda x: order.index(x["tag"]) if x["tag"] in order else 99)
     return out
 
