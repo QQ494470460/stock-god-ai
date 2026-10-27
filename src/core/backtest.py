@@ -63,6 +63,10 @@ class BacktestConfig:
     weight_cap: float = 1.0          # 单票权重上限（1.0 = 不封顶）
     band_pct: float = 0.0            # 调仓容忍带（0 = 每次都调）
     min_trade_amount: float = 0.0    # 单笔最小交易额（元，0 = 不过滤碎单）
+    # 持有纪律（与 trading_loop.hold_if_profitable_pct 同义）：持仓跌出目标组合、
+    # 但未实现浮盈 ≥ 该百分比时不强制卖出，保留漂移权重继续持有，其余目标仓位
+    # 缩到剩余预算。0 = 关闭（默认，行为与历史完全一致）。
+    hold_if_profitable_pct: float = 0.0
 
 
 @dataclass
@@ -236,6 +240,9 @@ class WalkForwardBacktester:
         equity = [1.0]
         w_held: Dict[str, float] = {}
         cash_w = 1.0
+        # 每只票的建仓成本价（用于「持有纪律」判定浮盈）。买入时记当日价，
+        # 持有则保留，卖出则清除 —— 与实盘 paper 账户的 avg_cost 同口径。
+        entry_price: Dict[str, float] = {}
         i = 0
         n = len(dates)
         while i + cfg.rebalance_days < n:
@@ -260,6 +267,33 @@ class WalkForwardBacktester:
 
             if trade:
                 w_new = dict(target)
+                # 持有纪律：跌出目标组合但浮盈达标 → 保留漂移权重，不强制卖出。
+                # 直接「跌出榜单就卖」会在每日换票时甩掉赢家、留下还没跌的输家，
+                # 等于做「卖赢家、留输家」的逆向选择（实盘盈亏比 0.15 的根因之一）。
+                # 保留仓位从目标预算里扣除，其余目标按比例缩到剩余预算，避免超配。
+                if cfg.hold_if_profitable_pct > 0 and w_held:
+                    budget = max(0.0, 1.0 - cfg.cash_reserve_pct)
+                    retained: Dict[str, float] = {}
+                    used = 0.0
+                    for c in sorted(w_held, key=lambda k: -w_held[k]):
+                        if c in target:
+                            continue
+                        ep = entry_price.get(c, 0.0)
+                        p0 = close_panel.at[t, c] if c in close_panel.columns else np.nan
+                        if ep <= 0 or pd.isna(p0) or p0 <= 0:
+                            continue
+                        if (p0 / ep - 1.0) * 100.0 >= cfg.hold_if_profitable_pct:
+                            w = min(w_held[c], budget - used)
+                            if w > 0:
+                                retained[c] = w
+                                used += w
+                    if retained:
+                        tgt_sum = sum(w_new.values())
+                        investable = max(0.0, budget - used)
+                        if tgt_sum > 0 and tgt_sum > investable:
+                            scale = investable / tgt_sum
+                            w_new = {c: v * scale for c, v in w_new.items() if v * scale > 0}
+                        w_new.update(retained)
                 # 碎单过滤：成交额不足的标的维持原仓位，差额落回现金
                 if cfg.min_trade_amount > 0:
                     for c in set(w_new) | set(w_held):
@@ -279,6 +313,16 @@ class WalkForwardBacktester:
                 w_new = dict(w_held)      # 不调仓：维持现有仓位
                 buys = sells = 0.0
                 cost = 0.0
+
+            # 成本线维护：新买入选当日价，已卖出的清除，持有/保留的保持原成本
+            for c in w_new:
+                if c not in entry_price:
+                    _p0 = close_panel.at[t, c] if c in close_panel.columns else np.nan
+                    if pd.notna(_p0) and _p0 > 0:
+                        entry_price[c] = float(_p0)
+            for c in list(entry_price):
+                if c not in w_new:
+                    entry_price.pop(c, None)
 
             cash_new = max(0.0, 1.0 - sum(w_new.values()))
 
