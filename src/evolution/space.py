@@ -235,9 +235,10 @@ PARAM_SPACE: Dict[str, ParamSpec] = {s.key: s for s in (
     ParamSpec("trading_loop.weight_cap", KIND_FLOAT, 0.30, low=0.05, high=0.30,
               step=0.05, risk="risky_up", auto_adopt=False,
               doc="单票权重上限（不得超过风控 max_single_position_pct）"),
-    ParamSpec("trading_loop.band_pct", KIND_FLOAT, 0.25, low=0.05, high=0.50,
+    ParamSpec("trading_loop.band_pct", KIND_FLOAT, 0.15, low=0.05, high=0.50,
               step=0.05, risk="neutral", auto_adopt=True,
-              doc="调仓容忍带。越大越少交易（省成本），越小越贴近计划"),
+              doc="调仓容忍带。越大越少交易（省成本），越小越贴近计划。"
+                  "默认 0.15 经真样本外面板（panel_oos）三档成本验证"),
     ParamSpec("trading_loop.min_trade_amount", KIND_FLOAT, 5000.0, low=1000.0,
               high=50000.0, step=1000.0, risk="neutral", auto_adopt=True,
               doc="最小交易金额，过滤碎单"),

@@ -132,7 +132,9 @@ class LoopConfig:
     # 从 -34% 压到 -14%，但年化也从 +26% 掉到 +4.7%、夏普腰斩，故保留敞口在场。
     enable_risk_scaling: bool = True
     risk_scale_floor: float = 0.30       # 最深回撤时仍保留的敞口比例（绝不为 0）
-    band_pct: float = 0.25               # 调仓容忍带
+    # 调仓容忍带。生产权威值在 config/settings.py:TradingLoopConfig.band_pct
+    # （此处只是 app_config 缺失时的兜底，两处须保持一致，否则谁读谁生效全看运气）。
+    band_pct: float = 0.15
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一。

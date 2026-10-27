@@ -260,7 +260,11 @@ def test_resolve_falls_back_to_default_when_current_unreadable(env, monkeypatch)
     """读不到当前值时用参数空间默认值算，不抛错。"""
     monkeypatch.setattr(ov_mod, "read_effective", lambda k: None)
     r = lr.resolve("widen_band")
-    assert r["value"] == pytest.approx(0.30)        # default 0.25 + 0.05
+
+    # 期望值由「参数空间默认 + 一个 step」推出，不硬编码 ——
+    # 默认值会随参数扫描结论演进（2026-10-27 由 0.25 → 0.15）。
+    spec = space.get_spec("trading_loop.band_pct")
+    assert r["value"] == pytest.approx(spec.clamp(spec.default + spec.step))
 
 
 # ------------------------------------------------------------------ ⑤ generate 的安全边界

@@ -503,6 +503,20 @@ def run_walk_forward_shared(args, ref_cols: List[str]) -> dict:
     summary = _panel_daily_metrics(pooled_panel, fwd_excess, top_n=args.top_n)
     summary["n_folds"] = len(fold_records)
 
+    # 落盘「真·样本外」面板（逐折重训），供参数扫描做无偏 A/B。
+    # ⚠️ 与部署模型 eval 的 data/evolution/panel/ 分开存放：后者是单一模型对
+    #    全历史打分（对模型样本内），拿它扫 band_pct 这类「交易强度」参数会
+    #    放大样本内幻觉；只有逐折重训的 pooled 分数才是真 OOS。
+    try:
+        oos_dir = Path(__file__).resolve().parent.parent / "data" / "evolution" / "panel_oos"
+        oos_dir.mkdir(parents=True, exist_ok=True)
+        idx2 = pooled_panel.index.intersection(close_panel.index)
+        pooled_panel.loc[idx2].to_parquet(oos_dir / "score_panel.parquet")
+        close_panel.loc[idx2].to_parquet(oos_dir / "close_panel.parquet")
+        logger.info(f"💾 已落盘真·样本外面板 {oos_dir}：{len(idx2)} 天")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"OOS 面板落盘失败（忽略）: {e}")
+
     print("\n" + "=" * 78)
     print(" Walk-Forward 样本外评估（生产特征管线，零泄漏）")
     print("=" * 78)

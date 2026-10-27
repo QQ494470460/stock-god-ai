@@ -291,7 +291,15 @@ class TradingLoopConfig:
     tilt_strength: float = 0.25          # 风险权重上叠加 alpha 倾斜（0=纯风险平价）
     enable_rebalance: bool = True        # 目标组合调仓开关
     enable_stop_orders: bool = True      # 止盈止损开关
-    band_pct: float = 0.25               # 调仓容忍带
+    # 调仓容忍带（触发换仓的最小权重偏离）。2026-10-27 由 0.25 降至 0.15：
+    # 依据 = 真·样本外面板（data/evolution/panel_oos，4 折逐折重训，1140 天，
+    # RankIC 0.061 / IC_IR 12.26 / TopN 超额 0.38% / 胜率 61.5%）上的参数扫描。
+    # 0.15 在滑点 10/30/50bp 三档成本下均「夏普不输 + 超额不输」5/5 块，
+    # 均夏普 0.96~1.00 vs 基准 0.76~0.78；0.10 更激进（均夏普 1.68）但换手 22%/期，
+    # 50bp 下退化为 4/5 不输 —— 成本敏感，故取 0.15 不取 0.10。
+    # ⚠️ 该参数改的是「交易强度」，越激进越会吃进样本内幻觉，
+    # 任何进一步下调都必须重跑 scripts/sweep_grid.py --panel-dir data/evolution/panel_oos。
+    band_pct: float = 0.15
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一，

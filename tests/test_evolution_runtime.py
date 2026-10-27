@@ -38,6 +38,19 @@ REAL_OVERRIDES = ROOT / "config" / "evolution_overrides.json"
 REAL_CANDIDATES = ROOT / "data" / "evolution" / "candidates.json"
 
 
+def _default_band() -> float:
+    """``band_pct`` 的出厂默认值 —— 从配置里取，不在测试里硬编码。
+
+    ⚠️ 曾经这里写死 ``0.25``，结果 2026-10-27 把它调到 0.15 后，
+    「重置回默认」这类测试全线假失败（被测逻辑没错，是断言过期了）。
+    默认值属于会随参数扫描结论演进的东西，测试只该断言「回到了默认」，
+    不该断言「默认是多少」。
+    """
+    from config.settings import AppConfig
+
+    return AppConfig().trading_loop.band_pct
+
+
 # ------------------------------------------------------------------ 夹具
 
 @pytest.fixture
@@ -237,7 +250,7 @@ def test_refresh_alone_does_not_restore_defaults(sandbox, restore_app_config):
     assert restore_app_config.trading_loop.band_pct == 0.40      # 仍在覆盖态
 
     ov_mod._restore_defaults(["trading_loop.band_pct"])
-    assert restore_app_config.trading_loop.band_pct == 0.25
+    assert restore_app_config.trading_loop.band_pct == _default_band()
 
 
 def test_reset_all_clears_overrides(sandbox, restore_app_config):
@@ -249,7 +262,7 @@ def test_reset_all_clears_overrides(sandbox, restore_app_config):
 
     assert cleared == ["trading_loop.band_pct"]
     assert ov_mod.load_overrides() == {}
-    assert restore_app_config.trading_loop.band_pct == 0.25      # 恢复默认
+    assert restore_app_config.trading_loop.band_pct == _default_band()   # 恢复默认
 
 
 # ------------------------------------------------------------------ 候选队列
