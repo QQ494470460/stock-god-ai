@@ -117,7 +117,9 @@ class LoopConfig:
     scan_interval_sec: float = 30.0     # 主循环 tick 间隔
     auto_build_plan: bool = True        # 自动生成/刷新交易计划
     top_n: Optional[int] = None          # 计划取前 N 只（None=用 max_positions）
-    max_positions: int = 10              # 目标持仓上限（与 guard 对齐）
+    # 生产权威值在 config/settings.py:TradingLoopConfig（此处仅 app_config 缺失时兜底，
+    # 两处须一致，否则「改哪份生效」全看运气）。
+    max_positions: int = 8               # 目标持仓上限（与 guard 对齐）
     cash_reserve_pct: float = 0.10       # 现金保留比例
     weight_cap: float = 0.30             # 单票权重上限（= guard.max_single_position_pct）
     # equal / score / risk_parity / min_variance / vol_target

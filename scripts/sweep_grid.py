@@ -22,10 +22,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# 各参数的「生产默认」，用作逐块胜负的基准
-_DEFAULT = {"band_pct": 0.25, "rebalance_days": 5,
+# 各参数的「生产默认」，用作逐块胜负的基准。
+# ⚠️ 与 config/settings.py 保持一致 —— 这里过期会让「vs 基准」比错对象。
+_DEFAULT = {"band_pct": 0.15, "rebalance_days": 5,
             "weight_cap": 0.30, "cash_reserve_pct": 0.10,
-            "min_trade_amount": 5000.0, "hold_if_profitable_pct": 0.0}
+            "min_trade_amount": 5000.0, "hold_if_profitable_pct": 0.0,
+            "top_n": 20}
 
 
 def _load_panel(panel_dir: str = ""):
@@ -65,6 +67,8 @@ def _run(score, close, bench, params: Dict, param: str, value):
     rb = int(p.pop("rebalance_days", 5))
     if param == "rebalance_days":
         rb = int(value)
+    elif param == "top_n":
+        top_n = int(value)
     else:
         p[param] = value
     try:

@@ -281,7 +281,14 @@ class TradingLoopConfig:
     """
     scan_interval_sec: float = 30.0      # 主循环周期（秒）
     auto_build_plan: bool = True         # 自动生成/刷新交易计划
-    max_positions: int = 10              # 目标持仓上限
+    # 目标持仓上限。2026-10-27 由 10 降至 8：真·样本外面板（panel_oos 1140 天）
+    # 扫描 top_n=5/8/10/15/20，8 只在 10/30/50bp 三档成本下夏普
+    # 1.59/1.53/1.48 vs 基准 1.00/0.98/0.96，逐块 4/5 双赢，换手仅 2.09%→4.41%。
+    # ⚠️ 5 只更亮眼（10bp 夏普 1.67）但换手 61%/期，30bp 崩到 1.09、50bp 崩到 0.58
+    # —— 典型的「成本一涨就废」，故取 8 不取 5。
+    # ⚠️ 该参数改的是组合集中度（单票 10%→12.5%），行业集中度更易撞
+    # guard.max_sector_pct，属需人工确认项（space.py 标 auto_adopt=False）。
+    max_positions: int = 8
     cash_reserve_pct: float = 0.10       # 现金保留比例
     weight_cap: float = 0.30             # 单票权重上限
     # equal / score / risk_parity / min_variance / vol_target

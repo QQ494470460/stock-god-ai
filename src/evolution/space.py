@@ -226,9 +226,10 @@ class ParamSpec:
 
 PARAM_SPACE: Dict[str, ParamSpec] = {s.key: s for s in (
     # ===== 组合参数（闭环引擎）=====
-    ParamSpec("trading_loop.max_positions", KIND_INT, 10, low=1, high=20, step=1,
+    ParamSpec("trading_loop.max_positions", KIND_INT, 8, low=1, high=20, step=1,
               risk="risky_up", auto_adopt=False,
-              doc="目标持仓只数。越多越分散但也越难管理，调高需人工确认"),
+              doc="目标持仓只数。越多越分散但也越难管理，调高需人工确认。"
+                  "默认 8 经真样本外面板（panel_oos）三档成本验证（5 只因换手 61% 被否）"),
     ParamSpec("trading_loop.cash_reserve_pct", KIND_FLOAT, 0.10, low=0.0, high=0.50,
               step=0.05, risk="risky_down", auto_adopt=False,
               doc="现金保留比例。调低=满仓更激进"),
