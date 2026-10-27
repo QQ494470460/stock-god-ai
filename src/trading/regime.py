@@ -27,17 +27,18 @@ REGIME_STRATEGY_WEIGHTS: Dict[str, Dict[str, float]] = {
     "bull": {
         "loop": 1.15, "ai": 1.15, "rebalance": 1.10,
         "momentum": 1.30, "mean_revert": 0.80, "defensive": 0.60,
-        "stop": 1.0,  # 风控离场永远执行
+        "stop": 1.0,  # 风控离场永远执行（旧标签，历史流水里仍有）
+        "stop_loss": 1.0, "stop_profit": 1.0, "trail_stop": 1.0,
     },
     "sideways": {
         "loop": 1.0, "ai": 1.0, "rebalance": 1.0,
         "momentum": 0.90, "mean_revert": 1.20, "defensive": 0.90,
-        "stop": 1.0,
+        "stop": 1.0, "stop_loss": 1.0, "stop_profit": 1.0, "trail_stop": 1.0,
     },
     "bear": {
         "loop": 0.85, "ai": 0.85, "rebalance": 0.80,
         "momentum": 0.70, "mean_revert": 0.90, "defensive": 1.30,
-        "stop": 1.0,
+        "stop": 1.0, "stop_loss": 1.0, "stop_profit": 1.0, "trail_stop": 1.0,
     },
 }
 

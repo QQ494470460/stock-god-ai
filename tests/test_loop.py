@@ -1175,3 +1175,76 @@ def test_loop_only_rebaselines_on_initial_cash_change_not_on_cash_change(force_t
     assert len(calls) == 1, (
         f"initial_cash 变更必须触发一次 rebaseline_peak，实际 {len(calls)} 次")
     assert loop.guard.safety._state.peak_equity == pytest.approx(500_000.0, rel=1e-3)
+
+
+# ======================================================================
+# 退出原因细分（归因可观测性）
+# ======================================================================
+
+def test_exit_tag_maps_reason_to_attributable_label():
+    """止盈 / 止损 / 移动止损必须是三个不同标签。
+
+    否则归因表里只剩一个 ``stop`` 桶，**「止盈从来没触发过」这个决定性事实
+    完全看不见** —— 实测就是这情况：配的止盈 +15%，实际最大盈利 +1.62%。
+    """
+    from src.trading.loop import _exit_tag
+
+    assert _exit_tag("止盈 15.0%") == "stop_profit"
+    assert _exit_tag("止损 -5.2%") == "stop_loss"
+    assert _exit_tag("移动止损 回撤-3.1% (最高+8.2%)") == "trail_stop"
+    # 「移动止损」含「止损」二字，优先级必须高于 stop_loss
+    assert _exit_tag("移动止损 -3%") != "stop_loss"
+
+
+def test_exit_tag_does_not_guess_when_ambiguous():
+    """兜底文案「止盈止损」说不清方向 → 记 exit，不许瞎猜。
+
+    猜错的标签会污染归因表，比缺失更难发现。
+    """
+    from src.trading.loop import _exit_tag
+
+    assert _exit_tag("止盈止损") == "exit"
+    assert _exit_tag("") == "exit"
+    assert _exit_tag("封板无量") == "exit"
+
+
+@pytest.mark.parametrize("reason,expect", [
+    ("止盈 15.0%", "stop_profit"),
+    ("止损 -5.2%", "stop_loss"),
+    ("移动止损 回撤-3.1%", "trail_stop"),
+])
+def test_run_exits_passes_fine_grained_tag(monkeypatch, reason, expect):
+    """闭环真正下单时带的是细分标签，而不是笼统的 stop。"""
+    loop = mk_loop()
+    seen = {}
+
+    monkeypatch.setattr(
+        loop.guard.executor, "check_stop_conditions",
+        lambda positions=None, prices=None: [{
+            "code": "600519", "name": "贵州茅台", "reason": reason,
+            "action": "sell", "pnl_pct": -5.0, "quantity": 100,
+        }])
+
+    def _fake_place(**kw):
+        seen.update(kw)
+        return True, "ok", None, {"code": kw.get("code")}
+
+    monkeypatch.setattr(loop, "_place", _fake_place)
+    loop._run_exits(positions=[], prices={"600519": 10.0}, report=TickReport())
+
+    assert seen.get("tag") == expect
+    assert seen.get("reason") == reason, "reason 原样透传给日志/日报"
+
+
+def test_regime_weights_keep_risk_exit_always_allowed():
+    """风控离场在任何市场状态下权重都是 1.0（不被 regime 降权）。
+
+    新加的三个细分标签必须显式登记 —— 靠 DEFAULT_TAG_WEIGHT 兜底虽然也是
+    1.0，但「永远执行」这条保证不该依赖默认值，那是会被后人改掉的。
+    """
+    from src.trading.regime import REGIME_STRATEGY_WEIGHTS
+
+    for regime in ("bull", "sideways", "bear"):
+        w = REGIME_STRATEGY_WEIGHTS[regime]
+        for tag in ("stop", "stop_loss", "stop_profit", "trail_stop"):
+            assert w.get(tag) == pytest.approx(1.0), f"{regime}/{tag} 会被降权"

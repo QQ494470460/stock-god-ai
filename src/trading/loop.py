@@ -73,6 +73,31 @@ def _today() -> date:
     return _now().date()
 
 
+#: 退出原因 → 可归因的策略标签。
+#:
+#: 为什么要分细：过去所有风控离场都记成同一个 ``stop``，于是
+#: **「止盈从来没触发过」这个决定性事实在归因表里完全看不见** ——
+#: 你只看得到「stop 腿 9 笔全亏 -23 万」，却不知道配的止盈线是 +15%、
+#: 而实际最大盈利只有 +1.62%（全部由调仓卖出）。三者是完全不同的失败模式：
+#:   · stop_profit 不触发 → 止盈线过远 / 盈利仓被调仓提前换出
+#:   · stop_loss 频繁触发 → 入场质量问题
+#:   · trail_stop 频繁触发 → 移动止损过紧，把趋势单砍在半路
+#: 混在一个桶里就没法判断到底该修入场还是修退出。
+def _exit_tag(reason: str) -> str:
+    r = str(reason or "")
+    # 「移动止损」里含「止损」，必须先判。
+    if "移动止损" in r:
+        return "trail_stop"
+    tp, sl = ("止盈" in r), ("止损" in r)
+    # 两者都出现（如兜底文案「止盈止损」）= 说不清，记 exit 而不是瞎猜 ——
+    # 猜错的标签会污染归因表，比缺失更难发现。
+    if tp and not sl:
+        return "stop_profit"
+    if sl and not tp:
+        return "stop_loss"
+    return "exit"
+
+
 # ----------------------------------------------------------------------------
 # 状态与配置
 # ----------------------------------------------------------------------------
@@ -708,10 +733,11 @@ class TradingLoop:
             price = float(prices.get(code) or self._price_of(code) or 0)
             if qty <= 0 or price <= 0:
                 continue
+            reason = a.get("reason", "止盈止损")
             ok, msg, order, detail = self._place(
                 code=code, name=a.get("name", code), side=OrderSide.SELL,
-                quantity=qty, price=price, reason=a.get("reason", "止盈止损"),
-                ai_score=50.0, risk_exit=True, tag="stop",
+                quantity=qty, price=price, reason=reason,
+                ai_score=50.0, risk_exit=True, tag=_exit_tag(reason),
             )
             report.n_stops += 1
             report.actions.append(detail or {"code": code, "side": "sell", "ok": ok, "msg": msg})
