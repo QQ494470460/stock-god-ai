@@ -437,14 +437,30 @@ def test_report_render_is_readable(env, patched_gate, restore_app_config):
 
 
 def test_audit_written_to_evolution_log(env, patched_gate, restore_app_config):
-    """回合结论要留痕，但**不能**写进交易审计流水。"""
+    """回合结论要留痕，但**不能**写进交易审计流水。
+
+    ⚠️ 不能断言「文件逐字节不变」：常驻闭环（run_loop）在盘中每 30s 就会往
+    同一个 journal 追加 fill / risk_block，回归又在交易日早盘跑 —— 于是
+    「文件变了」几乎每天都成立，用例变成假红（2026-10-27 实测：09:21:35
+    那 6 条是闭环自己写的 risk_block，与进化回合毫无关系）。
+    正确的判据是：**新增的行里不能有进化/候选相关内容**。
+    """
     journal = ROOT / "data" / "trading_journal.jsonl"
-    before = journal.read_bytes() if journal.exists() else None
 
+    def _lines() -> list:
+        try:
+            return journal.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+
+    before = _lines()
     _runner(env, _snap()).run()
+    after = _lines()
 
-    after = journal.read_bytes() if journal.exists() else None
-    assert after == before, "进化回合污染了交易审计日志"
+    added = after[len(before):] if len(after) >= len(before) else after
+    polluted = [ln for ln in added
+                if ("evolution" in ln) or ("candidate" in ln) or ("候选" in ln)]
+    assert not polluted, f"进化回合污染了交易审计日志: {polluted[:3]}"
 
     # 另起一个引擎从磁盘重读：log 是写在文件里的，不是改内存对象
     from src.models.evolution import EvolutionEngine

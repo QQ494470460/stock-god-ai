@@ -1925,7 +1925,7 @@ with st.sidebar:
     if "page" not in st.session_state:
         st.session_state.page = "🏠 概览"
 
-    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📐 量化模型", "📈 模型稳定性", "⚙️ 设置"]
+    page_options = ["🏠 概览", "🔍 AI选股", "📊 个股分析", "📡 实时监控", "🤖 AI 助手", "💹 自动交易", "📊 业绩归因", "📐 量化模型", "📈 模型稳定性", "⚙️ 设置"]
 
     st.markdown('<div class="nav-hint">导航</div>', unsafe_allow_html=True)
     page = st.radio(
@@ -4761,6 +4761,201 @@ if page == "📈 模型稳定性":
                         st.rerun()
                 except Exception as e:  # noqa: BLE001
                     st.error(f"回填异常: {e}")
+
+
+if page == "📊 业绩归因":
+    render_hero(
+        "业绩归因 · 净值与风险档案",
+        "把分散的每日结算快照汇成一条可判断的净值曲线：赚不赚钱、钱从哪来、风险有没有变大",
+        icon="📊",
+        badges=[("violet", "净值 / 回撤 / 归因")],
+    )
+
+    from src.trading import performance as perf_mod
+
+    rep = perf_mod.build_report()
+    per = rep.get("period") or {}
+    eqv = rep.get("equity") or {}
+    rk = rep.get("risk") or {}
+    tr = rep.get("trades") or {}
+    n_days = int(per.get("n_days") or 0)
+
+    if n_days == 0:
+        st.info("还没有可用的结算快照（data/loop_reports/）。"
+                "收盘后闭环会自动生成；也可先跑一次 `python -m src.trading.performance`。")
+    else:
+        # ---------- KPI ----------
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("期末权益", f"¥{eqv.get('end', 0):,.0f}")
+        _tr_pct = eqv.get("total_return_pct")
+        c2.metric("累计收益", "—" if _tr_pct is None else f"{_tr_pct:+.2f}%",
+                  delta=None if _tr_pct is None else f"{_tr_pct:+.2f}%")
+        _ann = eqv.get("annualized_return_pct")
+        c3.metric("年化收益", "—" if _ann is None else f"{_ann:+.1f}%")
+        c4.metric("夏普", "—" if rk.get("sharpe") is None else f"{rk['sharpe']:.2f}")
+        c5.metric("最大回撤", f"{rk.get('max_drawdown_pct', 0):.1f}%",
+                  delta=f"{rk.get('max_dd_days', 0)} 日",
+                  delta_color="off")
+        _wr = tr.get("win_rate")
+        c6.metric("平仓胜率", "—" if _wr is None else f"{_wr*100:.0f}%",
+                  delta=f"{tr.get('n_closes', 0)} 笔", delta_color="off")
+
+        # 样本太小时口径必须自证，否则用户会把噪声当业绩
+        if n_days < 20:
+            st.warning(
+                f"⚠️ 当前只有 **{n_days}** 个交易日样本：夏普/索提诺/年化一律不显示"
+                f"（<20 日无法免疫噪声）。最大回撤与胜率可以看，但不要据此判断策略优劣。"
+            )
+
+        # ---------- 净值 + 回撤 ----------
+        curve = rep.get("curve") or []
+        if curve:
+            _df = pd.DataFrame(curve)
+            _df["date"] = pd.to_datetime(_df["date"])
+            fig = make_subplots(
+                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                row_heights=[0.68, 0.32],
+                subplot_titles=("净值曲线", "回撤（相对历史峰值）"),
+            )
+            fig.add_trace(go.Scatter(
+                x=_df["date"], y=_df["equity"], mode="lines+markers",
+                name="权益", line=dict(color="#5b21b6", width=2.2),
+                fill="tozeroy", fillcolor="rgba(91,33,182,0.07)",
+                marker=dict(size=4),
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=_df["date"], y=_df["dd_pct"], mode="lines", name="回撤%",
+                line=dict(color="#dc2626", width=1.6),
+                fill="tozeroy", fillcolor="rgba(220,38,38,0.12)",
+            ), row=2, col=1)
+            fig.update_layout(
+                height=430, margin=dict(l=10, r=10, t=38, b=10),
+                showlegend=False, hovermode="x unified",
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(size=11),
+            )
+            fig.update_yaxes(tickformat=",.0f", row=1, col=1)
+            fig.update_yaxes(ticksuffix="%", row=2, col=1)
+            # 净值轴不能从 0 起：¥470 万的曲线在 0~500 万坐标里就是一条贴顶的直线，
+            # 什么也看不出来。按实际波动区间给 25% 余量，形状才看得出来。
+            _lo = float(_df["equity"].min())
+            _hi = float(_df["equity"].max())
+            _pad = max((_hi - _lo) * 0.25, _hi * 0.004)
+            fig.update_yaxes(range=[_lo - _pad, _hi + _pad], row=1, col=1)
+            st.plotly_chart(fig, use_container_width=True, key="perf_curve")
+
+        st.caption(
+            f"区间 {per.get('start')} ~ {per.get('end')}（{n_days} 个交易日）"
+            f" ｜ 最大回撤 {rk.get('max_dd_peak_date') or '—'} → "
+            f"{rk.get('max_dd_trough_date') or '—'}"
+            f"（{'已恢复' if rk.get('max_dd_recovered') else '未恢复'}）"
+            f" ｜ 上涨 {rk.get('up_days', 0)} 天 / 下跌 {rk.get('down_days', 0)} 天"
+        )
+
+        # ---------- 月度收益 ----------
+        monthly = rep.get("monthly") or {}
+        if monthly:
+            mdf = pd.DataFrame(
+                [{"月份": k, "收益率": v} for k, v in sorted(monthly.items())])
+            # A 股口径：正收益红、负收益绿
+            colors = ["#dc2626" if v >= 0 else "#059669" for v in mdf["收益率"]]
+            mfig = go.Figure(go.Bar(
+                x=mdf["月份"], y=mdf["收益率"], marker_color=colors,
+                text=[f"{v:+.2f}%" for v in mdf["收益率"]],
+                textposition="outside",
+            ))
+            mfig.update_layout(
+                height=250, margin=dict(l=10, r=10, t=22, b=10),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(ticksuffix="%"), showlegend=False,
+            )
+            # 「2026-10」会被 Plotly 当日期解析成 23:59:59.999…，轴标签变成时间。
+            # 月份是**离散类目**，必须显式 category。
+            mfig.update_xaxes(type="category")
+            st.markdown("##### 月度收益")
+            st.plotly_chart(mfig, use_container_width=True, key="perf_monthly")
+
+        # ---------- 归因 ----------
+        attr = rep.get("attribution") or {}
+        st.markdown("##### 归因：钱是从哪赚/亏的")
+        a1, a2 = st.columns(2)
+        with a1:
+            st.caption("按行业（缺失映射归入「未知行业」，不会被静默丢掉）")
+            bs = attr.get("by_sector") or {}
+            if bs:
+                df_s = pd.DataFrame(
+                    [{"行业": k, "已实现盈亏": v["pnl"], "笔数": v["count"],
+                      "胜率%": round((v.get("win_rate") or 0) * 100, 1)}
+                     for k, v in sorted(bs.items(), key=lambda kv: kv[1]["pnl"], reverse=True)]
+                )
+                # 不设固定高度：行业数少时全展开。最大亏损源（如「未知行业」）
+                # 若被折进滚动区，等于把最该看的一行藏起来。
+                st.dataframe(df_s, use_container_width=True, hide_index=True)
+            else:
+                st.caption("暂无已平仓交易")
+        with a2:
+            st.caption("按策略标签")
+            bst = attr.get("by_strategy") or {}
+            if bst:
+                df_g = pd.DataFrame(
+                    [{"策略": k, "已实现盈亏": v["pnl"], "笔数": v["count"],
+                      "胜率%": round((v.get("win_rate") or 0) * 100, 1)}
+                     for k, v in sorted(bst.items(), key=lambda kv: kv[1]["pnl"], reverse=True)]
+                )
+                st.dataframe(df_g, use_container_width=True, hide_index=True)
+            else:
+                st.caption("暂无已平仓交易")
+
+        bc = attr.get("by_code") or {}
+        if bc:
+            with st.expander("按个股（前 15）", expanded=False):
+                df_c = pd.DataFrame(
+                    [{"标的": k, "已实现盈亏": v["pnl"], "笔数": v["count"],
+                      "胜率%": round((v.get("win_rate") or 0) * 100, 1),
+                      "费用": v["fees"]}
+                     for k, v in sorted(bc.items(), key=lambda kv: kv[1]["pnl"], reverse=True)[:15]]
+                )
+                st.dataframe(df_c, use_container_width=True, hide_index=True)
+
+        # ---------- 交易与成本 ----------
+        st.markdown("##### 交易质量与成本")
+        t1, t2, t3, t4, t5 = st.columns(5)
+        t1.metric("盈亏比", "—" if tr.get("payoff_ratio") is None else f"{tr['payoff_ratio']:.2f}")
+        t2.metric("期望值", "—" if tr.get("expectancy") is None else f"¥{tr['expectancy']:,.0f}/笔")
+        t3.metric("最长连亏", f"{tr.get('max_consecutive_losses', 0)} 笔")
+        t4.metric("累计手续费", f"¥{tr.get('fees', 0):,.0f}")
+        _fr = tr.get("fee_ratio_pct")
+        t5.metric("费用率", "—" if _fr is None else f"{_fr:.3f}%")
+        if (tr.get("payoff_ratio") or 9) < 1:
+            st.error(
+                "🔴 **盈亏比 < 1**：平均每笔亏损大于平均每笔盈利。这不是运气问题，"
+                "是止盈/止损不对称——胜率再高也会被少数大亏吃掉。"
+                "先查止损是否被放宽过（ATR 自适应），再看是否在亏损仓位上反复补仓。"
+            )
+
+        with st.expander("🔧 数据口径与落盘", expanded=False):
+            st.markdown(
+                f"""
+- 数据源：`data/loop_reports/loop_report_*.json`（{n_days} 份）+ `data/paper_trade_history.json`
+- **已剔除** `equity_ok=false` 的占位快照：账户取不到时权益是占位值，一条就能把回撤算成 -100%
+- 日收益分母用**当日起始权益**（不是前一日收盘），隔夜跳空不会被算进当天
+- 胜率/盈亏比只统计**平仓腿**（`side=sell` 且 `pnl≠0`）；买入腿混进来会把胜率稀释成 0
+- 夏普/索提诺/年化要求 ≥20 个交易日；零波动时返回「—」而不是 inf
+- 生成时间：{rep.get('generated_at')}
+                """
+            )
+            if st.button("💾 落盘为 data/performance.json", key="perf_save"):
+                try:
+                    p = perf_mod.save_report(rep)
+                    st.success(f"已写入 {p}")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"落盘失败: {e}")
+
+            if rep.get("rolling_sharpe"):
+                rs = pd.DataFrame(rep["rolling_sharpe"]).dropna()
+                if len(rs) >= 2:
+                    st.caption("滚动 20 日夏普（观察优势是否在衰减）")
+                    st.line_chart(rs.set_index("date")["sharpe"], height=180)
 
 
 if page == "⚙️ 设置":

@@ -47,6 +47,7 @@ from src.core.single_instance import SingleInstanceLock
 from config.settings import DATA_DIR, config as app_config
 from src.trading.broker import BrokerAPI, OrderSide, Position, AccountInfo, Order
 from src.trading.guard import RiskSupervisor, build_supervisor, TradingMode
+from src.trading.sanity import QuoteSanityGuard
 
 
 # ----------------------------------------------------------------------------
@@ -222,6 +223,13 @@ class TradingLoop:
         self._stop_event = threading.Event()
         self._price_cache: Dict[str, float] = {}
 
+        # 报价合法性守卫：一个坏价格就是一笔坏交易。
+        # 数据源会偶发返回昨收/复权价/错位价，而止损是按价格判定的 ——
+        # 不校验就会在错误的价格上斩仓，或让权益曲线凭空断崖。
+        # 连续 confirm 次同向偏离才采信（区分「数据抖动」与「真实涨跌停」）。
+        self._sanity = QuoteSanityGuard(confirm_ticks=2, tolerance_pct=2.0)
+        self._sanity_warned: set = set()   # (code, why) 去重，避免每 tick 刷日志
+
         # 结算记账
         self._settled_dates: set = set()
         self._last_report: Optional[TickReport] = None
@@ -392,11 +400,16 @@ class TradingLoop:
         if code in self._price_cache:
             return self._price_cache[code]
         price = 0.0
+        pre_close = 0.0
+        volume = amount = None
         # 1) 券商实时行情
         try:
             tick = self.broker.get_tick(code)
             if tick and getattr(tick, "last_price", 0) > 0:
                 price = float(tick.last_price)
+                pre_close = float(getattr(tick, "pre_close", 0) or 0)
+                volume = getattr(tick, "volume", None)
+                amount = getattr(tick, "amount", None)
         except Exception:  # noqa: BLE001
             pass
         # 2) 公开实时行情兜底（券商 tick 不可用时的**首选**兜底）
@@ -413,10 +426,15 @@ class TradingLoop:
                     p = float(q.get("最新价") or 0)
                     if p > 0:
                         price = p
+                        try:
+                            pre_close = float(q.get("昨收") or q.get("昨收价") or 0)
+                        except (TypeError, ValueError):
+                            pre_close = 0.0
                 elif q is not None:
                     p = float(getattr(q, "last_price", 0) or getattr(q, "price", 0) or 0)
                     if p > 0:
                         price = p
+                        pre_close = float(getattr(q, "pre_close", 0) or 0)
             except Exception:  # noqa: BLE001
                 pass
         # 3) 兜底：日线收盘价（离线 / 盘后可用；盘中会退化为昨收，仅最后手段）
@@ -426,6 +444,8 @@ class TradingLoop:
                 df = fetcher.get_daily_kline(code)
                 if df is not None and len(df) > 0:
                     price = float(df["close"].iloc[-1])
+                    # 日线兜底拿到的就是「收盘价」，没有当日盘中信息 →
+                    # 不提供 pre_close，让守卫退化为「相对上次可信价的跳变检查」
             except Exception:  # noqa: BLE001
                 pass
         # 4) 外部注入的价格函数
@@ -434,6 +454,21 @@ class TradingLoop:
                 price = float(self._price_fn(code) or 0)
             except Exception:  # noqa: BLE001
                 price = 0.0
+
+        # 5) 合法性校验：可疑价不采信，沿用上一次可信价（好过用 0 让止损失明）
+        if price > 0:
+            v = self._sanity.check(code, price, pre_close=pre_close,
+                                   volume=volume, amount=amount)
+            if not v.ok:
+                key = (code, v.why.split("（")[0])
+                if key not in self._sanity_warned:
+                    self._sanity_warned.add(key)
+                    logger.warning(
+                        f"⚠️ 报价异常已拦截 {code}: 原始价 {price:.3f} → "
+                        f"{v.why}；本次沿用 ¥{v.price:.3f}")
+            if v.price > 0:
+                price = v.price
+
         self._price_cache[code] = price
         return price
 
@@ -893,6 +928,26 @@ class TradingLoop:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"结算报告写入失败: {e}")
 
+        # 业绩档案：先落当天快照，再重算累计（此刻今天的点已在内），
+        # 然后把累计摘要补回日报并重写文件。
+        # 为什么值得多写一次盘：日报是用户唯一会主动翻的产物，而「今天 -2.39%」
+        # 单独看毫无意义 —— 必须配上「累计 -4.51% / 最大回撤 -4.9%」才知道
+        # 系统整体在往哪走。少了这一块，日报永远只有当天视角。
+        perf_rep = self._update_performance()
+        if perf_rep:
+            snapshot["performance"] = self._perf_brief(perf_rep)
+            try:
+                out_dir = Path(DATA_DIR) / "loop_reports"
+                stamp = today.replace("-", "")
+                (out_dir / f"loop_report_{stamp}.json").write_text(
+                    json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                (out_dir / f"loop_report_{stamp}.md").write_text(
+                    self._settle_markdown(snapshot), encoding="utf-8")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"日报补写累计摘要失败（已忽略）: {e}")
+
         self._settled_dates.add(_today())
         # 落盘：常驻进程重启后不会重复结算 / --until-close 能正确退出
         try:
@@ -916,6 +971,47 @@ class TradingLoop:
 
         self._emit("loop_settled", snapshot)
         logger.info(report.note)
+
+        # 业绩档案：结算后自动重算一次，看板/日报/进化门禁直接读 data/performance.json。
+        # ⚠️ 路径全部显式取自本模块的 DATA_DIR（测试里会被 monkeypatch 到 tmp），
+        # 绝不能让 performance 模块用它自己的默认路径 —— 那会把测试的虚拟权益
+        # 写进真实 data/performance.json（同一类事故已经发生过一次）。
+        self._update_performance()
+
+    def _update_performance(self) -> dict:
+        """重算并落盘业绩档案；失败只记 debug（业绩统计不该影响交易主流程）。"""
+        try:
+            from src.trading import performance as _perf
+            _root = Path(DATA_DIR)
+            rep = _perf.build_report(
+                reports_dir=_root / "loop_reports",
+                history_file=_root / "paper_trade_history.json",
+                industry_file=_root / "industry_map.json",
+                account_file=_root / "paper_account.json",
+            )
+            _perf.save_report(rep, _root / "performance.json")
+            return rep
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"业绩档案更新失败（已忽略）: {e}")
+            return {}
+
+    @staticmethod
+    def _perf_brief(rep: dict) -> dict:
+        """从完整业绩档案里摘出日报需要的几项（None 原样保留，不冒充 0）。"""
+        eq = rep.get("equity") or {}
+        rk = rep.get("risk") or {}
+        tr = rep.get("trades") or {}
+        return {
+            "period": rep.get("period") or {},
+            "total_return_pct": eq.get("total_return_pct"),
+            "annualized_return_pct": eq.get("annualized_return_pct"),
+            "sharpe": rk.get("sharpe"),
+            "max_drawdown_pct": rk.get("max_drawdown_pct"),
+            "win_rate": tr.get("win_rate"),
+            "payoff_ratio": tr.get("payoff_ratio"),
+            "n_closes": tr.get("n_closes"),
+        }
+
 
     @staticmethod
     def _settle_markdown(s: dict) -> str:
@@ -942,6 +1038,26 @@ class TradingLoop:
             lines.append("")
         if s.get("equity_ok") is False:
             lines.append("> ⚠️ **账户快照取不到**：权益/当日盈亏为占位值，不可用于业绩归因。")
+            lines.append("")
+        pf = s.get("performance") or {}
+        if pf:
+            _per = pf.get("period") or {}
+
+            def _f(v, suf=""):
+                return "—" if v is None else f"{v:+.2f}{suf}"
+
+            _sharpe = "—" if pf.get("sharpe") is None else f"{pf['sharpe']:.2f}"
+            _wr = ("—" if pf.get("win_rate") is None
+                   else f"{pf['win_rate'] * 100:.0f}%")
+            lines.append(
+                f"**累计表现**（{_per.get('start') or '—'} ~ {_per.get('end') or '—'}，"
+                f"{_per.get('n_days', 0)} 个交易日）："
+                f"累计 {_f(pf.get('total_return_pct'), '%')}"
+                f" ｜ 年化 {_f(pf.get('annualized_return_pct'), '%')}"
+                f" ｜ 夏普 {_sharpe}"
+                f" ｜ 最大回撤 {_f(pf.get('max_drawdown_pct'), '%')}"
+                f" ｜ 平仓胜率 {_wr}（{pf.get('n_closes', 0)} 笔）"
+            )
             lines.append("")
         if s["positions"]:
             lines.append("| 代码 | 名称 | 数量 | 成本 | 现价 | 盈亏% |")
