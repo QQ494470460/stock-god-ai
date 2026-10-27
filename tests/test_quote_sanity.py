@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -17,7 +18,9 @@ for p in (str(ROOT), str(ROOT / "src")):
 
 import pytest
 
-from src.trading.sanity import QuoteSanityGuard, board_limit_pct, filter_prices, is_st
+from src.trading.sanity import (
+    QuoteSanityGuard, SanityBroker, board_limit_pct, filter_prices, is_st, wrap_broker,
+)
 
 
 # ---------------------------------------------------------------- 板限
@@ -177,3 +180,192 @@ def test_loop_price_guard_rejects_absurd_quote(tmp_path, monkeypatch):
     loop._price_cache.clear()
     # 连续第二次同向 → 说明是真跳空，采信
     assert loop._price_of("600519") == pytest.approx(1000.0)
+
+
+# ---------------------------------------------------------------- 券商代理
+class _FullBroker(_BadQuoteBroker):
+    """带五档价与「旁路方法」的假券商，用来验证代理的透明性。"""
+
+    def __init__(self, price, pre_close=None, ask1=None, bid1=None):
+        super().__init__(price, pre_close)
+        self.ask1 = ask1 if ask1 is not None else price
+        self.bid1 = bid1 if bid1 is not None else price
+        self.orders = []
+
+    def get_tick(self, code):
+        from src.trading.broker import TickData
+        return TickData(code=code, name=code, last_price=self.price,
+                        open=self.price, high=self.price, low=self.price,
+                        pre_close=self.pre_close, volume=1000, amount=1e5,
+                        bid1=self.bid1, ask1=self.ask1)
+
+    def place_order(self, code, side, order_type, price, quantity,
+                    strategy_tag=""):
+        self.orders.append((code, price, quantity))
+        return None
+
+
+def test_wrap_broker_is_idempotent():
+    """层层套娃会把「上一次可信价」切成几份 —— 必须幂等。"""
+    inner = _FullBroker(10.0)
+    once = wrap_broker(inner)
+    twice = wrap_broker(once)
+    assert once is twice, "重复包裹产生了两个代理，状态会被切成两份"
+    assert twice.guard is once.guard
+
+
+def test_wrap_broker_rebinds_shared_guard():
+    """传入守卫时应以传入为准（允许调用方显式决定共享哪份状态）。"""
+    inner = _FullBroker(10.0)
+    g = QuoteSanityGuard()
+    w = wrap_broker(inner, guard=g)
+    assert w.guard is g
+    g2 = QuoteSanityGuard()
+    w2 = wrap_broker(w, guard=g2)
+    assert w2 is w and w2.guard is g2
+
+
+def test_sanity_broker_passes_through_non_quote_methods():
+    """代理只净化行情，其余一律直通 —— 否则会影响下单/查询/武装校验。"""
+    inner = _FullBroker(10.0)
+    w = wrap_broker(inner)
+    assert w.is_simulated is False
+    assert w.get_broker_name() == "bad-quote"
+    assert w.is_trading_time() is True
+    assert w.query_account().total_asset == pytest.approx(1_000_000.0)
+    assert w.query_positions() == []
+    w.place_order("600519", "buy", "limit", 10.0, 100)
+    assert inner.orders == [("600519", 10.0, 100)], "下单没有直通到底层券商"
+
+
+def test_sanity_broker_rejects_absurd_quote_and_keeps_last_trusted():
+    inner = _FullBroker(10.0, pre_close=10.0)
+    w = wrap_broker(inner)
+    assert w.get_tick("600519").last_price == pytest.approx(10.0)   # 建立可信价
+    inner.price, inner.ask1, inner.bid1 = 1000.0, 1000.0, 1000.0    # 数据源抽风
+    t = w.get_tick("600519")
+    assert t.last_price == pytest.approx(10.0), "异常报价被采信了"
+    assert w.last_verdict("600519").ok is False
+
+
+def test_sanity_broker_pulls_back_ask_when_quote_untrusted():
+    """五档价与最新价同源，不可信时一并拉回。
+
+    不拉回的后果：execute_stop_orders 直接拿 tick.ask1 挂卖单 —— 会用一个
+    荒谬的委托价把持仓砸出去。
+    """
+    inner = _FullBroker(10.0, pre_close=10.0)
+    w = wrap_broker(inner)
+    w.get_tick("600519")
+    inner.price, inner.ask1 = 1000.0, 1000.0
+    t = w.get_tick("600519")
+    assert t.ask1 == pytest.approx(10.0), "止损会拿荒谬 ask1 定价"
+
+
+def test_sanity_broker_accepts_after_confirmation():
+    """连续 2 次同向偏离 = 真实跳空（如涨跌停），必须采信。"""
+    inner = _FullBroker(10.0, pre_close=10.0)
+    w = wrap_broker(inner)
+    w.get_tick("600519")
+    inner.price = 1000.0
+    assert w.get_tick("600519").last_price == pytest.approx(10.0)   # 第 1 次
+    assert w.get_tick("600519").last_price == pytest.approx(1000.0)  # 第 2 次
+
+
+def test_sanity_broker_does_not_mutate_source_tick():
+    """券商可能复用同一 tick 对象，就地改会污染别的取值。"""
+    from src.trading.broker import TickData
+    src = TickData(code="600519", name="600519", last_price=1000.0,
+                   open=1000.0, high=1000.0, low=1000.0, pre_close=10.0,
+                   volume=1000, amount=1e5)
+    w = wrap_broker(_FullBroker(10.0, pre_close=10.0))
+    w.guard._last["600519"] = 10.0
+    out = w.sanitize("600519", src)
+    assert src.last_price == pytest.approx(1000.0), "原始 tick 被就地改写了"
+    assert out.last_price == pytest.approx(10.0)
+
+
+def test_sanity_broker_zeroes_price_when_no_history_and_invalid():
+    """没有历史可信价时不能编一个数出来 —— 归 0 让下游按「无行情」拒单。"""
+    inner = _FullBroker(0.0)
+    w = wrap_broker(inner)
+    t = w.get_tick("600519")
+    assert t.last_price == 0.0
+
+
+def test_risk_supervisor_wraps_broker_and_shares_guard(tmp_path):
+    """中枢必须自己收口，且 executor / safety 共用同一份守卫状态。"""
+    from src.trading.guard import GuardConfig, RiskSupervisor
+
+    inner = _FullBroker(10.0, pre_close=10.0)
+    cfg = GuardConfig(state_file=str(tmp_path / "g.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    sup = RiskSupervisor(inner, cfg)
+
+    assert isinstance(sup.broker, SanityBroker)
+    assert isinstance(sup.executor.broker, SanityBroker)
+    assert sup.executor.broker is sup.broker
+    assert sup.safety._broker is sup.broker
+    assert sup.sanity is sup.broker.guard
+
+    # 一次抖动：三处看到的是同一个结论（不能 A 判异常、B 判正常）
+    sup.broker.get_tick("600519")
+    inner.price = 1000.0
+    assert sup.executor.broker.get_tick("600519").last_price == pytest.approx(10.0)
+
+
+def test_loop_rebinds_external_guard_to_proxy(tmp_path):
+    """外部先建好的中枢握的是原始券商，闭环必须整体回灌到代理上。"""
+    from src.trading.guard import GuardConfig, RiskSupervisor
+    from src.trading.loop import LoopConfig, TradingLoop
+    from src.trading.paper import PaperAccount
+
+    inner = _FullBroker(10.0, pre_close=10.0)
+    cfg = GuardConfig(state_file=str(tmp_path / "g.json"),
+                      journal_file=str(tmp_path / "j.jsonl"))
+    pa = PaperAccount(initial_cash=100_000.0,
+                      account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json")
+    sup = RiskSupervisor(inner, cfg, paper_account=pa)
+    loop = TradingLoop(inner, guard=sup, paper_account=pa,
+                       config=LoopConfig(auto_build_plan=False,
+                                         heartbeat_file=str(tmp_path / "hb.json")))
+
+    assert loop.broker is sup.broker, "闭环与中枢用了两个代理，状态会打架"
+    assert loop.guard.executor.broker is loop.broker
+    assert sup.sanity is loop._sanity, "三处取价没有共享同一个守卫"
+
+
+def test_bad_quote_is_journaled_for_audit(tmp_path):
+    """报价拦截必须落进交易流水，而不只是刷一行日志。
+
+    常驻闭环（run_loop.py）没注册 UI 事件回调，走 loop._emit 是**空转**；
+    事后要回答「今天数据源骗了几次、骗在哪几只票上」就只能靠 journal。
+    """
+    from src.trading.guard import GuardConfig, RiskSupervisor
+    from src.trading.loop import LoopConfig, TradingLoop
+    from src.trading.paper import PaperAccount
+
+    broker = _FullBroker(10.0, pre_close=10.0)
+    journal = tmp_path / "j.jsonl"
+    cfg = GuardConfig(state_file=str(tmp_path / "g.json"),
+                      journal_file=str(journal))
+    pa = PaperAccount(initial_cash=100_000.0,
+                      account_file=tmp_path / "pa.json",
+                      history_file=tmp_path / "ph.json")
+    loop = TradingLoop(broker, guard=RiskSupervisor(broker, cfg, paper_account=pa),
+                       paper_account=pa,
+                       config=LoopConfig(auto_build_plan=False,
+                                         heartbeat_file=str(tmp_path / "hb.json")))
+
+    loop._price_of("600519")          # 建立可信价
+    broker.price = 1000.0             # 数据源抽风
+    loop._price_cache.clear()
+    assert loop._price_of("600519") == pytest.approx(10.0)
+
+    recs = [json.loads(ln) for ln in journal.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+    hits = [r for r in recs if r.get("event") == "quote_reject"]
+    assert hits, "报价拦截没有落进交易流水"
+    assert hits[0]["data"]["code"] == "600519"
+    assert hits[0]["data"]["used"] == pytest.approx(10.0)

@@ -48,6 +48,7 @@ from src.trading.paper import PaperAccount
 from src.trading.rules import check_buyable, check_sellable, sellable_quantity
 from src.trading.regime import RegimeWeighter, RegimeSmoother
 from src.trading.intelligence import StrategyCredibility
+from src.trading.sanity import wrap_broker
 
 try:  # 与 calendar.py 一致：打包/测试环境下 config 可能不在 sys.path 顶层
     from config.settings import ROOT_DIR, DATA_DIR
@@ -944,7 +945,11 @@ class RiskSupervisor:
         risk_monitor=None,
         turnover_file: Optional[Path] = None,
     ):
-        self.broker = broker
+        # 报价校验收口：任何构造路径都必须过它，而不只是闭环那一条。
+        # propose_trade 自己会 broker.get_tick() 且不接受外部传价，止损判定
+        # 也在 executor 内部独立取价 —— 只修闭环等于没修。
+        self.broker = wrap_broker(broker)
+        self.sanity = getattr(self.broker, "guard", None)
         self.config = config or GuardConfig()
         self.paper_account = paper_account
         # 行业映射默认自动装载：不传就空表会让「行业集中度」风控静默失效
@@ -1011,11 +1016,11 @@ class RiskSupervisor:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"按配置构造 RiskConfig 失败，改用默认值: {e}")
                 risk_config = None
-        self.executor = TradeExecutor(broker, risk_config)
+        self.executor = TradeExecutor(self.broker, risk_config)
         self.risk_config = self.executor.config
 
         # 安全层组件（把 broker 注入进去：武装实盘前要能确认它是真实盘通道）
-        self.safety = SafetyController(self.config, broker=broker)
+        self.safety = SafetyController(self.config, broker=self.broker)
         self.gate = OrderGate(self.config, self.safety)
 
         # 波动率目标法需要的「按 code 实时估 vol」provider（固定比例法下不会被调用）
@@ -1073,6 +1078,32 @@ class RiskSupervisor:
     # ---------- 事件回调 ----------
     def set_event_callback(self, cb: Callable[[str, dict], None]):
         self._on_event = cb
+
+    def rebind_broker(self, broker) -> None:
+        """把下单/取价通道整体切到另一个 broker（通常是报价代理）。
+
+        为什么需要：:class:`~src.trading.loop.TradingLoop` 会在构造时才把原始
+        券商包成 ``SanityBroker``，而外部（``run_loop.py`` / 看板）已经先建好了
+        本中枢并注入了**原始** broker。不整体回灌的话，``propose_trade`` 与
+        ``check_stop_conditions`` 仍走原始通道 —— 报价校验等于只覆盖了闭环估值
+        那一条路，而止损恰恰是拿另外那条路的价在判。
+
+        三处引用必须一起换（本类 / 内层 executor / 安全层），漏一个就留一个
+        绕过校验的入口。
+        """
+        self.broker = broker
+        # 顺手把「当前生效的报价守卫」指到代理上那份 —— 两处各留一份状态
+        # 正是这个模块要防的事（A 判异常沿用旧价，B 没见过该价反手采信）。
+        self.sanity = getattr(broker, "guard", getattr(self, "sanity", None))
+        try:
+            self.executor.broker = broker
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"executor 切通道失败（止损取价仍绕过校验）: {e}")
+        try:
+            if getattr(self, "safety", None) is not None:
+                self.safety._broker = broker
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"安全层切通道失败（武装前券商校验仍看旧对象）: {e}")
 
     def _emit(self, event: str, data: dict):
         self.journal.log(event, data)

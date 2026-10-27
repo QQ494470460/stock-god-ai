@@ -1,5 +1,8 @@
 {
-  "_comment": "Walk-Forward 样本外门禁开关（防过拟合的最后一道闸）。默认关闭（fail-safe）。开启前必须先 `scripts/evolve.py --build-panel` 且面板足够长（≥ max(min_periods*3, 36) 天），否则 _walk_forward_verdict 会静默退化为「不拦」（等于没开）。设 require_walk_forward=true 后：候选除了通过 A/B 回测，还必须在按时间切分的多个样本外折上整体胜过当前参数（样本外胜折数 ≥ min_wf_folds），否则被拒。也可在单次回合用 --walk-forward / --no-walk-forward 临时覆盖。",
+  "_comment": "进化闸门门槛。五层判定：①风控硬线 ②可评估性 ③A/B 指标对比 ④walk-forward 多折样本外 ⑤回测-实盘一致性。②③恒开，④⑤须显式打开。| require_walk_forward：需先 `scripts/evolve.py --build-panel` 且面板 ≥ max(min_periods*3, 36) 天，否则静默退化为「不拦」（等于没开）；开启后候选除通过 A/B 外还须在多个样本外折上整体胜过当前参数（胜折数 ≥ min_wf_folds）。| require_live_consistency：比对回测夏普与 data/performance.json 的真实夏普，背离 > max_live_gap_sharpe 即判定模拟失真、拒绝放行；真实样本 < min_live_days 个交易日时只报告不拦截（fail-safe）。真实业绩摘要无论开关如何都会写进判定依据。",
   "require_walk_forward": true,
-  "min_wf_folds": 3
+  "min_wf_folds": 3,
+  "require_live_consistency": true,
+  "max_live_gap_sharpe": 2.0,
+  "min_live_days": 20
 }

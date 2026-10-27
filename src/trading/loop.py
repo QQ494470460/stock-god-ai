@@ -47,7 +47,7 @@ from src.core.single_instance import SingleInstanceLock
 from config.settings import DATA_DIR, config as app_config
 from src.trading.broker import BrokerAPI, OrderSide, Position, AccountInfo, Order
 from src.trading.guard import RiskSupervisor, build_supervisor, TradingMode
-from src.trading.sanity import QuoteSanityGuard
+from src.trading.sanity import QuoteSanityGuard, wrap_broker
 
 
 # ----------------------------------------------------------------------------
@@ -198,16 +198,41 @@ class TradingLoop:
         event_callback: Optional[Callable[[str, dict], None]] = None,
         lock_path: Optional[str] = None,
     ):
-        self.broker = broker
-
         # 单实例锁：传了 lock_path 就表示「本实例启动时必须先抢到这把锁」。
         # 看板内嵌闭环与常驻 run_loop.py 共用 data/.run_loop.lock，
         # 抢不到 = 已经有一个实例在跑 → 拒绝启动，避免重复下单。
         self._instance_lock = SingleInstanceLock(lock_path) if lock_path else None
         self.config = config or LoopConfig.from_app_config()
 
+        # 报价合法性守卫：一个坏价格就是一笔坏交易。
+        # 数据源会偶发返回昨收/复权价/错位价，而止损是按价格判定的 ——
+        # 不校验就会在错误的价格上斩仓，或让权益曲线凭空断崖。
+        # 连续 confirm 次同向偏离才采信（区分「数据抖动」与「真实涨跌停」）。
+        #
+        # ⚠️ 顺序有讲究：守卫必须先建，再拿去包券商，最后回灌给 guard。
+        # 三处取价链路（闭环估值 / propose_trade 预览 / executor 止损）必须
+        # 共享**同一个**实例 —— 「上一次可信价」是跨 tick 状态，各记一份就会
+        # 互相打架：这边判异常沿用旧价，那边没见过这个价反手就采信。
+        self._sanity = QuoteSanityGuard(confirm_ticks=2, tolerance_pct=2.0)
+        self._sanity_warned: set = set()   # (code, why) 去重，避免每 tick 刷日志
+        self.broker = wrap_broker(
+            broker, guard=self._sanity, on_reject=self._warn_bad_quote)
+
         # 安全中枢：未提供则自动构建（默认 PAPER，绝不裸奔）
-        self.guard = guard or build_supervisor(broker, paper_account=paper_account)
+        self.guard = guard or build_supervisor(self.broker, paper_account=paper_account)
+        # 外部传入的 guard（run_loop.py / 看板）握的是**原始** broker，
+        # 取价会绕过代理。整体切到代理上，否则刚才那层包装等于白套。
+        try:
+            self.guard.rebind_broker(self.broker)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"风控中枢切到报价代理失败（取价将绕过校验）: {e}")
+        else:
+            # 启动即留痕：出问题时第一件事就是确认「校验到底有没有接管」，
+            # 靠推理不如靠一行日志。
+            logger.info(
+                f"🔍 报价校验已接管取价通道（券商代理统一收口，"
+                f"连续 {self._sanity.confirm_ticks} 次同向偏离才采信，"
+                f"容差 ±{self._sanity.tolerance_pct:g}%）")
         if paper_account is not None and getattr(self.guard, "paper_account", None) is None:
             self.guard.paper_account = paper_account
 
@@ -222,13 +247,6 @@ class TradingLoop:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._price_cache: Dict[str, float] = {}
-
-        # 报价合法性守卫：一个坏价格就是一笔坏交易。
-        # 数据源会偶发返回昨收/复权价/错位价，而止损是按价格判定的 ——
-        # 不校验就会在错误的价格上斩仓，或让权益曲线凭空断崖。
-        # 连续 confirm 次同向偏离才采信（区分「数据抖动」与「真实涨跌停」）。
-        self._sanity = QuoteSanityGuard(confirm_ticks=2, tolerance_pct=2.0)
-        self._sanity_warned: set = set()   # (code, why) 去重，避免每 tick 刷日志
 
         # 结算记账
         self._settled_dates: set = set()
@@ -396,13 +414,44 @@ class TradingLoop:
             logger.debug(f"取持仓失败: {e}")
             return list(self.broker.query_positions() or [])
 
+    def _warn_bad_quote(self, code: str, raw: float, v) -> None:
+        """报价被代理拦下时的告警（按 code + 原因去重，避免每 tick 刷屏）。
+
+        双写：``logger.warning`` 给人看实时日志，``quote_reject`` 进交易流水
+        给事后复盘 —— 「今天数据源骗了几次、骗在哪几只票上」必须能查。
+        ⚠️ 闭环走 ``self._emit`` 是**空转**（常驻 run_loop.py 没注册 UI 回调），
+        所以这里改走风控中枢的 ``_emit``，它同时写 journal 与 UI 回调。
+        """
+        try:
+            key = (str(code or ""), str(v.why or "").split("（")[0])
+            if key in self._sanity_warned:
+                return
+            self._sanity_warned.add(key)
+            payload = {
+                "code": code,
+                "raw": round(float(raw or 0), 4),
+                "used": round(float(v.price or 0), 4),
+                "why": v.why,
+            }
+            logger.warning(
+                f"⚠️ 报价异常已拦截 {code}: 原始价 {raw:.3f} → {v.why}；"
+                f"本次沿用 ¥{float(v.price or 0):.3f}")
+            g = getattr(self, "guard", None)
+            if g is not None:
+                g._emit("quote_reject", payload)
+            else:
+                self._emit("quote_reject", payload)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _price_of(self, code: str) -> float:
         if code in self._price_cache:
             return self._price_cache[code]
         price = 0.0
         pre_close = 0.0
         volume = amount = None
-        # 1) 券商实时行情
+        from_broker = False
+        # 1) 券商实时行情（已被 SanityBroker 净化过 —— 这里拿到的就是可信价）
         try:
             tick = self.broker.get_tick(code)
             if tick and getattr(tick, "last_price", 0) > 0:
@@ -410,6 +459,7 @@ class TradingLoop:
                 pre_close = float(getattr(tick, "pre_close", 0) or 0)
                 volume = getattr(tick, "volume", None)
                 amount = getattr(tick, "amount", None)
+                from_broker = True
         except Exception:  # noqa: BLE001
             pass
         # 2) 公开实时行情兜底（券商 tick 不可用时的**首选**兜底）
@@ -456,16 +506,15 @@ class TradingLoop:
                 price = 0.0
 
         # 5) 合法性校验：可疑价不采信，沿用上一次可信价（好过用 0 让止损失明）
-        if price > 0:
+        #    ⚠️ 券商那条路已在 SanityBroker 里校验过（from_broker），这里不能再检
+        #    一次 —— 同一个价被 check 两遍会让「连续 N 次才采信」变成 N/2 次，
+        #    相当于偷偷把 confirm_ticks=2 降成 1，一次抖动就能改写风控判断。
+        #    公开行情 / 日线 / 外部价格函数这三条兜底路径绕过代理，必须补检。
+        if price > 0 and not from_broker:
             v = self._sanity.check(code, price, pre_close=pre_close,
                                    volume=volume, amount=amount)
             if not v.ok:
-                key = (code, v.why.split("（")[0])
-                if key not in self._sanity_warned:
-                    self._sanity_warned.add(key)
-                    logger.warning(
-                        f"⚠️ 报价异常已拦截 {code}: 原始价 {price:.3f} → "
-                        f"{v.why}；本次沿用 ¥{v.price:.3f}")
+                self._warn_bad_quote(code, price, v)
             if v.price > 0:
                 price = v.price
 

@@ -14,6 +14,7 @@ from loguru import logger
 from src.trading.broker import BrokerAPI, OrderSide, Order
 from src.trading.executor import TradeExecutor, RiskConfig
 from src.trading.yuekai import YuekaiBroker
+from src.trading.sanity import wrap_broker
 from src.trading.account import account_manager
 
 
@@ -33,7 +34,10 @@ class AutoTrader:
         broker: Optional[BrokerAPI] = None,
         risk_config: Optional[RiskConfig] = None,
     ):
-        self.broker = broker or YuekaiBroker()
+        # 报价校验收口（详见 src/trading/sanity.py）：本编排器会独立取 tick
+        # 判止损/定价，不包一层就会成为绕过校验的第四条通道。
+        self.broker = wrap_broker(broker or YuekaiBroker())
+        self.sanity = getattr(self.broker, "guard", None)
         self.executor = TradeExecutor(self.broker, risk_config)
         self.config = self.executor.config
         

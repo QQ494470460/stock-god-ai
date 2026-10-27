@@ -498,8 +498,8 @@ def _doctor() -> int:
         else:
             print(f"     ℹ️ {what}：{p.name} 尚未生成（首次运行时创建）")
 
-    # ---------------- 7 Walk-Forward 门禁就绪 ----------------
-    print("\n【7/7 Walk-Forward 门禁就绪】防过拟合的最后一道闸")
+    # ---------------- 7 闸门就绪（WF + 回测-实盘一致性） ----------------
+    print("\n【7/7 闸门就绪】防过拟合的样本外闸 + 唯一的真实业绩参照")
     from src.evolution import gate as _gate
 
     wf_crit = _gate.load_criteria()
@@ -523,6 +523,30 @@ def _doctor() -> int:
             else:
                 ok(f"门禁已开启且面板 {nd} 天 ≥ {min_len} 天下限，"
                    f"walk-forward 会真正生效（min_wf_folds={wf_crit.min_wf_folds}）")
+
+    # ---- 第五层：回测-实盘一致性（消费 data/performance.json）----
+    if not wf_crit.require_live_consistency:
+        print("   ⚪ 回测-实盘一致性校验**关闭**。候选只看回测就可能被采纳，"
+              "模拟失真（滑点/成交价/信号延迟）无从发现。")
+    else:
+        perf = _gate.load_live_performance()
+        if not perf:
+            warn("一致性校验已开启，但没有 data/performance.json —— "
+                 "本层会退化为「只报告不拦截」，等于没开",
+                 "python scripts/performance.py（或等闭环收盘结算自动生成）")
+        else:
+            nd = int((perf.get("period") or {}).get("n_days") or 0)
+            cap = wf_crit.max_live_gap_sharpe
+            if nd < wf_crit.min_live_days:
+                warn(f"一致性校验已开启，但真实业绩仅 {nd} 天 < "
+                     f"{wf_crit.min_live_days} 天下限 —— 只报告不拦截"
+                     "（用几天业绩否决候选等于用噪声管噪声）",
+                     "等闭环累积足够交易日；不要为此调低 min_live_days")
+            else:
+                sh = (perf.get("risk") or {}).get("sharpe")
+                sh_s = "无定义（零波动）" if sh is None else f"{float(sh):.2f}"
+                ok(f"一致性校验已开启：真实业绩 {nd} 天、真实夏普 {sh_s}，"
+                   f"回测背离容忍 ≤{cap:.2f}")
 
     print("\n" + "=" * 72)
     if blockers:
@@ -615,6 +639,10 @@ def main() -> int:
     if criteria.require_walk_forward:
         print(f"🔬 本回合已启用 Walk-Forward 样本外门禁"
               f"（min_wf_folds={criteria.min_wf_folds}，面板过短会退化为不拦）")
+    if criteria.require_live_consistency:
+        print(f"🔍 本回合已启用回测-实盘一致性校验"
+              f"（真实夏普背离 ≤{criteria.max_live_gap_sharpe:.2f}，"
+              f"真实样本 ≥{criteria.min_live_days} 天才校验）")
 
     runner = EvolutionRunner(provider=panels.provider_from_cache(),
                              criteria=criteria)
@@ -725,6 +753,25 @@ def main() -> int:
     print(f"   Walk-Forward 样本外门禁：{wf}"
           f"（min_wf_folds={c.min_wf_folds}，需面板 ≥ "
           f"{max(c.min_periods * 3, 36)} 天，否则退化为不拦）")
+
+    # 第五层：回测-实盘一致性 —— 唯一的外部参照，必须一眼可见
+    if c.require_live_consistency:
+        perf = gate.load_live_performance()
+        if not perf:
+            live = "✅已开启（但无业绩报告 → 只报告不拦截）"
+        else:
+            _nd = int((perf.get("period") or {}).get("n_days") or 0)
+            if _nd < c.min_live_days:
+                live = (f"✅已开启（真实业绩仅 {_nd} 天 < {c.min_live_days} "
+                        "天 → 只报告不拦截）")
+            else:
+                _sh = (perf.get("risk") or {}).get("sharpe")
+                _sh_s = "无定义" if _sh is None else f"{float(_sh):.2f}"
+                live = (f"✅已开启（真实 {_nd} 天、夏普 {_sh_s}，"
+                        f"背离容忍 ≤{c.max_live_gap_sharpe:.2f}）")
+    else:
+        live = "⚪关闭（候选只看回测即可能被采纳）"
+    print(f"   回测-实盘一致性校验：{live}")
     return 0
 
 

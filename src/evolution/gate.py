@@ -22,6 +22,14 @@
    而不是因为「差异为 0」就误判为通过 —— 那是最危险的假阳性。
 3. **指标对比**
    夏普须有实质提升、收益不得倒退、回撤不得恶化、调仓期数须够多。
+4. **walk-forward 多折样本外**（可选，``require_walk_forward``）
+   按时间切折，候选须在多数折上同时不输基准 —— 防「全样本好看、实盘拉胯」。
+5. **回测-实盘一致性**（可选，``require_live_consistency``）
+   拿 ``data/performance.json`` 里的真实夏普校验回测夏普。前四层全在模拟里
+   打转，这一层是唯一的外部参照：背离过大即说明撮合假设失真，此时 A/B 出来的
+   「好 0.05 夏普」是模拟的产物而不是策略的改进，整批拒绝放行。
+   真实样本不足 ``min_live_days`` 时只报告不拦截 —— 用几天业绩否决候选，
+   等于用噪声管噪声。业绩摘要**无论开关如何**都会写进判定依据。
 
 生成器的分工
 ============
@@ -50,11 +58,16 @@ __all__ = [
     "GateCriteria", "DEFAULT_CRITERIA", "BACKTEST_MAP", "PanelProvider",
     "risk_precheck", "map_changes", "compare_metrics", "evaluate",
     "evaluate_candidate", "verify_supplied_evaluation", "apply_verdict",
-    "load_criteria",
+    "load_criteria", "load_live_performance",
 ]
 
 #: 闸门配置文件的默认位置（项目根 config/）。可被 load_criteria(path=...) 覆盖（测试用）。
 _GATE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "evolution_gate.json"
+
+#: 真实业绩报告（由 src/trading/performance.py 的 build_report 落盘）。
+#: 进化闸门消费它是为了让「是否采纳候选」不再只看回测 —— 回测是模拟，
+#: 业绩是真金白银（纸盘也是同一套撮合与风控口径）。
+_LIVE_PERF_PATH = Path(__file__).resolve().parents[2] / "data" / "performance.json"
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +96,17 @@ class GateCriteria:
     require_walk_forward: bool = False
     #: walk-forward 至少要在多少折上胜过基准（样本外胜率门槛）
     min_wf_folds: int = 3
+
+    # ---- 第五层：回测-实盘一致性（防「回测很好看、实盘一直亏」的模拟失真）----
+    #: 是否启用一致性校验。默认关闭 —— 真实业绩样本不足时它本来就会自动跳过，
+    #   但「开」仍必须显式，避免误以为系统已经在校验。
+    require_live_consistency: bool = False
+    #: 允许的夏普背离上限（回测夏普 − 真实夏普）。超过即认为模拟严重失真，
+    #   A/B 回测的差异不再可信 —— 此时任何候选都不该被放行。
+    max_live_gap_sharpe: float = 2.0
+    #: 真实业绩最少交易日。不足则只报告、不拦截（fail-safe）：
+    #   用 4 天的业绩去否决候选，等于用噪声管噪声。
+    min_live_days: int = 20
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -329,6 +353,7 @@ def evaluate(
     candidate: Candidate,
     provider: Optional[PanelProvider] = None,
     criteria: GateCriteria = DEFAULT_CRITERIA,
+    live_perf_path=None,
 ) -> Evaluation:
     """对一个候选做样本外验证。
 
@@ -338,6 +363,8 @@ def evaluate(
             缺省尝试 :func:`default_panel_provider`（当前返回 None，
             即「本机没有现成面板」→ 判负而非放行）。
         criteria: 判定门槛。
+        live_perf_path: 真实业绩报告路径（缺省 ``data/performance.json``）。
+            仅供测试注入，生产无需传。
 
     Returns:
         :class:`Evaluation`。``evaluator`` 取值为
@@ -417,6 +444,16 @@ def evaluate(
         # 「walk-forward 通过/未通过」前缀，直接留痕即可。
         reasons = reasons + [wf_msg]
         if not wf_ok:
+            passed = False
+
+    # ---- 第五层：回测-实盘一致性（消费真实业绩）----
+    # 无论通过与否都把依据写进 reasons：真实业绩是这条判定链上唯一的
+    # 「非模拟」证据，漏记会让事后复盘看不到当时的现实处境。
+    if passed:
+        live_ok, live_reasons = _live_consistency_verdict(
+            base_metrics, criteria, path=live_perf_path)
+        reasons = reasons + live_reasons
+        if not live_ok:
             passed = False
 
     ev = Evaluation(
@@ -524,6 +561,115 @@ def _walk_forward_verdict(
 def gate_backtest_keys() -> set:
     """``run_backtest`` 能接受的组合参数键（与 BACKTEST_MAP 的值域保持同步）。"""
     return {bt_key for bt_key, _ in BACKTEST_MAP.values()}
+
+
+# ---------------------------------------------------------------------------
+# 第五层：回测-实盘一致性（消费真实业绩）
+# ---------------------------------------------------------------------------
+
+def load_live_performance(path=None) -> Optional[Dict[str, Any]]:
+    """读取 ``data/performance.json``（业绩归因引擎的产物）。
+
+    缺失 / 损坏 / 不是 dict 一律返回 None —— 门禁据此「只报告不拦截」。
+    绝不因为盘上有半截 JSON 就在进化回路上抛异常：进化的失败模式必须是
+    「不动」而不是「崩掉」。
+    """
+    p = Path(path) if path else _LIVE_PERF_PATH
+    try:
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"真实业绩报告读取失败（一致性校验跳过）: {e}")
+        return None
+
+
+def _live_summary(perf: Dict[str, Any]) -> str:
+    """一行人话摘要，写进每条判定依据里 —— 让「进化决定」天生带真实业绩上下文。"""
+    period = perf.get("period") or {}
+    eq = perf.get("equity") or {}
+    risk = perf.get("risk") or {}
+    trades = perf.get("trades") or {}
+
+    def _f(v, unit=""):
+        return "—" if v is None else f"{float(v):.2f}{unit}"
+
+    dd = risk.get("max_drawdown_pct")
+    dd_s = "—" if dd is None else f"{float(dd):.2f}%"
+    return (
+        f"（实盘）{period.get('start', '?')}~{period.get('end', '?')} "
+        f"共 {period.get('n_days', 0)} 个交易日："
+        f"累计 {_f(eq.get('total_return_pct'), '%')}，"
+        f"最大回撤 {dd_s}，"
+        f"盈亏比 {_f(trades.get('payoff_ratio'))}，"
+        f"胜率 {_f((trades.get('win_rate') or 0) * 100, '%') if trades.get('win_rate') is not None else '—'}，"
+        f"最长连亏 {trades.get('max_consecutive_losses', '—')} 笔"
+    )
+
+
+def _live_consistency_verdict(
+    backtest_metrics: Dict[str, Any],
+    criteria: GateCriteria,
+    path=None,
+) -> Tuple[bool, List[str]]:
+    """回测夏普 vs 真实夏普的背离校验。
+
+    为什么需要这一层
+    ----------------
+    前四层全在**回测**里打转。回测是模拟：滑点按固定值估、成交按收盘价给、
+    信号按 T 日收盘计算 T+1 开盘执行。任何一处失真，A/B 对比出来的
+    「候选比基准好 0.05 夏普」就可能是模拟假设的产物，而不是策略的改进。
+    真实业绩恰恰是这套假设的**校验器**：回测夏普 1.5 而真实夏普 -2，说明
+    模拟与现实差了两个数量级，此时拿回测差异去改参数等于在错的坐标系里调参。
+
+    保守边界（三条都不拦）
+    ----------------------
+    · 报告缺失 / 损坏
+    · 真实样本 < ``min_live_days``（4 天的业绩否定不了任何东西）
+    · 任一夏普为 None（样本不足 20 日 / 零波动时夏普无定义）
+    宁可漏拦，也不让一条「数据还没攒够」就永久冻结进化。
+
+    Returns:
+        ``(是否放行, 依据文案列表)``。依据**总会**返回（含仅报告的情况），
+        这样即便开关关闭，进化日志里也能看到当时的真实业绩。
+    """
+    perf = load_live_performance(path)
+    if not perf:
+        return True, ["（实盘）无业绩报告，一致性校验跳过"]
+
+    reasons = [_live_summary(perf)]
+
+    if not criteria.require_live_consistency:
+        return True, reasons
+
+    n_days = int((perf.get("period") or {}).get("n_days") or 0)
+    if n_days < int(criteria.min_live_days):
+        reasons.append(
+            f"一致性校验跳过：真实样本 {n_days} 交易日 < {criteria.min_live_days}，"
+            "不足以判定模拟失真")
+        return True, reasons
+
+    bt = _num(backtest_metrics, "sharpe")
+    live = (perf.get("risk") or {}).get("sharpe")
+    if bt is None or live is None:
+        reasons.append("一致性校验跳过：回测或真实夏普缺失（样本不足/零波动）")
+        return True, reasons
+
+    gap = float(bt) - float(live)
+    cap = float(criteria.max_live_gap_sharpe)
+    if gap > cap:
+        reasons.append(
+            f"回测-实盘背离过大：回测夏普 {float(bt):.2f} 比真实夏普 "
+            f"{float(live):.2f} 高 {gap:.2f}，超出容忍 {cap:.2f} → "
+            "模拟逼真度存疑（滑点/成交价/信号延迟），本次 A/B 差异不可信，拒绝放行。"
+            "请先校准撮合假设或排查实盘执行偏差。")
+        return False, reasons
+
+    reasons.append(
+        f"回测-实盘一致性通过：回测夏普 {float(bt):.2f} vs 真实 {float(live):.2f}"
+        f"（背离 {gap:+.2f}，容忍 ≤{cap:.2f}）")
+    return True, reasons
 
 
 def _clean(metrics: Dict[str, Any]) -> Dict[str, float]:
