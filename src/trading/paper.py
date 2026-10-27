@@ -705,7 +705,98 @@ class PaperAccount:
                        f"盈亏¥{pnl:+,.2f}({pnl_pct:+.2f}%) 余额¥{self.cash:,.0f}")
             
             return True, f"✅ 卖出 {quantity}股 @¥{fill_price:.2f} 盈亏¥{pnl:+,.2f}", record
-    
+
+    # ========== 除权除息 ==========
+
+    def apply_corporate_action(
+        self, code: str, kind: str,
+        ratio: float = 0.0, dividend_per_share: float = 0.0,
+        ex_date: str = "",
+    ) -> Tuple[bool, str]:
+        """处理除权除息，保持账本价值连续（避免除权日出现 Phantom 盈亏/止损失效）。
+
+        A 股常见公司行为：
+
+        - ``"split"`` / ``"bonus"`` 送股 / 转增：每 1 股变 ``(1+ratio)`` 股，成本同比例
+          摊薄，现金不变。例：10 送 10 → ``ratio=1.0``，持股 1000 变 2000、均价减半。
+        - ``"dividend"`` 现金分红：``cash += 持股数 × dividend_per_share``，持仓股数/
+          成本不动（除息价由市场自然回落，mark_to_market 会接管）。
+        - ``"merge"`` 缩股：每 ``ratio(<1)`` 股并 1 股，成本同比例抬高，现金不变。
+
+        为什么必须做：不复权会让持仓在除权日凭空「少一半市值 + 成本价不变」，
+        止损线与盈亏比同时失真 —— 一次 10 送 10 就能把一笔盈利仓算成巨亏，触发
+        误斩仓。这里把股数/成本同步调整，使 ``持股数×成本 × 价格`` 在除权前后连续。
+
+        不抛出任何异常：参数非法或持仓缺失只返回 (False, 原因)，主流程照常。
+        """
+        kind = str(kind or "").strip().lower()
+        with self._lock:
+            with _xlock(self):
+                self._load()
+                if code not in self.holdings:
+                    return False, f"无 {code} 持仓，无法除权", None
+                h = self.holdings[code]
+                try:
+                    qty = int(h.get("quantity", 0) or 0)
+                    avail = int(h.get("available", qty) or 0)
+                    today = int(h.get("today_quantity", 0) or 0)
+                    cost = float(h.get("avg_cost", 0) or 0)
+                    px = float(h.get("last_price", 0) or 0)
+                except (TypeError, ValueError):
+                    return False, "持仓字段损坏"
+
+                if kind in ("split", "bonus"):
+                    factor = 1.0 + float(ratio or 0.0)
+                    if factor <= 0:
+                        return False, f"送转比例非法: {ratio}"
+                    new_qty = int(round(qty * factor))
+                    h["quantity"] = new_qty
+                    h["available"] = int(round(avail * factor))
+                    h["today_quantity"] = int(round(today * factor))
+                    h["avg_cost"] = round(cost / factor, 6) if cost > 0 else cost
+                    h["market_value"] = round(new_qty * px, 2) if px > 0 else h.get("market_value", 0)
+                    note = f"送转 {ratio*100:.0f}%（每 1 股变 {factor:.2f} 股，成本摊薄）"
+                elif kind == "dividend":
+                    dps = float(dividend_per_share or 0.0)
+                    if dps <= 0:
+                        return False, f"每股分红非法: {dividend_per_share}"
+                    self.cash += round(qty * dps, 2)
+                    note = f"现金分红 ¥{dps:.4f}/股 × {qty}股 = ¥{qty*dps:,.2f}"
+                elif kind == "merge":
+                    factor = float(ratio or 1.0)
+                    if factor <= 0 or factor >= 1:
+                        return False, f"缩股比例非法（需 0<ratio<1）: {ratio}"
+                    new_qty = int(round(qty * factor))
+                    if new_qty <= 0:
+                        return False, "缩股后股数为 0"
+                    h["quantity"] = new_qty
+                    h["available"] = int(round(avail * factor))
+                    h["today_quantity"] = int(round(today * factor))
+                    h["avg_cost"] = round(cost / factor, 6) if cost > 0 else cost
+                    h["market_value"] = round(new_qty * px, 2) if px > 0 else h.get("market_value", 0)
+                    note = f"缩股（每 {factor:.2f} 股并 1 股，成本抬高）"
+                else:
+                    return False, f"未知公司行为类型: {kind}", None
+
+                self._normalize_holdings()
+
+                # 审计记录：用独立 side，performance.attribute 只统计 side=="sell"，
+                # 不会污染已实现盈亏；看板可据 strategy 单独展示「公司行为」。
+                tid = f"CA{datetime.now().strftime('%Y%m%d%H%M%S')}{self.today_trades:03d}"
+                rec = TradeRecord(
+                    trade_id=tid, code=code, name=h.get("name", code),
+                    side="corporate_action", price=0.0, quantity=qty,
+                    amount=0.0, filled_at=datetime.now().isoformat(),
+                    strategy="corporate_action",
+                    ai_score=0.0,
+                )
+                self.trade_history.append(rec)
+                self._history_dirty = True
+                self._save_history_nolock()
+                self._save_nolock()
+                logger.info(f"🪙 公司行为 {code} {kind}: {note}")
+                return True, f"✅ {code} 已{('除权' if kind!='dividend' else '分红')}：{note}", rec
+
     # ========== 市值更新 ==========
     
     def mark_to_market(self, prices: Dict[str, float]):

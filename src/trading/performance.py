@@ -393,6 +393,49 @@ def attribute(
     }
 
 
+# 退出原因标签 → 人话。固定桶：即使某个桶为 0 也要展示，
+# 否则「止盈 0 次 / 移动止损 0 次」这种决定性事实会被悄悄藏起来
+# （实测：配 +15% 止盈线，实际最大盈利仅 +1.62%，止盈一次都没触发，
+# 而在旧归因里只看到一个笼统的「stop」桶，根本看不出来）。
+EXIT_REASON_LABELS = {
+    "rebalance": "调仓换出",
+    "stop_profit": "止盈",
+    "stop_loss": "止损",
+    "trail_stop": "移动止损",
+    "exit": "其他退出",
+}
+
+
+def exit_reason_distribution(trades: Sequence[dict]) -> List[dict]:
+    """按退出原因（strategy 标签）聚合平仓盈亏，所有固定桶都在（含 0 值）。"""
+    sells = [t for t in trades
+             if str(t.get("side")) == "sell" and float(t.get("pnl") or 0) != 0]
+    acc: Dict[str, dict] = {k: {"label": v, "pnl": 0.0, "count": 0, "wins": 0}
+                            for k, v in EXIT_REASON_LABELS.items()}
+    for t in sells:
+        raw = str(t.get("strategy") or "") or "exit"
+        # 未知标签归并到「其他退出」，不凭空造新桶（看板/日报按固定桶渲染）。
+        tag = raw if raw in EXIT_REASON_LABELS else "exit"
+        d = acc[tag]
+        pnl = float(t.get("pnl") or 0)
+        d["pnl"] += pnl
+        d["count"] += 1
+        d["wins"] += 1 if pnl > 0 else 0
+    out = []
+    for k, d in acc.items():
+        out.append({
+            "tag": k,
+            "label": d["label"],
+            "pnl": round(d["pnl"], 2),
+            "count": d["count"],
+            "win_rate": round(d["wins"] / d["count"], 4) if d["count"] else 0.0,
+        })
+    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 其他
+    order = ["rebalance", "stop_profit", "stop_loss", "trail_stop", "exit"]
+    out.sort(key=lambda x: order.index(x["tag"]) if x["tag"] in order else 99)
+    return out
+
+
 # ======================================================================
 # 汇总报告
 # ======================================================================
@@ -453,6 +496,7 @@ def build_report(
         },
         "trades": trade_stats(trades),
         "attribution": attribute(trades, industry_map),
+        "exit_reason_distribution": exit_reason_distribution(trades),
         "monthly": monthly_matrix(curve),
         "rolling_sharpe": rolling_sharpe(curve, window=20),
         "curve": [{"date": p["date"], "equity": round(float(p["equity"]), 2),
@@ -527,6 +571,15 @@ def format_text(r: dict) -> str:
         for k, v in sorted(by_sector.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
             lines.append(f"  {k:<10} {_fmt(v['pnl'], 0)} 元"
                          f"  {v['count']} 笔  胜率 {_fmt((v['win_rate'] or 0) * 100, 0, '%')}")
+    # 退出原因分布：固定桶（含 0 值），让「止盈 0 次」之类的事实一眼可见。
+    erd = r.get("exit_reason_distribution") or []
+    if erd:
+        lines.append("─" * 46)
+        lines.append("退出原因分布：")
+        for e in erd:
+            flag = "  ⚠️未触发" if e["count"] == 0 else ""
+            lines.append(f"  {e['label']:<6} {_fmt(e['pnl'], 0)} 元"
+                         f"  {e['count']} 笔  胜率 {_fmt(e['win_rate'] * 100, 0, '%')}{flag}")
     return "\n".join(lines)
 
 

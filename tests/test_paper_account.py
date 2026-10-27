@@ -543,3 +543,95 @@ def test_sell_refreshes_mark_and_keeps_available_in_range(tmp_path):
     assert h["market_value"] == pytest.approx(200 * 20.0)
     pa.reload()
     assert pa.holdings["600519"]["market_value"] == pytest.approx(200 * 20.0)
+
+
+# ======================================================================
+# 除权除息（corporate actions）
+# ======================================================================
+
+def test_corporate_action_split_keeps_book_continuous(tmp_path):
+    """10送10：股数翻倍、成本摊薄、现金不变，账本价值连续（无 phantom 盈亏）。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    h0 = pa.holdings["600519"]
+    qty0, cost0 = h0["quantity"], h0["avg_cost"]
+    cash0 = pa.cash
+
+    ok, msg, rec = pa.apply_corporate_action("600519", "split", ratio=1.0)
+    assert ok, msg
+    h = pa.holdings["600519"]
+    assert h["quantity"] == qty0 * 2
+    assert h["avg_cost"] == pytest.approx(cost0 / 2, rel=1e-4)
+    assert pa.cash == pytest.approx(cash0), "送股不改变现金"
+    # 审计记录用独立 side，不会污染平仓盈亏
+    assert rec.side == "corporate_action"
+
+
+def test_corporate_action_split_eliminates_phantom_pnl(tmp_path):
+    """拆分后按除权价卖出应≈0盈亏，否则一次送股会被算成巨亏触发误斩仓。
+
+    直接预置「隔夜仓」（today_quantity=0）绕过 T+1，聚焦复权对成本的连续性。
+    """
+    seed = {
+        "cash": 900000.0,
+        "holdings": {
+            "600519": {
+                "name": "贵州茅台", "quantity": 1000, "available": 1000,
+                "today_quantity": 0, "avg_cost": 100.0,
+                "market_value": 100050.0, "last_price": 100.05,
+            }
+        },
+        "today_pnl": 0.0, "today_trades": 0, "last_reset_date": "2026-10-15",
+    }
+    pa, _ = _new_account(tmp_path, seed=seed, initial_cash=1_000_000.0)
+    px = pa.holdings["600519"]["last_price"]
+    ok, msg, _ = pa.apply_corporate_action("600519", "split", ratio=1.0)
+    assert ok, msg
+    # 复权后：1000→2000 股、成本 100→50，available 同步翻倍（无 T+1 锁）
+    assert pa.holdings["600519"]["quantity"] == 2000
+    assert pa.holdings["600519"]["available"] == 2000
+    ok, msg, rec = pa.sell("600519", px / 2.0, 2000)   # 除权后价≈原价一半，全清
+    assert ok, msg
+    # 拆分本身不制造盈亏：真实盈亏只来自交易成本（滑点/佣金/印花税，约数百元）。
+    # 若不调成本，这里会变成 -10 万级的 phantom 巨亏 → 误斩仓。故只排除假亏，
+    # 容忍真实手续费（不超过名义的 1% ≈ ¥1000）。
+    assert abs(rec.pnl) < 0.01 * rec.amount, f"拆分后卖出出现 phantom 盈亏: {rec.pnl}"
+
+
+def test_corporate_action_dividend_adds_cash(tmp_path):
+    """现金分红：持股数×每股分红 进现金，持仓股数/成本不变。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    ok, msg, _ = pa.apply_corporate_action("600519", "split", ratio=1.0)  # 2000 股
+    assert ok, msg
+    cash0 = pa.cash
+    ok, msg, _ = pa.apply_corporate_action("600519", "dividend", dividend_per_share=0.5)
+    assert ok, msg
+    assert pa.cash == pytest.approx(cash0 + 2000 * 0.5)
+    assert pa.holdings["600519"]["quantity"] == 2000
+
+
+def test_corporate_action_merge_shrinks_qty_raises_cost(tmp_path):
+    """缩股：股数减少、成本抬高，账本价值连续。"""
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    h0 = pa.holdings["600519"]
+    qty0, cost0 = h0["quantity"], h0["avg_cost"]
+    ok, msg, _ = pa.apply_corporate_action("600519", "merge", ratio=0.5)
+    assert ok, msg
+    h = pa.holdings["600519"]
+    assert h["quantity"] == 500
+    assert h["avg_cost"] == pytest.approx(cost0 * 2, rel=1e-4)
+
+
+def test_corporate_action_rejects_unknown_and_missing(tmp_path):
+    pa, _ = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    ok1, _, _ = pa.apply_corporate_action("600519", "weird")
+    assert not ok1, "未知公司行为必须拒绝"
+    ok2, _, _ = pa.apply_corporate_action("000000", "split", ratio=1.0)
+    assert not ok2, "无持仓必须拒绝"

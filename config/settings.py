@@ -293,6 +293,10 @@ class TradingLoopConfig:
     enable_stop_orders: bool = True      # 止盈止损开关
     band_pct: float = 0.25               # 调仓容忍带
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
+    # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
+    # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一，
+    # 调高前须经 walk-forward 验证，否则退回「卖赢家、留输家」。
+    hold_if_profitable_pct: float = 0.0
     max_orders_per_tick: int = 10        # 单周期最大下单数
     settle_hour: int = 15                # 收盘结算时刻（时）
     settle_minute: int = 5               # 收盘结算时刻（分）

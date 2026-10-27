@@ -4906,6 +4906,26 @@ if page == "📊 业绩归因":
             else:
                 st.caption("暂无已平仓交易")
 
+        # 退出原因分布：固定桶（含 0 值），让「止盈从未触发」这类事实直接可见。
+        # 实测曾因所有风控离场都记成同一个 stop 桶，+15% 止盈线从没走到、
+        # 亏损一路跑到 -5% 止损的事实被完全掩盖，归因表上看不出任何异常。
+        erd = rep.get("exit_reason_distribution") or []
+        if erd:
+            st.markdown("##### 退出原因分布（固定桶，含未触发的）")
+            df_e = pd.DataFrame([
+                {"退出原因": e["label"] + (" ⚠️未触发" if e["count"] == 0 else ""),
+                 "已实现盈亏": e["pnl"], "笔数": e["count"],
+                 "胜率%": 0 if e["count"] == 0 else round(e["win_rate"] * 100, 1)}
+                for e in erd
+            ])
+            st.dataframe(df_e, use_container_width=True, hide_index=True)
+            if any(e["count"] == 0 for e in erd):
+                st.warning(
+                    "⚠️ 存在「0 笔」的退出桶：说明该退出类型从未触发（如止盈线设得太高、"
+                    "或亏损一路跑到止损）。这是盈亏比塌陷的典型信号，优先查止损/止盈参数"
+                    "与持有纪律，而不是加仓。"
+                )
+
         bc = attr.get("by_code") or {}
         if bc:
             with st.expander("按个股（前 15）", expanded=False):

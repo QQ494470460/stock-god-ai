@@ -134,6 +134,10 @@ class LoopConfig:
     risk_scale_floor: float = 0.30       # 最深回撤时仍保留的敞口比例（绝不为 0）
     band_pct: float = 0.25               # 调仓容忍带
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
+    # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
+    # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一。
+    # 调高前须经 walk-forward 验证，否则退回「卖赢家、留输家」。
+    hold_if_profitable_pct: float = 0.0
     max_orders_per_tick: int = 10        # 单 tick 最多下多少单（防雪崩）
     settle_hour: int = 15                # 收盘结算时刻
     settle_minute: int = 5
@@ -764,6 +768,7 @@ class TradingLoop:
             risk_scale=risk_scale,
             adv_provider=self._adv_provider(),
             participation=self._participation(),
+            hold_if_profitable_pct=self.config.hold_if_profitable_pct,
         )
         report.n_intents = len(intents)
         if not intents:
@@ -1085,6 +1090,7 @@ class TradingLoop:
             "win_rate": tr.get("win_rate"),
             "payoff_ratio": tr.get("payoff_ratio"),
             "n_closes": tr.get("n_closes"),
+            "exit_reason_distribution": rep.get("exit_reason_distribution") or [],
         }
 
 
@@ -1133,6 +1139,20 @@ class TradingLoop:
                 f" ｜ 最大回撤 {_f(pf.get('max_drawdown_pct'), '%')}"
                 f" ｜ 平仓胜率 {_wr}（{pf.get('n_closes', 0)} 笔）"
             )
+            # 退出原因分布：固定桶（含 0 值）。让「止盈 0 次 / 移动止损 0 次」
+            # 这类决定性事实在日报里一眼可见 —— 实测曾因只有一个笼统的 stop 桶，
+            # 「+15% 止盈线从没走到、亏损一路跑到 -5% 止损」被完全掩盖。
+            erd = pf.get("exit_reason_distribution") or []
+            if erd:
+                lines.append("")
+                lines.append("| 退出原因 | 已实现盈亏 | 笔数 | 胜率 |")
+                lines.append("| --- | --- | --- | --- |")
+                for e in erd:
+                    _warn = " ⚠️未触发" if e["count"] == 0 else ""
+                    lines.append(
+                        f"| {e['label']}{_warn} | ¥{e['pnl']:,.0f} | "
+                        f"{e['count']} | {('%.0f%%' % (e['win_rate'] * 100)) if e['count'] else '—'} |"
+                    )
             lines.append("")
         if s["positions"]:
             lines.append("| 代码 | 名称 | 数量 | 成本 | 现价 | 盈亏% |")
@@ -1509,11 +1529,12 @@ class TradingLoop:
             self.plan, positions, account, prices,
             band_pct=self.config.band_pct,
             min_trade_amount=self.config.min_trade_amount,
-            # 预演必须与真实 tick 用同一套参数（敞口系数 + 流动性封顶），
+            # 预演必须与真实 tick 用同一套参数（敞口系数 + 流动性封顶 + 持有纪律），
             # 否则「预演说买 8000 股、实盘只买 3200」这种不一致永远查不出来。
             risk_scale=self._portfolio_risk_scale(account),
             adv_provider=self._adv_provider(),
             participation=self._participation(),
+            hold_if_profitable_pct=self.config.hold_if_profitable_pct,
         ) if (self.plan and account) else []
 
         stops = []

@@ -97,6 +97,7 @@ def compute_rebalance_orders(
     risk_scale: float = 1.0,
     adv_provider=None,
     participation: float = 0.01,
+    hold_if_profitable_pct: float = 0.0,
 ) -> List[RebalanceIntent]:
     """计算调仓订单意图（卖单在前，买单在后）。
 
@@ -117,6 +118,11 @@ def compute_rebalance_orders(
             事后拦截好：计划里显示的股数就是真能成交的股数，不会出现
             「计划 8000 股 / 风控砍成 3200 / 日志里全是拦截」的来回打架。
         participation: 单笔占 ADV 的上限比例，默认 1%。
+        hold_if_profitable_pct: 持有纪律阈值（0=关闭，保持原「跌出榜单即清仓」纪律）。
+            当持仓不在目标组合、但当前**未实现浮盈 ≥ 该百分比**时，不强制清仓，
+            改由止损/止盈线托管。直接「跌出榜单就卖」会在每日换票时把赢家甩掉、
+            把还没跌的输家留下，等于做「卖赢家、留输家」的逆向选择——实测正是
+            盈亏比 0.15 的根因之一。阈值需经 walk-forward 验证后再上调，不要拍脑袋。
 
     Returns:
         List[RebalanceIntent]，已排序为「先卖后买」。
@@ -165,6 +171,18 @@ def compute_rebalance_orders(
             if qty <= 0:
                 logger.debug(f"调仓：{pos.code} 无可卖股（T+1 锁仓），本轮跳过")
                 continue
+            # 持有纪律：盈利且浮盈达阈值时不强制清仓，交止损/止盈线托管。
+            # 默认 0 = 保持原「跌出榜单即清仓」纪律。阈值需 walk-forward 验证后
+            # 再上调，否则又会回到「卖赢家、留输家」的逆向选择。
+            if hold_if_profitable_pct > 0:
+                cost = float(getattr(pos, "avg_cost", 0) or 0)
+                if cost > 0:
+                    _pnl_pct = (price - cost) / cost * 100.0
+                    if _pnl_pct >= hold_if_profitable_pct:
+                        logger.debug(
+                            f"调仓：{pos.code} 浮盈 {_pnl_pct:.1f}% ≥ 持有阈值 "
+                            f"{hold_if_profitable_pct:.1f}%，暂不强制清仓（交止损/止盈）")
+                        continue
             # 退出纪律 > 碎单过滤：跌出目标组合的仓位**必须走干净**。
             # 旧实现在这里套用 min_trade_amount，于是「100 股 × ¥30 = ¥3000」
             # 这类小仓位永远不满足最小金额 → 永久滞留在组合里，占着持仓名额、
@@ -282,7 +300,9 @@ def summarize_intents(intents: Sequence[RebalanceIntent]) -> str:
         return "本轮无需调仓（已与目标组合一致）"
     sells = [i for i in intents if i.side == OrderSide.SELL]
     buys = [i for i in intents if i.side == OrderSide.BUY]
-    lines = [f"调仓预演：卖出 {len(sells)} 笔 / 买入 {len(buys)} 笔"]
+    capped = [i for i in buys if i.capped_by]
+    lines = [f"调仓预演：卖出 {len(sells)} 笔 / 买入 {len(buys)} 笔"
+             + (f"（其中 {len(capped)} 笔受流动性上限约束，分批建仓）" if capped else "")]
     for i in intents:
         arrow = "🔴卖出" if i.side == OrderSide.SELL else "🟢买入"
         lines.append(

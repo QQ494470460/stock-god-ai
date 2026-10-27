@@ -283,3 +283,54 @@ def test_exit_ignores_min_trade_amount():
     assert sells[0].code == "600000"
     assert sells[0].quantity == 100                        # 全清，不是部分减
     assert "跌出目标组合" in sells[0].reason
+
+
+# ---------------------------------------------------------------- 持有纪律
+
+def test_hold_if_profitable_keeps_winner():
+    """持仓不在目标组合、但浮盈达标 → 不强制清仓，交止损/止盈托管。
+
+    这是「卖赢家、留输家」逆向选择的直接解药：每天换票时，原本会把刚盈利的
+    赢家甩掉（只赚 1%）、把还没跌的输家留在组合里（一路亏到止损）。实测盈亏比
+    设计 3:1、实测 0.15 的根因之一就在这里。阈值需 walk-forward 验证后再上调。
+    """
+    plan = mk_plan([("000001", 0.30)])           # 600519 跌出目标组合
+    positions = [mk_pos("600519", 1000, cost=100.0, price=110.0)]  # 浮盈 +10%
+    intents = compute_rebalance_orders(
+        plan, positions, mk_acct(), {"600519": 110.0},
+        hold_if_profitable_pct=5.0)
+    sells = [i for i in intents if i.side == OrderSide.SELL]
+    assert all(i.code != "600519" for i in sells), "盈利仓被持有纪律外的强制清仓卖掉了"
+
+
+def test_hold_disabled_default_sells_winner():
+    """默认阈值 0 = 关闭持有纪律，保持原「跌出榜单即清仓」语义（向后兼容）。"""
+    plan = mk_plan([("000001", 0.30)])
+    positions = [mk_pos("600519", 1000, cost=100.0, price=110.0)]
+    intents = compute_rebalance_orders(
+        plan, positions, mk_acct(), {"600519": 110.0},
+        hold_if_profitable_pct=0.0)
+    sells = [i for i in intents if i.side == OrderSide.SELL and i.code == "600519"]
+    assert sells, "默认应保留原有清仓纪律"
+
+
+def test_hold_does_not_keep_loser():
+    """持有纪律只保盈利仓：亏损仓即便浮盈阈值很高也必须清仓。"""
+    plan = mk_plan([("000001", 0.30)])
+    positions = [mk_pos("600519", 1000, cost=100.0, price=90.0)]   # 浮亏 -10%
+    intents = compute_rebalance_orders(
+        plan, positions, mk_acct(), {"600519": 90.0},
+        hold_if_profitable_pct=5.0)
+    sells = [i for i in intents if i.side == OrderSide.SELL and i.code == "600519"]
+    assert sells, "亏损仓必须清仓，持有纪律不该保它"
+
+
+def test_summarize_intents_reports_capped_count():
+    """流动性封顶笔数应在预演摘要里明示，否则「计划 8000 股 / 实盘只买 3200」类
+    不一致会被静默吞掉。"""
+    intents = [
+        RebalanceIntent(code="600519", name="x", side=OrderSide.BUY,
+                        quantity=100, price=10.0, capped_by="liquidity"),
+    ]
+    txt = summarize_intents(intents)
+    assert "流动性上限" in txt

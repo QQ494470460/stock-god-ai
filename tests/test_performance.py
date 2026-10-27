@@ -193,3 +193,37 @@ def test_save_report_is_atomic(tmp_path):
     p = perf.save_report(r, tmp_path / "perf.json")
     assert json.loads(p.read_text(encoding="utf-8")) == {"a": 1}
     assert not (tmp_path / "perf.json.tmp").exists()
+
+
+def test_exit_reason_distribution_fixed_buckets_with_zero():
+    """退出原因必须固定桶（含 0 值），否则「止盈 0 次 / 移动止损 0 次」会被藏起来。
+
+    实测：配 +15% 止盈线、实际最大盈利仅 +1.62%，止盈一次都没触发；
+    旧归因只有一个笼统的 stop 桶，这个事实完全不可见。
+    """
+    trades = [
+        {"side": "sell", "code": "A", "pnl": 100.0, "strategy": "stop_profit"},
+        {"side": "sell", "code": "B", "pnl": -200.0, "strategy": "stop_loss"},
+        {"side": "sell", "code": "C", "pnl": 50.0, "strategy": "rebalance"},
+        {"side": "buy", "code": "D", "pnl": 999.0, "strategy": "rebalance"},   # 买入腿忽略
+        {"side": "sell", "code": "E", "pnl": 0.0, "strategy": "stop_loss"},    # pnl=0 忽略
+    ]
+    erd = perf.exit_reason_distribution(trades)
+    tags = [e["tag"] for e in erd]
+    # 固定顺序：调仓 / 止盈 / 止损 / 移动止损 / 其他
+    assert tags == ["rebalance", "stop_profit", "stop_loss", "trail_stop", "exit"], tags
+    by = {e["tag"]: e for e in erd}
+    assert by["stop_profit"]["count"] == 1 and by["stop_profit"]["pnl"] == 100.0
+    assert by["stop_loss"]["count"] == 1 and by["stop_loss"]["pnl"] == -200.0
+    assert by["rebalance"]["count"] == 1
+    # 从未触发的桶必须显式存在（0 值），这是这条指标存在的全部意义
+    assert by["trail_stop"]["count"] == 0, "移动止损从未触发必须显式可见"
+    assert by["exit"]["count"] == 0
+
+
+def test_exit_reason_distribution_unknown_tag_falls_to_exit():
+    """未知标签归入「其他退出」，不丢弃。"""
+    trades = [{"side": "sell", "code": "A", "pnl": 10.0, "strategy": "weird_tag"}]
+    erd = perf.exit_reason_distribution(trades)
+    by = {e["tag"]: e for e in erd}
+    assert by["exit"]["count"] == 1 and by["exit"]["pnl"] == 10.0
