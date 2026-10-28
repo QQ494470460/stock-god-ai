@@ -33,6 +33,10 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+# 风险加权估计协方差的历史窗口（交易日）。只用再平衡日 t 及之前的数据，
+# 保证 walk-forward 无未来泄露；窗口不足时退化为「t 之前全部可用历史」。
+RISK_WINDOW = 60
+
 
 @dataclass
 class BacktestConfig:
@@ -67,6 +71,7 @@ class BacktestConfig:
     # 但未实现浮盈 ≥ 该百分比时不强制卖出，保留漂移权重继续持有，其余目标仓位
     # 缩到剩余预算。0 = 关闭（默认，行为与历史完全一致）。
     hold_if_profitable_pct: float = 0.0
+    tilt_strength: float = 0.25       # alpha 倾斜强度（risk 加权之上叠加，0=纯风险平价）
 
 
 @dataclass
@@ -141,6 +146,7 @@ def _rank_ic_series(score_panel: pd.DataFrame, fwd_ret: pd.DataFrame, min_stocks
 class WalkForwardBacktester:
     def __init__(self, config: Optional[BacktestConfig] = None):
         self.cfg = config or BacktestConfig()
+        self._rets = None  # 日收益率矩阵缓存（风险加权用，walk-forward）
 
     # ---- 内部：单期交易成本（按成交额近似） ----
     def _trade_cost_ratio(self, buy_value: float, sell_value: float) -> float:
@@ -155,19 +161,27 @@ class WalkForwardBacktester:
         return float((buy_cost + sell_cost) / cfg.capital)
 
     # ---- 内部：目标权重（等权 / 评分加权 + 单票封顶 + 现金保留） ----
-    def _target_weights(self, srow: pd.Series, top: List[str]) -> Dict[str, float]:
+    def _target_weights(self, srow: pd.Series, top: List[str], t_date=None) -> Dict[str, float]:
         """算出这一期的目标持仓权重（不含现金，合计 = 1 - 现金保留）。
 
         * ``weighting="score"``：按评分占比分配。评分需先平移消除负值，
           否则低分股会拿到负权重（等价于做空，A 股普通账户做不到）。
-        * ``weight_cap < 1``：单票封顶，超出的份额**再分配给未封顶的标的**，
-          迭代到收敛 —— 简单截断会导致权重和不等于投入比例。
+        * ``weighting="equal"``（默认）：等权。
+        * ``weighting="risk_parity"`` / ``min_variance`` / ``vol_target``：
+          用截至 ``t_date`` 的历史收益率估计协方差/波动率，调
+          :func:`src.trading.optimizer.optimize_weights` 求风险平价权重；
+          数据不足时 fail-safe 回退等权（与生产 :func:`_risk_weights` 一致）。
         """
         cfg = self.cfg
         invest = max(0.0, 1.0 - cfg.cash_reserve_pct)
         n = len(top)
         if n == 0 or invest <= 0:
             return {}
+
+        if cfg.weighting in ("risk_parity", "min_variance", "vol_target"):
+            w = self._risk_target_weights(srow, top, t_date)
+            if w is not None:
+                return w
 
         if cfg.weighting == "score":
             s = pd.to_numeric(srow[top], errors="coerce").astype(float)
@@ -196,6 +210,58 @@ class WalkForwardBacktester:
 
         return {c: v * invest for c, v in w.items()}
 
+    # ---- 内部：风险平价目标权重（walk-forward 协方差，无未来泄露） ----
+    def _risk_target_weights(self, srow: pd.Series, top: List[str], t_date) -> Optional[Dict[str, float]]:
+        """风险加权目标权重；失败/数据不足返回 None（调用方回退等权）。
+
+        关键正确性约束：协方差与波动率只用再平衡日 ``t_date`` 及之前的历史估计，
+        绝不用未来数据（否则回测会吃到未来信息，夏普虚高）。窗口长度见
+        ``RISK_WINDOW``；窗口内若有标的全 NaN 或覆盖不全，直接回退等权——
+        与生产 :func:`_risk_weights` 对「缺价的最危险那只」的处理一致。
+        """
+        if self._rets is None or t_date is None:
+            return None
+        try:
+            rets = self._rets
+            if t_date not in rets.index:
+                return None
+            pos = rets.index.get_loc(t_date)
+            start = max(0, pos - RISK_WINDOW + 1)
+            window = rets.iloc[start:pos + 1][top]
+            sub = window.dropna(axis=1, how="any")
+            # 必须覆盖全部标的；否则缺价标的会拿到未经风险调整的权重（最危险），
+            # 与生产一致地整体回退等权，而不是带病权重。
+            if sub.shape[1] < 2 or sub.shape[1] != len(top):
+                return None
+            cov = sub.cov().values
+            vols = sub.std().values
+            if not (np.all(np.isfinite(cov)) and np.all(np.isfinite(vols))
+                    and float(np.min(vols)) > 0):
+                return None
+            from src.trading.optimizer import optimize_weights
+
+            scores = [float(srow.get(c, 0.0) or 0.0) for c in top]
+            cap = self.cfg.weight_cap if 0 < self.cfg.weight_cap < 1.0 else None
+            w = optimize_weights(
+                cov=cov, vols=vols, scores=scores, method=self.cfg.weighting,
+                cap=cap, tilt_strength=self.cfg.tilt_strength,
+            )
+            w = np.asarray(w, dtype=float)
+            if w.size != len(top) or not np.all(np.isfinite(w)):
+                return None
+            total = float(w.sum())
+            if total <= 0:
+                return None
+            invest = max(0.0, 1.0 - self.cfg.cash_reserve_pct)
+            # vol_target 允许 sum(w) < 1（剩余留现金），不强行归一；其余方法归一。
+            if self.cfg.weighting == "vol_target":
+                return {c: float(w[i]) * invest for i, c in enumerate(top)}
+            w = w / total
+            return {c: float(w[i]) * invest for i, c in enumerate(top)}
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"风险加权失败，回退等权: {e}")
+            return None
+
     def backtest_scores(
         self,
         score_panel: pd.DataFrame,
@@ -215,6 +281,10 @@ class WalkForwardBacktester:
         idx = score_panel.index.intersection(close_panel.index)
         score_panel = score_panel.loc[idx]
         close_panel = close_panel.loc[idx]
+        # 风险加权所需的「截至当日」历史收益率（walk-forward，无未来泄露）：
+        # 协方差只在再平衡日 t 及其之前估计；_target_weights 用 t_date 截窗口。
+        # 第 0 行为 NaN（无前日收益），窗口截取会自动跳过。
+        self._rets = close_panel.pct_change()
         if codes_universe:
             cols = [c for c in codes_universe if c in close_panel.columns]
             score_panel = score_panel.reindex(columns=cols)
@@ -255,7 +325,7 @@ class WalkForwardBacktester:
             top = srow.nlargest(min(cfg.top_n, len(srow))).index.tolist()
 
             # 目标权重（含现金保留与单票封顶）
-            target = self._target_weights(srow, top)
+            target = self._target_weights(srow, top, t_date=t)
 
             # 容忍带：偏离不够大就不动，省下双边成本
             trade = True

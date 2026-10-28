@@ -57,6 +57,15 @@ def _base_params() -> Dict:
         print(f"⚠️ 取当前参数失败，退回默认：{e}")
         params = {}
     params.setdefault("top_n", 20)
+    # 权重方法 / alpha 倾斜强度：必须与生产口径一致，否则扫描与生产脱钩。
+    # backtest_scores 现已支持 risk_parity/min_variance/vol_target + tilt_strength。
+    try:
+        from config.settings import AppConfig
+        tl = AppConfig().trading_loop
+        params.setdefault("weighting", tl.weighting)
+        params.setdefault("tilt_strength", tl.tilt_strength)
+    except Exception:  # noqa: BLE001
+        pass
     return params
 
 
@@ -111,6 +120,7 @@ def main() -> int:
     score, close, bench = _load_panel(args.panel_dir)
     n = len(score)
     params = _base_params()
+    print(f"🔧 权重口径: weighting={params.get('weighting')} tilt_strength={params.get('tilt_strength')}")
     if args.slippage is not None:
         params["slippage"] = args.slippage
     if args.commission is not None:
