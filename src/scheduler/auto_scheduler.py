@@ -196,6 +196,7 @@ def _job_daily_pick_impl(dry_run: bool = False) -> Dict:
                     cash_reserve_pct=tc.cash_reserve_pct,
                     weighting=tc.weighting,
                     weight_cap=cap,
+                    tilt_strength=tc.tilt_strength,
                     write=not dry_run,
                 )
                 info["plan_date"] = plan.plan_date

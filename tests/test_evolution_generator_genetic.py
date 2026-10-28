@@ -35,6 +35,7 @@ CURRENT = {
     "trading_loop.weight_cap": 0.30,
     "trading_loop.min_trade_amount": 5000.0,
     "trading_loop.weighting": "equal",
+    "trading_loop.tilt_strength": 0.0,
 }
 
 
@@ -281,8 +282,11 @@ def test_evolve_climbs_multiple_steps(env):
     i = dom.index(base[key])
     target[key] = dom[i + 2]
 
+    # 注：基因组每多一个基因，单基因达到指定步数的收敛就更慢（每次变异只动 1 个
+    # 基因）。把 tilt_strength 纳入可进化基因后共 7 个基因，4 代只能爬 1 步；
+    # 扩到 10 代才能稳定爬满 2 步。这是测试参数随基因数演进，不是 GA 退化。
     best, m, _ = ga.evolve(_distance_landscape(target), base, _m(sharpe=-2.0),
-                           population=10, generations=4, rng=random.Random(2))
+                           population=10, generations=10, rng=random.Random(2))
     assert best[key] == target[key]
 
 

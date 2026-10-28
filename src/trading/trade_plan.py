@@ -228,7 +228,7 @@ def _assign_weights(
     weighting: str = "equal",
     weight_cap: Optional[float] = None,
     risk_stats: Optional[dict] = None,
-    tilt_strength: float = 0.25,
+    tilt_strength: float = 0.0,
 ) -> None:
     """就地填充 target.weight。
 
@@ -473,7 +473,7 @@ def build_trade_plan(
     weighting: str = "equal",
     weight_cap: Optional[float] = None,
     risk_stats: Optional[dict] = None,
-    tilt_strength: float = 0.25,
+    tilt_strength: float = 0.0,
     write: bool = True,
     plan_dir: Optional[Path] = None,
 ) -> TradePlan:

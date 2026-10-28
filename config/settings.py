@@ -295,7 +295,7 @@ class TradingLoopConfig:
     # 默认风险平价：等权与按评分加权都只看 alpha，不看波动与相关性，
     # 会让组合风险集中在少数高波动标的上。数据不足时自动退回等权。
     weighting: str = "risk_parity"
-    tilt_strength: float = 0.25          # 风险权重上叠加 alpha 倾斜（0=纯风险平价）
+    tilt_strength: float = 0.0           # 风险权重上叠加 alpha 倾斜（0=纯风险平价；真OOS验证 0.0 全面更优）
     enable_rebalance: bool = True        # 目标组合调仓开关
     enable_stop_orders: bool = True      # 止盈止损开关
     # 调仓容忍带（触发换仓的最小权重偏离）。2026-10-27 由 0.25 降至 0.15：

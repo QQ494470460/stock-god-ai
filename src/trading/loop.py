@@ -127,7 +127,7 @@ class LoopConfig:
     # 组合的风险集中在少数高波动标的上；风险平价让每只票贡献相同风险，
     # 与 guard 的 VaR 预算同源。数据不足时 build_trade_plan 自动退回等权。
     weighting: str = "risk_parity"
-    tilt_strength: float = 0.25          # 风险权重上叠加 alpha 倾斜的力度（0=纯风险平价）
+    tilt_strength: float = 0.0           # 风险权重上叠加 alpha 倾斜的力度（0=纯风险平价；真OOS验证 0.0 全面更优）
     enable_rebalance: bool = True        # 是否执行目标调仓
     enable_stop_orders: bool = True      # 是否执行止盈止损
     # 组合回撤 → 连续渐进降仓（**不是**清仓）。回测实证：触线全清能把回撤

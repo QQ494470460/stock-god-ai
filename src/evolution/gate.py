@@ -167,6 +167,7 @@ BACKTEST_MAP: Dict[str, Tuple[str, type]] = {
     "trading_loop.band_pct": ("band_pct", float),
     "trading_loop.min_trade_amount": ("min_trade_amount", float),
     "trading_loop.weighting": ("weighting", str),
+    "trading_loop.tilt_strength": ("tilt_strength", float),
 }
 
 

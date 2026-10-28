@@ -183,6 +183,7 @@ def _cfg():
             cash_reserve_pct = 0.10
             weight_cap = 0.30
             weighting = "equal"
+            tilt_strength = 0.0
     return S()
 
 
@@ -208,6 +209,16 @@ def test_config_stub_mirrors_real_scheduler_config():
     assert not missing, (
         f"配置替身缺少调度代码会读取的字段 {missing}：真实配置新增了开关，"
         "替身没跟上，调度作业会在运行时抛 AttributeError。"
+    )
+
+    # 同样守护 trading_loop 字段（如 tilt_strength）：调度在生成交易计划时
+    # 会逐个读取，缺一个就抛 AttributeError，整组作业用例跟着红。
+    used_tl = set(re.findall(r"app_config\.trading_loop\.([a-z_]+)", src))
+    stub_tl = {k for k in vars(_cfg().trading_loop) if not k.startswith("_")}
+    missing_tl = sorted(used_tl - stub_tl)
+    assert not missing_tl, (
+        f"配置替身缺少调度代码会读取的 trading_loop 字段 {missing_tl}："
+        "真实配置新增了字段，替身没跟上，调度作业会在运行时抛 AttributeError。"
     )
 
 

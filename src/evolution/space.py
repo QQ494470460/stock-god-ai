@@ -247,7 +247,7 @@ PARAM_SPACE: Dict[str, ParamSpec] = {s.key: s for s in (
               choices=("risk_parity", "equal", "score", "min_variance", "vol_target"),
               risk="neutral", auto_adopt=True,
               doc="权重分配方式（风险平价/等权/按评分/最小方差/波动率目标）"),
-    ParamSpec("trading_loop.tilt_strength", KIND_FLOAT, 0.25, low=0.0, high=0.6,
+    ParamSpec("trading_loop.tilt_strength", KIND_FLOAT, 0.0, low=0.0, high=0.6,
               step=0.05, risk="neutral", auto_adopt=True,
               doc="风险权重上叠加 alpha 倾斜的力度（秩空间，0=纯风险平价）"),
     ParamSpec("trading_loop.enable_rebalance", KIND_BOOL, True,

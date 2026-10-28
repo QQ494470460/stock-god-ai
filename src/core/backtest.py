@@ -71,7 +71,7 @@ class BacktestConfig:
     # 但未实现浮盈 ≥ 该百分比时不强制卖出，保留漂移权重继续持有，其余目标仓位
     # 缩到剩余预算。0 = 关闭（默认，行为与历史完全一致）。
     hold_if_profitable_pct: float = 0.0
-    tilt_strength: float = 0.25       # alpha 倾斜强度（risk 加权之上叠加，0=纯风险平价）
+    tilt_strength: float = 0.0        # alpha 倾斜强度（risk 加权之上叠加，0=纯风险平价；真OOS验证 0.0 全面更优）
 
 
 @dataclass

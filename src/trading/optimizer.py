@@ -307,7 +307,7 @@ def optimize_weights(
     method: str = "risk_parity",
     cap: Optional[float] = None,
     target_vol: Optional[float] = None,
-    tilt_strength: float = 0.25,
+    tilt_strength: float = 0.0,
     old_weights: Optional[Sequence[float]] = None,
     max_turnover: Optional[float] = None,
 ) -> np.ndarray:

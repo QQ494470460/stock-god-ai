@@ -98,7 +98,8 @@ def _make_volatile_panel(n_days=200, n_codes=10, seed=42):
 
 def test_backtestconfig_has_tilt_strength():
     assert hasattr(BacktestConfig, "tilt_strength")
-    assert BacktestConfig().tilt_strength == 0.25
+    from config.settings import AppConfig
+    assert BacktestConfig().tilt_strength == AppConfig().trading_loop.tilt_strength
 
 
 def test_backtest_risk_parity_distinct_from_equal():
