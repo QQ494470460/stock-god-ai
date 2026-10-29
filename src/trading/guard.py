@@ -564,8 +564,20 @@ class SafetyController:
 
     # ---------- Kill Switch ----------
     def halt(self, reason: str, operator: str = "system") -> bool:
-        """全局紧急停止：持久化，重启仍保持"""
+        """全局紧急停止：持久化，重启仍保持
+
+        **幂等**：同因同操作者重复调用不再落盘/打 WARNING。``tick_monitor`` 每
+        30s 被调一次，熔断期间条件仍成立 → 旧实现每次都会写一次状态文件并打一条
+        WARNING。实测一天刷出 1,250 条「KILL SWITCH 触发」，日志 4,671 条里绝大
+        部分是同一个状态在自言自语，看板/日志永远在滚「已熔断」，用户无法判断
+        这是新的一次熔断还是旧状态。幂等后「触发」只发生在真正的跃迁上。
+        """
         with self._lock:
+            if (self._state.halted
+                    and self._state.halt_reason == reason
+                    and self._state.halted_by == operator):
+                logger.debug(f"KILL SWITCH 已处于熔断（同因重复触发，忽略）: {reason}")
+                return True
             self._state.halted = True
             self._state.halt_reason = reason
             self._state.halt_at = datetime.now().isoformat()
@@ -2244,10 +2256,22 @@ class RiskSupervisor:
 
         # 回撤熔断
         dd = self.safety.current_drawdown_pct(equity)
+        # 本 tick 内是否刚由「回撤」这条线拉下闸。同一个 tick 里两条线可能同时
+        # 成立，那时允许「单日亏损」这条更具体的线复核原因（只复核一次，不算
+        # 重复触发）；跨 tick 则一律不再改写，避免熔断期间每 30s 刷日志。
+        halted_this_tick = False
         if dd >= self.config.max_portfolio_drawdown_pct:
             reason = f"组合回撤 {dd:.2f}% ≥ 熔断线 {self.config.max_portfolio_drawdown_pct:.1f}%"
-            self.safety.halt(reason, operator="auto(drawdown)")
-            alerts.append(reason)
+            # ⚠️ 只在「首次进入熔断」时落状态 + 告警。熔断会持续多天，条件每 tick
+            # 都成立，无条件调 halt() 会让同一个状态每 30s 重写一次文件、重打一条
+            # WARNING（实测 4,671 条），且会把峰谷回撤的实时值不断覆盖进
+            # halt_reason，事后无法看出「第一次触发时回撤是多少」。
+            # 另：已在熔断中（无论是人工 KILL 还是别的规则）不得被本条覆盖原因 ——
+            # 人工停手的原因被改写成「组合回撤」会让审计看不出有人动过手。
+            if not self.safety.halted:
+                self.safety.halt(reason, operator="auto(drawdown)")
+                alerts.append(reason)
+                halted_this_tick = True
 
         # 单日亏损熔断（比例线 / 绝对金额线，任一触发即停）
         dl = self.safety.daily_loss_pct(equity)
@@ -2278,8 +2302,13 @@ class RiskSupervisor:
                 which.append(f"金额线 ¥{loss_abs:,.0f} ≥ {abs_desc}")
             reason = (f"单日亏损熔断（{'；'.join(which)}；"
                       f"当日亏损 {dl:.2f}% / ¥{loss_abs:,.0f}）")
-            self.safety.halt(reason, operator="auto(dailyloss)")
-            alerts.append(reason)
+            # 同回撤分支：只在跃迁时触发，避免每 tick 重复落盘/刷日志。
+            # 例外 = 本 tick 刚被「回撤」拉下闸：两条线同时成立时，更具体的
+            # 「单日亏损（哪条线）」应覆盖宽泛的「组合回撤」，便于事后归因。
+            if (not self.safety.halted) or halted_this_tick:
+                self.safety.halt(reason, operator="auto(dailyloss)")
+                if not halted_this_tick:
+                    alerts.append(reason)
 
         # 清理超时委托
         expired = self.gate.reap_expired()

@@ -570,6 +570,45 @@ def test_normal_drawdown_still_halts(tmp_path):
     assert any("回撤" in a for a in alerts)
 
 
+def test_halt_is_idempotent_while_condition_persists(tmp_path):
+    """熔断期间每 30s 一个 tick，条件仍成立 → 不得重复落盘/重复告警。
+
+    实测线上一天刷出 1,250 条「KILL SWITCH 触发」（日志里共 4,671 条），
+    绝大多数是同一个状态在自言自语；且 halt_reason 被实时回撤值不断覆盖，
+    事后看不出「第一次触发时回撤是多少」。这里锁死三条不变量。
+    """
+    sup, paper, state = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    first = sup.tick_monitor()
+    assert sup.safety.halted is True
+    assert any("回撤" in a for a in first), "首次进入熔断必须告警"
+
+    snap1 = sup.safety.snapshot()
+    raw1 = json.loads(state.read_text(encoding="utf-8"))
+
+    second = sup.tick_monitor()
+    third = sup.tick_monitor()
+
+    assert not any("回撤" in a for a in second), "同一回撤状态不该重复告警"
+    assert not any("回撤" in a for a in third)
+    assert sup.safety.snapshot()["halt_reason"] == snap1["halt_reason"], \
+        "触发原因必须保持为首次触发时的快照，不能被实时值覆盖"
+    assert sup.safety.snapshot()["halt_at"] == snap1["halt_at"], \
+        "halt_at 必须保持首次触发时间（重复触发不得刷新）"
+    raw2 = json.loads(state.read_text(encoding="utf-8"))
+    assert raw2["halt_at"] == raw1["halt_at"]
+    assert raw2["halt_reason"] == raw1["halt_reason"]
+
+
+def test_drawdown_does_not_overwrite_manual_kill_reason(tmp_path):
+    """人工 KILL 的原因绝不能被自动规则改写 —— 否则审计看不出有人动过手。"""
+    sup, paper, _ = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    sup.kill_switch("手动紧急停止", operator="alice")
+    sup.tick_monitor()
+    assert sup.safety.halted is True
+    assert sup.safety.snapshot()["halted_by"] == "alice"
+    assert sup.safety.snapshot()["halt_reason"] == "手动紧急停止"
+
+
 # ======================================================================
 # 风控拦截必须留痕（审计）
 # ----------------------------------------------------------------------
