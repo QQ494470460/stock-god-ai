@@ -1966,11 +1966,30 @@ class RiskSupervisor:
             except Exception:  # noqa: BLE001
                 pass
             risk_budget = float(account.total_asset) * float(cfg.max_risk_per_trade_pct)
-            cap_qty = int(risk_budget / (price * stop_pct) // lot * lot)
+            # ⚠️ 预算必须扣掉**同标的已有持仓**的风险敞口。本方法按「单笔」算上限，
+            # 分多笔建仓时每笔单独看都合规、合起来却成倍超标 —— 预算被「分批」掏空。
+            # 实测 300757 用 3 笔建到 800 股：200股×¥397×止损15% ≈ ¥1.2万，每笔都在
+            # ¥2.35万预算内，但合计敞口 ¥4.76万 = 净值 1.03%，是 0.5% 预算的 2 倍。
+            # 只对买入生效；不持有该标的时 held_risk=0，行为与改动前逐字节一致。
+            held_risk = 0.0
+            try:
+                for _p in (self._positions() or []):
+                    _pq = int(getattr(_p, "quantity", 0) or 0)
+                    if str(getattr(_p, "code", "")) != code or _pq <= 0:
+                        continue
+                    _px = float(getattr(_p, "avg_cost", 0) or 0) or price
+                    held_risk = _pq * _px * stop_pct
+                    break
+            except Exception:  # noqa: BLE001
+                held_risk = 0.0
+            remain = max(0.0, risk_budget - held_risk)
+            cap_qty = int(remain / (price * stop_pct) // lot * lot)
             if cap_qty < qty:
                 reasons.append(
                     f"风险预算：单笔亏损≤{cfg.max_risk_per_trade_pct:.2%}净值"
-                    f"（止损{stop_pct:.0%} → {cap_qty}股）"
+                    f"（止损{stop_pct:.0%}"
+                    + (f"，含已有持仓风险¥{held_risk:,.0f}" if held_risk > 0 else "")
+                    + f" → {cap_qty}股）"
                 )
                 qty = cap_qty
 

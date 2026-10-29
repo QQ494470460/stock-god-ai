@@ -146,8 +146,51 @@ def test_risk_budget_caps_position_by_stop_distance(tmp_path):
     assert "风险预算" in why
 
 
+def _pos(code="600000", qty=5000, cost=10.0):
+    return Position(code=code, name=code, quantity=qty, available=qty,
+                    avg_cost=cost, current_price=cost,
+                    market_value=qty * cost, pnl=0.0, pnl_pct=0.0)
+
+
+def test_risk_budget_subtracts_existing_position_risk(tmp_path):
+    """预算按「单笔」算会被分批建仓掏空 —— 已有同标的持仓的风险必须先扣掉。
+
+    实盘复现：300757 用 3 笔建到 800 股（300+200+200），每笔 200 股 × ¥397 ×
+    止损 15% ≈ ¥1.2 万，单看都在 ¥2.35 万预算内，合计敞口 ¥4.76 万 = 净值
+    1.03%，是 0.5% 预算的 2 倍。
+    """
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05)
+    # 已持有 5000 股 @10 → 已占风险 5000×10×5% = 2500 元（预算共 5000 元）
+    g._positions = lambda: [_pos(qty=5000, cost=10.0)]
+    qty, why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    assert qty == 5_000, "剩余预算 2500 元 / (10×5%) = 5000 股，而不是每笔各给 10000 股"
+    assert "风险预算" in why
+    assert "已有持仓风险" in why
+
+
+def test_risk_budget_ignores_holdings_of_other_codes(tmp_path):
+    """别的标的的持仓不该占本标的的预算（否则正常建仓会被无故缩小）。"""
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05)
+    g._positions = lambda: [_pos(code="000001", qty=5000, cost=10.0)]
+    qty, _why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    assert qty == 10_000
+
+
+def test_risk_budget_blocks_add_when_already_over_budget(tmp_path):
+    """已有持仓风险已超预算 → 加仓一律压到 0（减风险只能靠卖出）。"""
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05)
+    g._positions = lambda: [_pos(qty=20_000, cost=10.0)]   # 已占 10000 元 > 5000 预算
+    qty, why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    assert qty == 0
+    assert "风险预算" in why
+
+
 def test_risk_budget_does_not_cap_sells(tmp_path):
     g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005)
+    g._positions = lambda: [_pos(qty=20_000, cost=10.0)]
     qty, _why = g._apply_execution_limits("600000", OrderSide.SELL, 10.0, 20_000, _account())
     assert qty == 20_000, "卖出是减风险，不该被风险预算卡住"
 
