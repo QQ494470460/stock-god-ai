@@ -696,3 +696,30 @@ def test_non_pristine_account_still_saves(tmp_path):
     saved = json.loads(acct.read_text(encoding="utf-8"))
     assert "600519" in saved["holdings"]
     assert saved["initial_cash"] == 1_000_000.0
+
+
+def test_reset_writes_reset_at_evidence_and_persists(tmp_path):
+    """`reset_at` 是「账户确实被人工重置过」的唯一证据，必须落盘且能重载。
+
+    常驻闭环靠它区分「人工重置」与「状态被写坏」（2026-10-30 事故：账户被
+    空白单例覆盖后基线跟着变，闭环误判成重置并静默解除了熔断）。
+    只有 reset() 会写它；普通买卖/落盘绝不能碰。
+    """
+    from src.trading.paper import PaperAccount
+
+    pa, acct = _new_account(tmp_path, initial_cash=1_000_000.0)
+    assert pa.reset_at == "", "新建/载入的账户不该带重置证据"
+
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    assert pa.reset_at == "", "普通成交不能伪造重置证据"
+
+    pa.reset(800_000.0)
+    assert pa.reset_at, "reset() 必须留下证据时间戳"
+    saved = json.loads(acct.read_text(encoding="utf-8"))
+    assert saved["reset_at"] == pa.reset_at
+
+    reloaded = PaperAccount(initial_cash=1_000_000.0, account_file=acct,
+                            history_file=tmp_path / "paper_history.json")
+    assert reloaded.reset_at == pa.reset_at, "证据必须能跨进程重载（闭环要读它）"
+    assert reloaded.initial_cash == 800_000.0

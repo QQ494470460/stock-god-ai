@@ -195,6 +195,11 @@ class PaperAccount:
         self.today_pnl = 0.0
         self.today_trades = 0
         self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
+        # 「本账户确实被人重置过」的**证据**：只有 reset() 会写它，高精度时间戳。
+        # 常驻闭环拿它判断「initial_cash 变了」到底是人工重置还是状态被写坏 ——
+        # 2026-10-30 09:42 空白单例覆盖账户时，边基线跟着变成 10 万，闭环把这次
+        # 覆盖当成「用户重置」并自动 rebaseline_peak，回撤归零、熔断被静默解除。
+        self.reset_at: str = ""
         # 当日起始权益（float | None）。None = 当日尚未建仓/尚未定基线，
         # 此时 today_pnl_market() 退化为 today_pnl（已实现口径），不会返回假数。
         self._day_start_equity: Optional[float] = None
@@ -312,6 +317,7 @@ class PaperAccount:
             self.today_pnl = acct.get("today_pnl", 0.0)
             self.today_trades = acct.get("today_trades", 0)
             self._last_reset_date = acct.get("last_reset_date", self._last_reset_date)
+            self.reset_at = str(acct.get("reset_at", "") or "")
             # ★ 本金基线必须与「实际注入的权益」对齐，否则盈亏/收益率/回撤会被按
             # 默认的 ¥100,000 误算（出现 4890% 这类幽灵收益 —— 即「双账户态不一致」）。
             # 历史存档若未记录 initial_cash（账户被外部注入了资金/持仓），则以载入时的
@@ -424,6 +430,7 @@ class PaperAccount:
                 "today_pnl": self.today_pnl,
                 "today_trades": self.today_trades,
                 "last_reset_date": self._last_reset_date,
+                "reset_at": self.reset_at,
                 "day_start_equity": self._day_start_equity,
             }
             _atomic_write_text(self.account_file, json.dumps(data, ensure_ascii=False, indent=2))
@@ -991,6 +998,8 @@ class PaperAccount:
                 self.today_trades = 0
                 self._day_start_equity = None
                 self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
+                # 重置证据：高精度时间戳，闭环靠它区分「人工重置」与「状态被写坏」
+                self.reset_at = datetime.now().isoformat(timespec="microseconds")
                 if not keep_history:
                     self.trade_history = []
                 self._save_nolock(force=True)   # 主动重置是明确意图，绕过空白账户保护
