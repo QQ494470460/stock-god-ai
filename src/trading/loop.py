@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -772,6 +773,54 @@ class TradingLoop:
     # ------------------------------------------------------------------
     # ② 目标组合调仓
     # ------------------------------------------------------------------
+    def _strategy_fingerprint(self) -> str:
+        """当前策略形状的短指纹（决定收益分布的那些参数）。
+
+        为什么要有它：回撤熔断按「峰值→当前权益」算，而峰值是**旧策略**
+        打出来的成绩。策略形状一变（周期、权重、退出规则），旧峰值就不再
+        是同一个策略的基准，继续拿它考核会直接把闭环锁死。
+        这里只放「改变收益分布」的参数，**不放风控阈值**（熔断线本身变了
+        不该触发基线重置，否则调风控就等于自己给自己发免死金牌）。
+        """
+        c = self.config
+        body = {
+            "top_n": int(getattr(c, "max_positions", 0) or 0),
+            "band": round(float(getattr(c, "band_pct", 0.0) or 0.0), 4),
+            "rebal": int(getattr(c, "rebalance_days", 0) or 0),
+            "weight": str(getattr(c, "weighting", "") or ""),
+            "cash": round(float(getattr(c, "cash_reserve_pct", 0.0) or 0.0), 4),
+            "tilt": round(float(getattr(c, "tilt_strength", 0.0) or 0.0), 4),
+            "hold_if_pf": round(
+                float(getattr(c, "hold_if_profitable_pct", 0.0) or 0.0), 4),
+        }
+        g = getattr(self.guard, "config", None)
+        if g is not None:
+            body.update({
+                "sl": round(float(getattr(g, "stop_loss_pct", 0.0) or 0.0), 4),
+                "tp": round(float(getattr(g, "stop_profit_pct", 0.0) or 0.0), 4),
+                "trail": round(
+                    float(getattr(g, "trailing_stop_pct", 0.0) or 0.0), 4),
+                "atr": bool(getattr(g, "atr_stop_enabled", False)),
+            })
+        raw = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+    def _maybe_sync_strategy_version(self, equity: float) -> None:
+        """策略形状变更时对齐熔断净值基线（细则见 guard.sync_strategy_version）。"""
+        safety = getattr(self.guard, "safety", None) if self.guard else None
+        if safety is None or not hasattr(safety, "sync_strategy_version"):
+            return
+        try:
+            version = self._strategy_fingerprint()
+            changed, why = safety.sync_strategy_version(version, equity)
+            if changed:
+                logger.warning(
+                    f"🧬 策略形状变更（{why}）⇒ 熔断净值基线已对齐当前权益 "
+                    f"¥{equity:,.0f}，回撤归零。旧峰值属另一策略，不再考核新策略。")
+        except Exception as e:  # noqa: BLE001
+            # 这条链路只影响「熔断基线是否跟着策略走」，失败绝不能挡住交易主流程
+            logger.error(f"策略指纹同步失败（已忽略，下个 tick 重试）: {e}")
+
     def _rebalance_due(self, now: Optional[datetime] = None) -> bool:
         """距上次调仓是否已满 ``config.rebalance_days`` 个交易日。
 
@@ -1363,6 +1412,15 @@ class TradingLoop:
                     self._day_start_equity[today] = report.equity
                     # 落盘：常驻进程重启后当日起始权益仍正确（否则 day_pnl 从 0 算起）
                     self._save_runtime()
+
+            # --- ②.5 策略形状 → 熔断基线对齐 ---
+            # 必须早于 ③ 熔断监控：否则本 tick 会先按旧峰值判熔断、再重置基线，
+            # 白白多冻结一个 tick；且若本 tick 正是交易日尾盘，会丢掉一次调仓机会。
+            if account:
+                try:
+                    self._maybe_sync_strategy_version(report.equity)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"策略指纹同步异常（已忽略）: {e}")
 
             # --- ③ 熔断监控 ---
             if self.guard is not None:

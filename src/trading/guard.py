@@ -340,6 +340,12 @@ class GuardState:
     # 对上遗留 peak 100 万 → 首 tick 报 89.95% 回撤直接 halt）。
     # 旧状态文件无此字段时为空串，表示「未记录」，此时不做自动重置。
     baseline_account: str = ""
+    # 峰值所依据的「策略形状指纹」（由 loop 计算，含周期/权重/退出规则等）。
+    # 回撤熔断的语义是「这个策略亏得太多」；策略一换，旧峰值就是**另一个
+    # 策略**的成绩，拿它考核新策略会直接把闭环锁死（实测 2026-10-31 改造后
+    # 回撤 10.86% 卡在 6% 解冻线下方，93% 现金根本回不来，新规则一行都跑不到）。
+    # 空串 = 旧状态文件，只登记不重置（见 SafetyController.sync_strategy_version）。
+    strategy_version: str = ""
 
 
 class SafetyController:
@@ -679,6 +685,57 @@ class SafetyController:
             "operator": operator, "old_peak": old_peak, "new_baseline": equity,
             "reason": reason, "account_id": account_id,
         })
+
+    def sync_strategy_version(self, version: str, equity: float,
+                              reason: str = "") -> Tuple[bool, str]:
+        """策略形状变了 ⇒ 把净值基线对齐到当前权益。
+
+        **为什么必须做**：回撤熔断的语义是「这个策略亏得太多」。策略形状
+        （周期 / 权重 / 退出规则）一换，旧峰值就是**另一个策略**的成绩，
+        拿它考核新策略会直接把闭环锁死 —— 实测 2026-10-31 改造后回撤
+        10.86% 卡在 6% 解冻线下方，93% 现金根本回不来，新规则一行代码都
+        执行不到。
+
+        **为什么不是无条件重置**（三条 fail-safe）：
+        - ``version`` 为空 / 权益非法 → 直接不动，返回未重置；
+        - 旧状态文件没有该字段（空串）→ **只登记不重置**。首次引入本机制
+          就静默放宽一次熔断是不可接受的，那一次必须由操作者显式
+          ``rebaseline_peak``（CLI ``--rebaseline-peak``）；
+        - 版本相同 → 不动。
+
+        Returns:
+            ``(是否重置, 说明)``
+        """
+        version = (version or "").strip()
+        if not version:
+            return False, "策略指纹为空，跳过"
+        try:
+            equity = float(equity)
+        except (TypeError, ValueError):
+            return False, "权益非法，跳过"
+        if equity <= 0:
+            return False, "权益非正，跳过"
+        with self._lock:
+            prev = (self._state.strategy_version or "").strip()
+            if not prev:
+                self._state.strategy_version = version
+                self._save()
+                logger.info(
+                    f"🧬 已登记策略指纹 {version}（首见，**不改动**净值基线；"
+                    f"若确因策略变更需要重置，请显式 --rebaseline-peak）")
+                return False, "首见，仅登记"
+            if prev == version:
+                return False, "策略指纹未变"
+            old_peak = float(self._state.peak_equity or 0.0)
+            self._state.strategy_version = version
+        # rebaseline_peak 自带锁与落盘，且会写 rebaseline_peak 审计事件
+        self.rebaseline_peak(
+            equity, operator="autoloop",
+            reason=(reason or (
+                f"策略形状变更 {prev}→{version}；旧峰值 ¥{old_peak:,.0f} "
+                f"属于另一个策略，不对新策略计回撤")),
+        )
+        return True, f"{prev}→{version}"
 
     def _journal_event(self, event: str, data: dict) -> None:
         """把关键状态变更落到 TradeJournal（append-only，便于事后审计）。
