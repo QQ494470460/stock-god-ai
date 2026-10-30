@@ -483,6 +483,41 @@ def test_settle_writes_report(monkeypatch, tmp_path, force_trading_time):
     assert "结算" in rep.note
 
 
+def test_rebalance_period_gate_skips_and_persists(force_trading_time, tmp_path, monkeypatch):
+    """调仓必须按「交易日周期」驱动，且上次调仓日期要跨进程存活。
+
+    背景：2026-10-31 依据 src/core/exec_backtest.py 的网格把周期从 5 天拉到 15 天
+    —— 5 天周期在 50bp 成本下夏普塌到 0.41（每期边际收益 ~0.5%，一次往返成本 ~1.1%），
+    15 天在三档成本下 1.19/1.06/0.95。这里钉两件事：
+      ① 周期内不重复调仓（否则等于逐 tick 调，成本翻倍）；
+      ② 日期要落盘 —— 闭环设计上会自愈重启，纯内存状态一重启就立刻再调一次。
+    """
+    import src.trading.loop as loopmod
+    monkeypatch.setattr(loopmod, "DATA_DIR", tmp_path)
+
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    cfg = LoopConfig(auto_build_plan=False, dry_run=True, rebalance_days=15,
+                     heartbeat_file=str(tmp_path / "hb.json"))
+    loop = mk_loop(broker=b, paper=paper, cfg=cfg)
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+
+    loop.tick()
+    first = loop._last_rebalance_date
+    assert first, "调仓日必须记下来"
+    assert loop._rebalance_due() is False, "同一天不该再次调仓"
+
+    rep = loop.tick()
+    assert rep.n_intents == 0, "周期内不得产生调仓委托"
+    assert "不足" in (rep.note or ""), f"应说明为何跳过调仓，实际 note={rep.note!r}"
+
+    # 模拟自愈重启：新实例从 loop_runtime.json 读回上次调仓日
+    loop2 = mk_loop(broker=FakeBroker(total=1_000_000.0, cash=1_000_000.0),
+                    paper=FakePaper(total=1_000_000.0), cfg=cfg)
+    assert loop2._last_rebalance_date == first, "重启后不得丢失调仓节奏（否则立刻再调一次）"
+    assert loop2._rebalance_due() is False
+
+
 def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, monkeypatch):
     """结算报告 stats 必须反映「一整天」的拦截/意图，而非结算那一刻的 0。
 
@@ -495,8 +530,10 @@ def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, 
 
     paper = FakePaper(total=1_000_000.0)
     b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    # rebalance_days=1 → 每个 tick 都发起调仓。本用例要验的是**日内累计计数**，
+    # 与「按周期调仓」无关；生产默认 15 天会让第 2、3 个 tick 直接跳过调仓。
     loop = mk_loop(broker=b, paper=paper,
-                   cfg=LoopConfig(auto_build_plan=False, notify=False))
+                   cfg=LoopConfig(auto_build_plan=False, notify=False, rebalance_days=1))
     # 目标评分 40 < 风控下限 55 → 每次调仓都会被 guard 拦截（盘中持续发生）
     loop.plan = mk_plan([("600519", 40, 0.30)])
 

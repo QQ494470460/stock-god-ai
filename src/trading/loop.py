@@ -137,6 +137,11 @@ class LoopConfig:
     # 调仓容忍带。生产权威值在 config/settings.py:TradingLoopConfig.band_pct
     # （此处只是 app_config 缺失时的兜底，两处须保持一致，否则谁读谁生效全看运气）。
     band_pct: float = 0.15
+    # 调仓周期（交易日，0/1=每 tick 都可调）。生产权威值在
+    # config/settings.py:TradingLoopConfig.rebalance_days（此处仅兜底）。
+    # 依据见 settings.py 里的注解：5 天周期在 50bp 成本下夏普塌到 0.41，
+    # 15 天周期在三档成本下 1.19/1.06/0.95 —— 周期是成本敏感性的决定性参数。
+    rebalance_days: int = 15
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一。
@@ -308,6 +313,11 @@ class TradingLoop:
             else Path(DATA_DIR) / "loop_runtime.json"
         )
         self._halt_notified: bool = False   # 熔断通知只发一次，解除后再熔断才重发
+        # 上次**实际发起调仓**的交易日（YYYY-MM-DD）。配合 config.rebalance_days
+        # 控制调仓节奏：到期才动，其余时间只跑止损/结算。
+        # 必须落盘：闭环本来就设计成会自愈重启，纯内存状态一重启就「立刻再调一次仓」，
+        # 换手与成本会翻倍 —— 而换手正是 50bp 成本下的死因。
+        self._last_rebalance_date: str = ""
         self._load_runtime()
         # 纸账户本金基线（initial_cash）的上一 tick 记忆：用于检测「重置」这类
         # 非交易性基线变更并自动对齐风控净值基线，避免误熔断。
@@ -416,6 +426,7 @@ class TradingLoop:
                 k: float(v) for k, v in (data.get("day_start_equity") or {}).items()
             }
             self._settled_dates = set(d for d in (data.get("settled_dates") or []) if d)
+            self._last_rebalance_date = str(data.get("last_rebalance_date") or "")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"闭环运行态读盘失败（已忽略，按内存默认值）: {e}")
 
@@ -427,6 +438,7 @@ class TradingLoop:
                 json.dumps({
                     "day_start_equity": self._day_start_equity,
                     "settled_dates": sorted(self._settled_dates),
+                    "last_rebalance_date": self._last_rebalance_date,
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -760,9 +772,39 @@ class TradingLoop:
     # ------------------------------------------------------------------
     # ② 目标组合调仓
     # ------------------------------------------------------------------
+    def _rebalance_due(self, now: Optional[datetime] = None) -> bool:
+        """距上次调仓是否已满 ``config.rebalance_days`` 个交易日。
+
+        为什么按**交易日**而不是自然日：15 个自然日含两个周末，实际只过了 11 个
+        交易日，等于把周期悄悄缩短 27%。也为什么必须落盘：自愈重启后内存清零会
+        立刻再调一次仓，换手与成本翻倍 —— 而换手就是 50bp 假设下的死因。
+        """
+        n = int(getattr(self.config, "rebalance_days", 0) or 0)
+        if n <= 1:
+            return True
+        last = (self._last_rebalance_date or "").strip()
+        if not last:
+            return True
+        try:
+            from datetime import date as _date
+
+            from src.trading.calendar import trading_days_between
+
+            d0 = _date.fromisoformat(last)
+            d1 = (now or datetime.now()).date()
+            return trading_days_between(d0, d1) >= n
+        except Exception as e:  # noqa: BLE001
+            # 数据不全时宁可允许调仓（机会成本 < 永久卡死的风险）
+            logger.debug(f"调仓周期判定失败，按「到期」处理: {e}")
+            return True
+
     def _run_rebalance(self, positions, account, prices, report: TickReport):
         if self.plan is None or not self.plan.targets:
             report.note = "无有效交易计划，跳过调仓"
+            return
+        if not self._rebalance_due():
+            report.note = (f"距上次调仓不足 {getattr(self.config, 'rebalance_days', 0)} "
+                           f"个交易日（上次 {self._last_rebalance_date}），本次只跑止损/结算")
             return
         from src.trading.rebalance import compute_rebalance_orders
 
@@ -778,6 +820,11 @@ class TradingLoop:
             hold_if_profitable_pct=self.config.hold_if_profitable_pct,
         )
         report.n_intents = len(intents)
+        # 无论本次有没有产生委托，都记「已发起」：调仓是**按周期**驱动的，
+        # 不是「想调就调」。若只在有成交时才记账，一个因带内/资金不足而空转的
+        # 调仓日会每 tick 重算一次，直到某天碰巧成交 —— 等于把周期悄悄改回逐 tick。
+        self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
+        self._save_runtime()
         if not intents:
             return
 

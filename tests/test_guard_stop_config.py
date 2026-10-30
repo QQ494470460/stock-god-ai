@@ -103,6 +103,57 @@ def test_explicit_risk_config_wins(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# 退出规则必须能「关掉」（0 = 关闭，而不是「0 = 立刻触发」）
+# ----------------------------------------------------------------------
+def _pos(code="600000", qty=1000, cost=10.0, price=10.0):
+    from src.trading.broker import Position
+    return Position(code=code, name=code, quantity=qty, available=qty,
+                    avg_cost=cost, current_price=price,
+                    market_value=qty * price, pnl=(price - cost) * qty,
+                    pnl_pct=(price / cost - 1) * 100)
+
+
+def test_zero_threshold_disables_exit_rules(tmp_path):
+    """stop_loss_pct=0 / stop_profit_pct=0 / trailing=0 → 一条都不许触发。
+
+    背景：2026-10-31 依据执行级回测（src/core/exec_backtest.py）关掉了个股退出，
+    因为止盈15%+移动止损-3% 把年化 +29% 打成 -27%。关的方法就是把阈值设 0 ——
+    若代码写成「pnl_pct >= stop_profit_pct」而不管 0，会把**每一笔浮盈**都卖掉；
+    写成「pnl_pct <= stop_line」而不管 0，会把**每一笔浮亏**都斩掉。
+    这两条都是静默灾难，故钉死。
+    """
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"),
+                      stop_loss_pct=0.0, stop_profit_pct=0.0,
+                      trailing_stop_pct=0.0, atr_stop_enabled=False)
+    sup = RiskSupervisor(_Broker(), cfg, industry_map={})
+    ex = sup.executor
+
+    # 深亏 -30%：硬止损已关 → 不该产生任何卖单
+    assert ex.check_stop_conditions(positions=[_pos(cost=10.0, price=7.0)],
+                                    prices={"600000": 7.0}) == []
+    # 大赚 +50%：止盈已关
+    assert ex.check_stop_conditions(positions=[_pos(cost=10.0, price=15.0)],
+                                    prices={"600000": 15.0}) == []
+    # 曾经摸高后回落：移动止损已关
+    ex._high_water["600000"] = 15.0
+    assert ex.check_stop_conditions(positions=[_pos(cost=10.0, price=12.0)],
+                                    prices={"600000": 12.0}) == []
+
+
+def test_negative_threshold_still_fires(tmp_path):
+    """反向保护：阈值仍为负时，硬止损必须照样触发（别把功能一起关没了）。"""
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"),
+                      stop_loss_pct=-5.0, stop_profit_pct=0.0,
+                      trailing_stop_pct=0.0, atr_stop_enabled=False)
+    sup = RiskSupervisor(_Broker(), cfg, industry_map={})
+    alerts = sup.executor.check_stop_conditions(
+        positions=[_pos(cost=10.0, price=9.0)], prices={"600000": 9.0})
+    assert alerts and "止损" in alerts[0]["reason"]
+
+
+# ----------------------------------------------------------------------
 # 单日亏损两条线
 # ----------------------------------------------------------------------
 def _cfg(tmp_path, **kw):

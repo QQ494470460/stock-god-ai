@@ -220,23 +220,27 @@ class TradeExecutor:
             stop_line, trail_line = self._effective_stop_lines(pos.code)
 
             # 止损判断
-            if pnl_pct <= stop_line:
+            # ⚠️ 三条线都必须能「关掉」，而不是「设成 0 就天天触发」：
+            # stop_line=0 时 pnl_pct<=0 会把每一笔浮亏都斩掉，止盈设 0 会把每一笔
+            # 浮盈都卖掉。执行级回测（src/core/exec_backtest.py）证明确切的负贡献：
+            # 止盈15%+移动止损-3% 把年化 +29% 打成 -27%、持有期 9 天压到 1.8 天。
+            if stop_line < 0 and pnl_pct <= stop_line:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"止损 {pnl_pct:.1f}%",
                     "action": "sell", "pnl_pct": pnl_pct,
                     "quantity": qty,
                 })
-            # 止盈判断
-            elif pnl_pct >= self.config.stop_profit_pct:
+            # 止盈判断（stop_profit_pct <= 0 表示关闭）
+            elif self.config.stop_profit_pct > 0 and pnl_pct >= self.config.stop_profit_pct:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"止盈 {pnl_pct:.1f}%",
                     "action": "sell", "pnl_pct": pnl_pct,
                     "quantity": qty,
                 })
-            # 移动止损
-            elif pnl_pct > 0 and drawdown <= trail_line:
+            # 移动止损（trailing_stop_pct >= 0 表示关闭）
+            elif self.config.trailing_stop_pct < 0 and pnl_pct > 0 and drawdown <= trail_line:
                 alerts.append({
                     "code": pos.code, "name": pos.name,
                     "reason": f"移动止损 回撤{drawdown:.1f}% (最高+{(tracked_high/pos.avg_cost-1)*100:.1f}%)",
