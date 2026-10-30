@@ -174,12 +174,12 @@ def test_watchdog_tick_throttles_to_interval(tmp_path):
 
 
 def test_watchdog_tick_swallows_errors(tmp_path):
-    """看门狗自己崩了不能把常驻调度进程带崩。"""
+    """看门狗自己崩了不能把常驻调度进程带崩，也不能把日志写脏。"""
     def boom(**_kw):
         raise RuntimeError("故意炸")
 
-    dog = wd.LoopWatchdog(interval=0.0)
-    dog._kwargs = {"now": IN_WINDOW}
+    log = tmp_path / "watchdog.log"
+    dog = wd.LoopWatchdog(interval=0.0, now=IN_WINDOW, log_path=log)
     import src.scheduler.loop_watchdog as mod
     orig = mod.check
     mod.check = boom
@@ -187,3 +187,4 @@ def test_watchdog_tick_swallows_errors(tmp_path):
         assert dog.tick(1.0) is None
     finally:
         mod.check = orig
+    assert log.exists() and "故意炸" in log.read_text(encoding="utf-8")

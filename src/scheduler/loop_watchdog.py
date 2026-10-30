@@ -253,7 +253,9 @@ class LoopWatchdog:
         try:
             return check(**self._kwargs)
         except Exception as e:  # noqa: BLE001
-            _append_log(f"ERROR 看门狗自身异常（已忽略）: {e}")
+            # 注意带上 log_path：测试用 tmp 路径时不能写脏生产 logs/。
+            _append_log(f"ERROR 看门狗自身异常（已忽略）: {e}",
+                        self._kwargs.get("log_path"))
             return None
 
 
