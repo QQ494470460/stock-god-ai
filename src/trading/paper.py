@@ -367,9 +367,55 @@ class PaperAccount:
         with _xlock(self):
             self._save_nolock()
 
-    def _save_nolock(self):
-        """无锁落盘：调用方必须已持有跨进程锁(_xlock)，否则并发写会互相覆盖。"""
+    def _looks_pristine(self) -> bool:
+        """内存里是不是一个「从没被用过」的全新账户（默认 10 万、无持仓）。
+
+        这个形态只有一个合法来源：``PaperAccount()`` 构造后 ``_load`` 没读到
+        任何状态。它一旦被 ``_save`` 落盘，磁盘上的真实账户就被抹掉了 ——
+        2026-10-30 09:42 正是这么丢的：账户从 ¥4,218,917 + 1 只持仓变成
+        ¥100,000 + 0 持仓，风控基线跟着被对齐到 10 万，回撤熔断被静默解除。
+        """
+        return (not self.holdings
+                and abs(float(self.cash) - 100_000.0) < 1e-6
+                and abs(float(self.initial_cash) - 100_000.0) < 1e-6)
+
+    def _disk_has_state(self) -> bool:
+        """磁盘上是否已有「非全新」账户。**读不出来一律按"有"处理**（保守）。
+
+        判据：文件存在且（有持仓 或 initial_cash ≠ 10 万），或者文件存在但
+        解析失败 —— 后者说明状态可能被截断/占用，更不能拿空白账户去覆盖。
+        """
+        p = Path(self.account_file)
         try:
+            if not p.exists():
+                return False
+        except Exception:  # noqa: BLE001
+            return True
+        raw = self._read_json(p)
+        if raw is None:
+            return True          # 存在但读不出来 → 视为有状态，绝不允许覆盖
+        try:
+            if raw.get("holdings"):
+                return True
+            return abs(float(raw.get("initial_cash", 0) or 0) - 100_000.0) > 1e-6
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _save_nolock(self, force: bool = False):
+        """无锁落盘：调用方必须已持有跨进程锁(_xlock)，否则并发写会互相覆盖。
+
+        ``force=False`` 时带一道「空白账户不得覆盖已有状态」的闸：全新账户
+        （10 万、无持仓）只在磁盘上确实没有状态时才允许落盘。真正的主动重置
+        走 ``reset()``，它会显式传 ``force=True``。
+        """
+        try:
+            if not force and self._looks_pristine() and self._disk_has_state():
+                logger.error(
+                    "🛑 拒绝用空白账户覆盖磁盘上已有的纸账户状态"
+                    f"（{Path(self.account_file).name}）—— "
+                    "疑似 _load 失败后被误持久化。主动重置请走 PaperAccount.reset()。"
+                )
+                return
             self._normalize_holdings()   # 落盘前再拉正一次，防止外部改 last_price
             data = {
                 "cash": self.cash,
@@ -947,7 +993,7 @@ class PaperAccount:
                 self._last_reset_date = datetime.now().strftime("%Y-%m-%d")
                 if not keep_history:
                     self.trade_history = []
-                self._save_nolock()
+                self._save_nolock(force=True)   # 主动重置是明确意图，绕过空白账户保护
                 self._save_history_nolock()
             logger.info(f"🔄 纸交易账户已重置: ¥{self.cash:,.0f}"
                         f"{'（保留成交历史）' if keep_history else '（已清空成交历史）'}")

@@ -635,3 +635,64 @@ def test_corporate_action_rejects_unknown_and_missing(tmp_path):
     assert not ok1, "未知公司行为必须拒绝"
     ok2, _, _ = pa.apply_corporate_action("000000", "split", ratio=1.0)
     assert not ok2, "无持仓必须拒绝"
+
+
+# ======================================================================
+# 空白账户不得覆盖磁盘上的真实状态（2026-10-30 事故）
+# ----------------------------------------------------------------------
+# 那天 09:42 纸账户从 ¥4,218,917 + 1 只持仓变成 ¥100,000 + 0 持仓，
+# 风控基线跟着被对齐到 10 万，回撤熔断被静默解除 —— 账面 450 万凭空消失。
+# 形态只有一个来源：模块级单例 PaperAccount() 在 _load 读不到文件时构造出
+# 一个「全新账户」，随后任意一次 save() 就把它落了盘。
+# ======================================================================
+
+def test_pristine_account_refuses_to_overwrite_existing_state(tmp_path):
+    """主文件读不出来（且无 .bak）时，内存里是空白账户 —— 绝不允许落盘覆盖。"""
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    broken = '{"cash": 4218917.24, "holdings": {"603688": '   # 截断的 JSON
+    acct.write_text(broken, encoding="utf-8")
+
+    pa = PaperAccount(account_file=acct, history_file=hist)
+    assert pa.cash == 100_000.0 and pa.holdings == {}, "读失败时应退化为空白账户"
+    assert pa._looks_pristine() is True
+
+    pa.save()   # 关键：这一步以前会把 450 万覆盖成 10 万
+
+    assert acct.read_text(encoding="utf-8") == broken, \
+        "空白账户不得覆盖已有（哪怕损坏的）账户文件"
+
+
+def test_pristine_account_saves_normally_when_disk_is_empty(tmp_path):
+    """真正的首次运行（磁盘上没有账户文件）不受影响。"""
+    acct = tmp_path / "paper_account.json"
+    hist = tmp_path / "paper_history.json"
+    pa = PaperAccount(account_file=acct, history_file=hist)
+    pa.save()
+    assert acct.exists()
+    saved = json.loads(acct.read_text(encoding="utf-8"))
+    assert saved["cash"] == 100_000.0
+
+
+def test_reset_still_wipes_state_on_explicit_request(tmp_path):
+    """主动重置（reset）必须照样能清仓 —— 保护闸只拦「意外的空白覆盖」。"""
+    pa, acct = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    assert acct.exists() and json.loads(acct.read_text(encoding="utf-8"))["holdings"]
+
+    pa.reset(800_000.0)
+    saved = json.loads(acct.read_text(encoding="utf-8"))
+    assert saved["holdings"] == {}
+    assert saved["cash"] == 800_000.0
+
+
+def test_non_pristine_account_still_saves(tmp_path):
+    """有持仓/现金≠10万的账户走原路径，不额外拦。"""
+    pa, acct = _new_account(tmp_path, initial_cash=1_000_000.0)
+    ok, msg, _ = pa.buy("600519", "茅台", 100.0, 1000)
+    assert ok, msg
+    pa.save()
+    saved = json.loads(acct.read_text(encoding="utf-8"))
+    assert "600519" in saved["holdings"]
+    assert saved["initial_cash"] == 1_000_000.0
