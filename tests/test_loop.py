@@ -1132,6 +1132,83 @@ def test_paper_reset_external_disk_change_realigns_guard_and_keeps_running(force
     assert rep2.state == LoopState.RUNNING.value
 
 
+def test_loop_refuses_rebaseline_when_baseline_changes_without_reset_evidence(force_trading_time, tmp_path):
+    """回归（2026-10-30 事故）：本金基线变了但**没有 reset() 证据** → 拒绝重对齐。
+
+    实况：09:42 `data/paper_account.json` 从「现金 ¥4,218,917 / 1 只持仓 /
+    本金基线 ¥4,995,224」被空白单例覆盖成「10 万 / 0 持仓 / 10 万」，随后闭环
+    把这个变化当成「用户重置」，rebaseline_peak 把峰值对齐到 10 万 —— 回撤从
+    10.86% 变成 0%，**熔断被静默解除**，且 journal 里只有一条 autoloop 的
+    rebaseline_peak，没有任何告警。
+
+    判据：只有 `PaperAccount.reset()` 会写 `reset_at`。基线变了而 reset_at 没动
+    ⇒ 不是人工重置，是状态被写坏 ⇒ 必须拒绝放宽基线、保留熔断并留痕。
+    """
+    from src.trading.guard import GuardConfig, RiskSupervisor
+    from src.trading.paper import PaperAccount
+
+    account_file = tmp_path / "paper_account.json"
+    history_file = tmp_path / "paper_history.json"
+    paper = PaperAccount(initial_cash=1_000_000.0,
+                         account_file=account_file, history_file=history_file)
+    paper.save()                                    # dry_run 不落盘，手动建盘
+    broker = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    guard = RiskSupervisor(broker, GuardConfig(
+        state_file=str(tmp_path / "gs.json"),
+        journal_file=str(tmp_path / "gj.jsonl"),
+    ), paper_account=paper)
+    loop = mk_loop(broker=broker, paper=paper, guard=guard,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+
+    loop.tick()                                     # 建立基线 peak=1,000,000
+    peak_before = loop.guard.safety._state.peak_equity
+    assert peak_before == pytest.approx(1_000_000.0, rel=1e-3)
+
+    # 绕过 PaperAccount 直接改盘 —— 这就是「状态被写坏」的样子：基线变了，
+    # reset_at 还是旧的（空），没有 reset() 留下的证据。
+    raw = json.loads(account_file.read_text(encoding="utf-8"))
+    raw.update({"cash": 100_000.0, "initial_cash": 100_000.0, "holdings": {}})
+    account_file.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    calls, events = [], []
+    _orig_rb = loop.guard.safety.rebaseline_peak
+    _orig_emit = loop.guard._emit
+    loop.guard.safety.rebaseline_peak = lambda *a, **k: (calls.append(a), _orig_rb(*a, **k))[1]
+    loop.guard._emit = lambda ev, data: (events.append(ev), _orig_emit(ev, data))[1]
+
+    rep = loop.tick()
+
+    assert calls == [], "没有 reset() 证据就重对齐基线 = 静默放宽熔断线"
+    assert loop.guard.safety._state.peak_equity == pytest.approx(peak_before), \
+        "峰值必须保持原值，否则回撤会被重新算成 0"
+    assert "rebaseline_blocked" in events, "拒绝重对齐必须留痕（事后审计要看得见）"
+    # 90% 的假回撤照常熔断 —— 宁可停摆也不静默放开
+    assert loop.guard.safety.halted is True
+    assert rep.state == LoopState.HALTED.value
+
+
+def test_loop_allows_rebaseline_when_reset_evidence_present(force_trading_time, tmp_path):
+    """对照：确实走过 reset()（reset_at 前进）→ 照常对齐基线，不误熔断。"""
+    from src.trading.paper import PaperAccount
+
+    account_file = tmp_path / "paper_account.json"
+    history_file = tmp_path / "paper_history.json"
+    paper = PaperAccount(initial_cash=1_000_000.0,
+                         account_file=account_file, history_file=history_file)
+    loop = mk_loop(broker=FakeBroker(total=1_000_000.0, cash=1_000_000.0),
+                   paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.plan = mk_plan([("600519", 90, 0.30)])
+    loop.tick()
+    assert paper.reset_at == "", "reset() 之外的路径不该写 reset_at"
+
+    paper.reset(500_000.0)          # 人工重置：reset_at 前进
+    rep = loop.tick()
+    assert loop.guard.safety._state.peak_equity == pytest.approx(500_000.0, rel=1e-3)
+    assert rep.state != LoopState.HALTED.value
+
+
 def test_loop_only_rebaselines_on_initial_cash_change_not_on_cash_change(force_trading_time, tmp_path):
     """回归：本金基线(_last_pa_baseline)只在 initial_cash 变更时才重对齐，
     普通市值波动（cash 变化）绝不应触发 rebaseline —— 否则会把真实的腰斩

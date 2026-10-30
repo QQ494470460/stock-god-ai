@@ -188,6 +188,38 @@ def test_risk_budget_blocks_add_when_already_over_budget(tmp_path):
     assert "风险预算" in why
 
 
+def test_risk_budget_uses_atr_stop_ceiling(tmp_path):
+    """ATR 自适应止损**只增不减** → 预算必须按止损可能放宽到的上限算。
+
+    用建仓当时的宽度（-5%）算预算，只能保证「今天合规」；后续 ATR 把止损放宽
+    到 -15% 时，这笔的潜在亏损直接翻 3 倍。实测 300757：建仓按 5% 放行 ¥41 万，
+    之后止损放宽到 -8.4%，实亏 ¥3.78 万 = 权益 0.81%，是 0.5% 预算的 1.6 倍。
+    """
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05, atr_stop_enabled=True, atr_stop_max_pct=15.0)
+    qty, why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    # 5000 元预算 / (10 元 × 15% 上限) = 3333 → 整手 3300
+    assert qty == 3_300
+    assert "风险预算" in why
+
+
+def test_risk_budget_ceiling_is_ignored_when_atr_disabled(tmp_path):
+    """没开 ATR 时止损宽度固定，预算口径不应有任何变化（逐字节等价旧行为）。"""
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05, atr_stop_enabled=False, atr_stop_max_pct=15.0)
+    qty, _why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    assert qty == 10_000
+
+
+def test_risk_budget_ceiling_can_be_disabled(tmp_path):
+    """留退路：risk_budget_use_stop_ceiling=False 回到按当前宽度算。"""
+    g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005,
+               risk_budget_stop_pct=0.05, atr_stop_enabled=True,
+               risk_budget_use_stop_ceiling=False)
+    qty, _why = g._apply_execution_limits("600000", OrderSide.BUY, 10.0, 20_000, _account())
+    assert qty == 10_000
+
+
 def test_risk_budget_does_not_cap_sells(tmp_path):
     g = _guard(tmp_path, adv=1e9, max_risk_per_trade_pct=0.005)
     g._positions = lambda: [_pos(qty=20_000, cost=10.0)]

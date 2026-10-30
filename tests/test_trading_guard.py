@@ -570,6 +570,62 @@ def test_normal_drawdown_still_halts(tmp_path):
     assert any("回撤" in a for a in alerts)
 
 
+# ======================================================================
+# 自愈滞后带 + 按交易日的半仓冷静期
+# ======================================================================
+# 背景：无滞后带时解冻只需「回撤刚好不超 8%」，账户必然在 8% 线上反复横跳：
+# 10-26 收 7.54% 解冻 → 10-27 建仓 138 万 → 收 8.70% 再熔断 → 10-28 收 8.06%
+# （差 ¥2,754 未达线）。用户体感就是「怎么老是这样」。
+
+def test_heal_blocked_inside_hysteresis_band(tmp_path):
+    """回撤 7%（低于 8% 熔断线，但没进 6% 滞后带）→ 不得解冻。"""
+    sup, _paper, _ = _sup_with_peak(
+        tmp_path, peak=1_000_000.0, today_start=930_000.0, equity=930_000.0)
+    assert sup.safety.current_drawdown_pct(930_000.0) == pytest.approx(7.0, abs=1e-6)
+    assert sup._heal_condition_cleared(930_000.0) is False, (
+        "回撤仍在滞后带内就解冻，等于把「横跳」原封不动地保留下来")
+
+
+def test_heal_allowed_below_hysteresis_band(tmp_path):
+    """回撤 5%（< 6% 滞后带）→ 允许解冻。"""
+    sup, _paper, _ = _sup_with_peak(
+        tmp_path, peak=1_000_000.0, today_start=950_000.0, equity=950_000.0)
+    assert sup._heal_condition_cleared(950_000.0) is True
+
+
+def test_hysteresis_band_can_be_disabled(tmp_path):
+    """margin=0 时退化为旧行为（不超线即可），保证可回退。"""
+    state = tmp_path / "s2.json"
+    cfg = GuardConfig(state_file=str(state), journal_file=str(tmp_path / "j2.jsonl"),
+                      auto_resume_drawdown_margin_pct=0.0)
+    paper = FakePaper(total=930_000.0)
+    sup = RiskSupervisor(FakeBroker(total_asset=930_000.0), cfg, paper_account=paper)
+    sup.safety.rebaseline_peak(1_000_000.0, operator="test")
+    sup.safety.set_today_start(930_000.0)   # 隔离单日亏损线，只验回撤判据
+    assert sup.safety.current_drawdown_pct(930_000.0) == pytest.approx(7.0, abs=1e-6)
+    assert sup._heal_condition_cleared(930_000.0) is True
+
+
+def test_heal_throttle_window_counts_trading_days(tmp_path):
+    """半仓冷静期必须按**交易日**计：周五解冻 + 2 个自然日 = 周日，等于没冷静期。"""
+    sup, _paper, _ = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    sup.config.auto_resume_throttle_days = 2.0
+    until = sup._heal_throttle_window()
+    # 2 个交易日至少跨 2 个自然日
+    assert until > time.time() + 86400, f"冷静期不足 1 天（until={until}），疑似按秒配置算"
+    # 且不超过 10 天（长假上限），防止把交易日推进写成死循环
+    assert until < time.time() + 86400 * 10
+
+
+def test_heal_throttle_window_falls_back_to_seconds(tmp_path):
+    """throttle_days<=0 → 退回秒级配置（默认 1800s）。"""
+    sup, _paper, _ = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    sup.config.auto_resume_throttle_days = 0.0
+    sup.config.auto_resume_throttle_sec = 600
+    until = sup._heal_throttle_window()
+    assert time.time() + 300 < until <= time.time() + 700
+
+
 def test_halt_is_idempotent_while_condition_persists(tmp_path):
     """熔断期间每 30s 一个 tick，条件仍成立 → 不得重复落盘/重复告警。
 

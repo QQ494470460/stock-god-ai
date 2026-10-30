@@ -147,8 +147,16 @@ class GuardConfig:
     auto_resume_cooldown_sec: int = 3600      # 熔断后至少冷却多久才允许自愈评估
     auto_resume_require_drawdown_clear: bool = True   # 自愈前回撤必须已回落到熔断线之下
     auto_resume_require_dailyloss_clear: bool = True  # 自愈前单日亏损必须已收复
-    auto_resume_throttle_sec: int = 1800      # 自愈后「降权冷静期」时长
+    auto_resume_throttle_sec: int = 1800      # 自愈后「降权冷静期」时长（throttle_days<=0 时生效）
     auto_resume_risk_fraction: float = 0.5    # 冷静期内 signal_strength 折扣（部分解冻）
+    # ★ 自愈滞后带：解冻要求回撤回落到「熔断线 − margin」之下，而不是「刚好不超线」。
+    # 没有滞后带时账户必在 8% 线上反复横跳：实测 10-26 收 7.54% 解冻 → 10-27 建仓
+    # 138 万 → 收 8.70% 再熔断 → 10-28 收 8.06%（差 ¥2,754 未达线），用户体感就是
+    # 「怎么老是这样」。留 2 个百分点的余量，解冻才算真出坑。
+    auto_resume_drawdown_margin_pct: float = 2.0
+    # 解冻后按**交易日**计的半仓冷静期（<=0 时退回 auto_resume_throttle_sec）。
+    # 必须按交易日：周五解冻 + 2 个自然日 = 周日，等于没有冷静期。
+    auto_resume_throttle_days: float = 2.0
 
     # ---- 持仓约束 ----
     max_positions: int = 20                  # 最大持仓只数
@@ -180,6 +188,10 @@ class GuardConfig:
     max_participation_rate: float = 0.01     # 单笔金额 ≤ 20日平均成交额 × 1%
     max_risk_per_trade_pct: float = 0.005    # 单笔潜在亏损 ≤ 总资产 × 0.5%
     risk_budget_stop_pct: float = 0.05       # 换算止损距离（对应 -5% 止损线）
+    # 预算按「止损可能放宽到的上限」算，而不是按建仓当时的宽度算。
+    # ATR 自适应止损只增不减（最宽 atr_stop_max_pct），建仓时按 -5% 放行的仓位，
+    # 后续止损被放宽到 -15% 时实际风险翻 3 倍 —— 预算形同虚设。
+    risk_budget_use_stop_ceiling: bool = True
     max_daily_turnover_pct: float = 0.30     # 当日买入总额 ≤ 总资产 × 30%
 
     # ---- 组合尾部风险（相关性 VaR 约束，2026-10-26 新增）----
@@ -1965,6 +1977,14 @@ class RiskSupervisor:
                 stop_pct = max(stop_pct, abs(float(_line)) / 100.0)
             except Exception:  # noqa: BLE001
                 pass
+            # ★ 再放宽到「止损可能到达的上限」：ATR 自适应止损**只增不减**，建仓时
+            # 按 -5% 放行的仓位，后续会被放宽到 -15%，实际风险翻 3 倍。用当前宽度
+            # 算预算 = 预算只能保证「今天合规」，保证不了「这笔交易最终会亏多少」。
+            # 实测 300757：建仓按 5% 止损距放行 ¥41 万，之后止损放宽到 -8.4%，
+            # 实亏 ¥3.78 万 = 权益 0.81%，是 0.5% 预算的 1.6 倍。
+            if (bool(getattr(cfg, "risk_budget_use_stop_ceiling", True))
+                    and bool(getattr(cfg, "atr_stop_enabled", False))):
+                stop_pct = max(stop_pct, float(getattr(cfg, "atr_stop_max_pct", 15.0)) / 100.0)
             risk_budget = float(account.total_asset) * float(cfg.max_risk_per_trade_pct)
             # ⚠️ 预算必须扣掉**同标的已有持仓**的风险敞口。本方法按「单笔」算上限，
             # 分多笔建仓时每笔单独看都合规、合起来却成倍超标 —— 预算被「分批」掏空。
@@ -2154,6 +2174,30 @@ class RiskSupervisor:
         return ok, msg, order
 
     # ---------- 周期性监控 / 熔断 ----------
+    def _heal_throttle_window(self) -> float:
+        """解冻后「降权冷静期」的截止时间戳。
+
+        优先按**交易日**计（``auto_resume_throttle_days``）：半仓期必须是交易的
+        天数 —— 周五解冻 + 2 个自然日恰好落在周日，等于没有冷静期。
+        日历不可用时退回秒级配置（``auto_resume_throttle_sec``），绝不因日历
+        异常而放弃冷静期。
+        """
+        now = time.time()
+        days = float(getattr(self.config, "auto_resume_throttle_days", 0) or 0)
+        if days <= 0:
+            return now + float(self.config.auto_resume_throttle_sec)
+        try:
+            from src.trading.calendar import next_trading_day
+
+            d = datetime.now().date()
+            for i in range(max(1, int(round(days)))):
+                d = next_trading_day(d, include_today=(i == 0))   # 第 i+1 个半仓交易日
+            end_day = next_trading_day(d)                          # 半仓期结束的次一交易日
+            return datetime.combine(end_day, datetime.min.time()).timestamp()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"按交易日计算冷静期失败，回退秒级配置: {e}")
+            return now + float(self.config.auto_resume_throttle_sec)
+
     def _heal_condition_cleared(self, equity: float) -> bool:
         """熔断自诊断：触发熔断的条件是否已经真正解除。
 
@@ -2164,8 +2208,12 @@ class RiskSupervisor:
         """
         if self.config.auto_resume_require_drawdown_clear:
             dd = self.safety.current_drawdown_pct(equity)
-            if dd >= self.config.max_portfolio_drawdown_pct:
-                return False  # 回撤仍在熔断线上 → 未清除
+            # 滞后带：必须回落到 (熔断线 − margin) 之下才算清除。margin=0 时
+            # 退化为旧行为「不超线即可」，仍可配置回退。
+            _clear_line = float(self.config.max_portfolio_drawdown_pct) - float(
+                getattr(self.config, "auto_resume_drawdown_margin_pct", 0.0) or 0.0)
+            if dd >= _clear_line:
+                return False  # 回撤尚未回落到滞后带之下 → 未清除
         if self.config.auto_resume_require_dailyloss_clear:
             dl = self.safety.daily_loss_pct(equity)
             if dl <= -self._effective_daily_loss_pct():
@@ -2243,16 +2291,30 @@ class RiskSupervisor:
                             st.halted_by = ""
                             self.safety._save()
                         # 部分解冻：进入「降权冷静期」，期间下单强度打折扣
-                        self._heal_throttle_until = (
-                            time.time() + float(self.config.auto_resume_throttle_sec))
+                        self._heal_throttle_until = self._heal_throttle_window()
+                        _until_txt = datetime.fromtimestamp(
+                            self._heal_throttle_until).strftime("%m-%d %H:%M")
+                        self._emit("auto_resume", {
+                            "reason": _reason, "halted_by": _by,
+                            "equity": equity,
+                            "drawdown_pct": self.safety.current_drawdown_pct(equity),
+                            "clear_line_pct": (
+                                float(self.config.max_portfolio_drawdown_pct)
+                                - float(getattr(self.config,
+                                                "auto_resume_drawdown_margin_pct", 0.0) or 0.0)),
+                            "throttle_until": _until_txt,
+                            "risk_fraction": float(self.config.auto_resume_risk_fraction),
+                        })
                         logger.warning(
                             f"♻️ 自动熔断已智能自愈（条件已清除，缘由 {_by}：{_reason}），"
+                            f"回撤 {self.safety.current_drawdown_pct(equity):.2f}% "
+                            f"< 滞后带 {float(self.config.max_portfolio_drawdown_pct) - float(getattr(self.config, 'auto_resume_drawdown_margin_pct', 0.0) or 0.0):.2f}%，"
                             f"无人值守循环恢复交易（保持 PAPER，"
-                            f"{self.config.auto_resume_throttle_sec}s 降权冷静期）"
+                            f"{float(self.config.auto_resume_risk_fraction):.0%} 仓位至 {_until_txt}）"
                         )
                         alerts.append(
                             f"自动熔断智能自愈：{_reason}（触发条件已清除，"
-                            f"{self.config.auto_resume_throttle_sec}s 冷静期降权）")
+                            f"{float(self.config.auto_resume_risk_fraction):.0%} 仓位至 {_until_txt}）")
                         self.safety.set_today_start(equity)
                     else:
                         # 条件未清除 → 保持熔断，仅刷新当日起始净值避免重复误触发
