@@ -162,11 +162,16 @@ def main() -> int:
     from src.scheduler.auto_scheduler import (
         is_running, start_scheduler, stop_scheduler,
     )
+    # 闭环存活看门狗：本进程是唯一"开机就在"的常驻体，顺手负责盯 loop 心跳。
+    # 2026-10-29 的教训 —— 闭环死了/没起来，唯一表现是"今天没成交"，与"今天
+    # 没信号"完全同形，人工根本发现不了，一下午的止损监控就这么丢了。
+    from src.scheduler.loop_watchdog import LoopWatchdog
 
     sched = None
     holding = False
     last_try = 0.0
     last_hb = 0.0
+    watchdog = LoopWatchdog(interval=60.0)
     logger.info(f"🕒 常驻调度进程启动（pid={os.getpid()}）")
 
     try:
@@ -197,6 +202,16 @@ def main() -> int:
             if now - last_hb >= _HEARTBEAT_INTERVAL:
                 last_hb = now
                 _write_heartbeat(sched, holding, lock_path)
+
+            # 闭环存活检查（自己节流到 60s 一次，且只在交易时段内动作）。
+            # 放在心跳之后：调度心跳先落盘，再去看别人的心跳，顺序颠倒会让
+            # 看板在检查瞬间读到旧的调度心跳。
+            try:
+                res = watchdog.tick(now)
+                if res and res.get("action") in ("alert", "restart"):
+                    logger.warning(f"🩺 闭环看门狗：{res.get('detail')}")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"闭环看门狗异常（已忽略）: {e}")
 
             if args.once:
                 break
