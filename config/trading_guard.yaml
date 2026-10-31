@@ -59,6 +59,18 @@ auto_resume_risk_fraction: 0.5         # 冷静期内下单强度折扣（半仓
 regime_weighting_enabled: false       # 市场状态 → 下单强度加权（已关闭，对齐回测）
 vol_control_enabled: false            # 波动率尾部 → 新开仓降权（已关闭，对齐回测）
 
+# ---- 组合尾部风险（VaR）缩放 / 策略信誉在线调权（已对齐回测，默认关闭）----
+# 二者在回测引擎里**都没有对应物**（回测基准 +26.8%/1.19 就是「它们全关」的状态）：
+#   · var_monitor：组合 1 日 VaR 超 2.5% → 新开仓连续降到 floor 0.40，
+#     本质是「市场风险高→少买」的顺周期砍仓（与 Vol-Control 同类）。
+#     10-31 实测日志 `[VaR约束]` 计数 0（当前休眠，_risk_monitor 未触发），属休眠炸弹。
+#   · credibility：从历史盈亏刷新多策略融合权重（_ic_weights 落盘
+#     data/credibility_state.json，rebalance 1.047 / stop 0.866），是「越亏越降级」
+#     的在线惩罚，回测无；关掉后 _ic_weights 保持空 = fuse_signals 用默认等权 = 回测等价。
+# 关闭它们 = 把生产对齐回测，且当前行为不变（VaR 休眠、credibility 关掉即失效），零风险。
+var_monitor_enabled: false            # 组合 VaR → 新开仓降权（已关闭，对齐回测）
+credibility_enabled: false            # 策略信誉 → 信号融合调权（已关闭，对齐回测）
+
 # ---- 持仓约束 ----
 max_positions: 20                   # 最大持仓只数
 max_single_position_pct: 0.30       # 单票最大仓位(占总资产比例)
@@ -120,7 +132,8 @@ max_daily_turnover_pct: 0.95
 
 # ---- 组合尾部风险（相关性 VaR）----
 # 名义分散 ≠ 风险分散：20 只同涨同跌的票，风险约等于 1 只加杠杆。
-var_monitor_enabled: true
+# var_monitor_enabled 的开关已上移到「运行期强度缩放（已对齐回测，默认关闭）」段
+# （2026-10-31 关掉：回测无此机制，且 VaR 超预算→砍新开仓是顺周期砍仓）。
 max_portfolio_var_pct: 0.025         # 组合 1 日 95% VaR 上限（占总资产 2.5%）
 var_confidence_z: 1.65               # 95% 单尾
 var_scale_floor: 0.40                # 超预算时最低缩到 40%（连续降仓，不清仓）

@@ -133,6 +133,7 @@ def sup(tmp_path):
         journal_file=str(tmp_path / "j.jsonl"),
         regime_weighting_enabled=True,
         vol_control_enabled=True,   # 功能测试隔离：显式开，避免默认值改动牵连
+        credibility_enabled=True,  # 功能测试隔离：同上
         auto_resume_risk_fraction=0.5,
         auto_resume_throttle_sec=1800,
     )
@@ -386,3 +387,22 @@ def test_regime_and_vol_control_explicitly_off_in_production_yaml():
     cfg = yaml.safe_load(open("config/trading_guard.yaml", encoding="utf-8"))
     assert cfg.get("regime_weighting_enabled") is False
     assert cfg.get("vol_control_enabled") is False
+
+
+def test_var_monitor_and_credibility_default_off():
+    """回归护栏：组合 VaR 缩放 / 策略信誉在线调权默认关闭。
+    二者回测引擎完全没有对应物（回测基准 +26.8%/1.19 即「全关」状态），且都是
+    「越跌越轻」类机制：VaR 超预算→砍新开仓；credibility 历史亏损→降权。
+    开着就是「实盘≠回测」漂移。10-31 实测 VaR 日志计数 0（休眠炸弹）、
+    credibility state 非空（正在调权）；关掉对齐回测且零回退风险。"""
+    g = GuardConfig()
+    assert g.var_monitor_enabled is False, "默认必须关：VaR 缩放是顺周期砍仓"
+    assert g.credibility_enabled is False, "默认必须关：credibility 是越亏越降级惩罚"
+
+
+def test_var_monitor_and_credibility_explicitly_off_in_production_yaml():
+    """生产权威配置必须显式写出 false（同 regime/vol_control 套路）。"""
+    import yaml
+    cfg = yaml.safe_load(open("config/trading_guard.yaml", encoding="utf-8"))
+    assert cfg.get("var_monitor_enabled") is False
+    assert cfg.get("credibility_enabled") is False

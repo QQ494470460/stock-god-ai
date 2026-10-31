@@ -211,7 +211,7 @@ class GuardConfig:
     # 「单票 X%、最多 N 只」只约束名义敞口，不约束相关性：20 只同涨同跌的票
     # 名义分散、风险等价于 1 只加杠杆。这里按协方差算组合 1 日 VaR，
     # 超预算就**连续降新开仓强度**（不清仓），把尾部风险摁在预算内。
-    var_monitor_enabled: bool = True
+    var_monitor_enabled: bool = False       # 对齐回测：回测无此机制，且为顺周期砍仓
     max_portfolio_var_pct: float = 0.025     # 组合 1 日 95% VaR 上限（占总资产）
     var_confidence_z: float = 1.65           # 95% 单尾
     var_scale_floor: float = 0.40            # 超预算时最低缩放到 40%（不清仓）
@@ -244,7 +244,7 @@ class GuardConfig:
     # 用每笔已平仓交易的「信号方向 vs 实际盈亏」一致性（类 IC 的 EWMA 代理）
     # 为每个策略标签维护信誉，映射成 ic_weights 喂给多策略集成器（Feature #7），
     # 让集成权重随真实战绩自我调优。默认开启；未知标签按中性 1.0 兜底。
-    credibility_enabled: bool = True
+    credibility_enabled: bool = False      # 对齐回测：回测无此机制，越亏越降级惩罚
     credibility_halflife: int = 20         # EWMA 半衰期（笔）
 
     # ---- 波动自适应熔断线（Volatility-scaled kill-switch，Batch 3）----

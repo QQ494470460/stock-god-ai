@@ -140,6 +140,7 @@ def _guard(tmp_path, monitor):
     cfg = GuardConfig(
         state_file=str(tmp_path / "s.json"),
         journal_file=str(tmp_path / "j.jsonl"),
+        var_monitor_enabled=True,   # 风险模型单测隔离：显式开，避免默认值改动牵连
     )
     g = RiskSupervisor.__new__(RiskSupervisor)  # 只测纯逻辑，免构造券商/安全层
     g.config = cfg

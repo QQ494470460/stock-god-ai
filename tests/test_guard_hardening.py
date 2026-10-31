@@ -173,7 +173,7 @@ def test_single_position_var_is_enforced(tmp_path):
     """满仓单票 VaR 超预算 → 新开仓强度被压（旧实现直接跳过检查）。"""
     mon = _Monitor(single=0.06)          # 6% > 2.5% 预算
     g = _guard(tmp_path, monitor=mon, max_portfolio_var_pct=0.025,
-               var_scale_floor=0.4)
+               var_scale_floor=0.4, var_monitor_enabled=True)
     scale, detail = g._portfolio_var_scale(
         _account(), {"600000": _pos(90_000)})     # 90% 仓位
     assert detail["n"] == 1
@@ -184,7 +184,8 @@ def test_single_position_var_is_enforced(tmp_path):
 
 def test_single_position_var_within_budget_is_neutral(tmp_path):
     mon = _Monitor(single=0.01)
-    g = _guard(tmp_path, monitor=mon, max_portfolio_var_pct=0.025)
+    g = _guard(tmp_path, monitor=mon, max_portfolio_var_pct=0.025,
+               var_monitor_enabled=True)
     scale, detail = g._portfolio_var_scale(_account(), {"600000": _pos(50_000)})
     assert scale == 1.0
     assert detail["var_pct"] == pytest.approx(0.01)
