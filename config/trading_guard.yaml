@@ -44,6 +44,21 @@ auto_resume_throttle_days: 2.0         # 解冻后按「交易日」计的半仓
 auto_resume_throttle_sec: 1800         # 冷静期秒级兜底（throttle_days<=0 或日历不可用时）
 auto_resume_risk_fraction: 0.5         # 冷静期内下单强度折扣（半仓）
 
+# ---- 运行期强度缩放（已对齐回测，默认关闭）----
+# regime 加权 / Vol-Control 在回测引擎里**完全没有对应物**（回测基准 +26.8%/1.19
+# 就是「这些机制全关」的状态）。二者都是「越跌越轻」的前瞻砍仓：
+#   · regime 判熊市 → rebalance ×0.80、loop ×0.85（REGIME_STRATEGY_WEIGHTS）
+#   · Vol-Control 波动飙升 → 新开仓压到 0.3
+# 10-31 实测日志里二者从未偏离 1.0（市场震荡，权重=1.0），属「休眠炸弹」——
+# 一旦 detect_regime 判熊，调仓强度立刻 ×0.8，又是顺周期砍仓。
+# 关闭它们 = 把生产对齐回测，且当前行为不变（factor 全 1.0），零风险。
+# 冷静期 0.5 折（上面 auto_resume_risk_fraction）保留：它是熔断自愈缓冲、
+# 只 2 个交易日、且已测试钉住，不是前瞻砍仓。
+# ⚠️ 这两个开关**不属于「决定收益分布」的参数**（指纹不含它们），
+#    改它们不会触发熔断基线重置。
+regime_weighting_enabled: false       # 市场状态 → 下单强度加权（已关闭，对齐回测）
+vol_control_enabled: false            # 波动率尾部 → 新开仓降权（已关闭，对齐回测）
+
 # ---- 持仓约束 ----
 max_positions: 20                   # 最大持仓只数
 max_single_position_pct: 0.30       # 单票最大仓位(占总资产比例)

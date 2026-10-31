@@ -132,6 +132,7 @@ def sup(tmp_path):
         state_file=str(tmp_path / "s.json"),
         journal_file=str(tmp_path / "j.jsonl"),
         regime_weighting_enabled=True,
+        vol_control_enabled=True,   # 功能测试隔离：显式开，避免默认值改动牵连
         auto_resume_risk_fraction=0.5,
         auto_resume_throttle_sec=1800,
     )
@@ -359,3 +360,29 @@ def test_sync_credibility_persists_when_not_under_pytest(sup, tmp_path, monkeypa
     assert target.exists()
     data = json.loads(target.read_text(encoding="utf-8"))
     assert data["scores"]["rebalance"]["n"] == 1
+
+
+# ----------------------------------------------------------------------
+# 运行期强度缩放默认关闭（对齐回测，防「实盘≠回测」顺周期砍仓悄悄回潮）
+# ----------------------------------------------------------------------
+def test_regime_and_vol_control_default_off():
+    """回归护栏：这两个运行期缩放默认关闭。
+
+    回测引擎完全没有对应物（回测基准 +26.8%/1.19 就是「它们全关」的状态），
+    且都是「越跌越轻」的前瞻砍仓：regime 判熊 → rebalance×0.80、loop×0.85；
+    Vol-Control 波动飙升 → 新开仓压到 0.3。开着就是「实盘≠回测」的漂移。
+    10-31 实测日志里二者从未偏离 1.0（市场震荡，权重=1.0），属休眠炸弹；
+    关闭它们对齐回测且当前行为不变（factor 全 1.0），零风险。
+    """
+    g = GuardConfig()  # 兜底默认（yaml 缺失时生效）
+    assert g.regime_weighting_enabled is False, "默认必须关：regime 加权是顺周期砍仓"
+    assert g.vol_control_enabled is False, "默认必须关：Vol-Control 是顺周期砍仓"
+
+
+def test_regime_and_vol_control_explicitly_off_in_production_yaml():
+    """生产权威配置也必须**显式**写出 false，不能只靠默认值——否则改默认值
+    会让生产悄然翻回开启，且没有一行测试能发现。"""
+    import yaml
+    cfg = yaml.safe_load(open("config/trading_guard.yaml", encoding="utf-8"))
+    assert cfg.get("regime_weighting_enabled") is False
+    assert cfg.get("vol_control_enabled") is False

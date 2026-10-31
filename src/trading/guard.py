@@ -224,13 +224,13 @@ class GuardConfig:
 
     # ---- 市场状态感知 + 策略动态加权（Feature #4）----
     # 默认开启；未接入指数数据前 regime=sideways → 所有权重≈1.0，零行为变化。
-    regime_weighting_enabled: bool = True
+    regime_weighting_enabled: bool = False   # 对齐回测：回测无此机制，且为顺周期砍仓
 
     # ---- 波动率尾部风险自适应降仓（Vol-Control，Feature #6）----
     # 监控组合净值已实现波动率，单边上行不限制、只在「波动率异常飙涨」时自动
     # 压低**新开仓**强度（不碰止损/风控离场），相当于给系统装一个「恐慌阻尼器」。
     # 默认开启；纯加法、fail-safe：数据不足/计算异常时退化为不干预（系数=1.0）。
-    vol_control_enabled: bool = True
+    vol_control_enabled: bool = False        # 对齐回测：回测无此机制，且为顺周期砍仓
     vol_control_window: int = 20          # 滚动计算已实现波动的样本窗口(交易日)
     vol_control_spike_multiple: float = 2.5  # 当前波动 ≥ 基线 × 该倍数 → 触发降仓
     vol_control_min_strength: float = 0.3    # 触发后新开仓强度下限（不完全停手，留流动性）
