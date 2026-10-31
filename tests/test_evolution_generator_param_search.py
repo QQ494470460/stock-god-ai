@@ -101,14 +101,24 @@ def test_diagnose_positions_underfilled():
 
 
 def test_diagnose_drawdown_near_halt():
-    # 熔断线 8%，回撤达 80% 即 6.4%
-    snap = _snap(metrics={"insufficient": False, "max_drawdown": -0.07})
+    """回撤达到熔断线的 70% → 应报「逼近熔断」。
+
+    阈值从配置推导，**不硬编码 8%**：熔断线 2026-10-31 依据执行级回测从
+    8% 提到 20%（8% 会触发 17% 的交易日），硬编码会让这条诊断静默失效。
+    """
+    limit = ps._halt_drawdown_limit()
+    assert limit, "读不到熔断线配置，本用例无法成立"
+    dd = -(float(limit) * (ps.DRAWDOWN_NEAR_HALT + 0.10))   # 略高于 70% 线
+    snap = _snap(metrics={"insufficient": False, "max_drawdown": dd})
     symptoms = {s["symptom"] for s in ps.diagnose(snap)}
     assert "drawdown_near_halt" in symptoms
 
 
 def test_diagnose_ignores_small_drawdown():
-    snap = _snap(metrics={"insufficient": False, "max_drawdown": -0.01})
+    limit = ps._halt_drawdown_limit()
+    assert limit, "读不到熔断线配置，本用例无法成立"
+    dd = -(float(limit) * (ps.DRAWDOWN_NEAR_HALT * 0.5))    # 明显低于 70% 线
+    snap = _snap(metrics={"insufficient": False, "max_drawdown": dd})
     symptoms = {s["symptom"] for s in ps.diagnose(snap)}
     assert "drawdown_near_halt" not in symptoms
 

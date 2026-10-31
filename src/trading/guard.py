@@ -134,7 +134,11 @@ class GuardConfig:
     require_live_confirmation: bool = True  # 进入 LIVE 必须两步确认令牌
 
     # ---- 组合级风控（熔断）----
-    max_portfolio_drawdown_pct: float = 8.0   # 峰谷最大回撤熔断线(%)
+    # 8 → 20（2026-10-31）。8% 在执行级回测里会触发 17% 的交易日 ——
+    # 它就在策略正常噪声带里；而熔断**不清仓**，对最大回撤几乎无改善
+    # （-25.03% vs -25.01%），却把年化从 +26.8% 压到 +24.5%（30bp 下压到 +7.4%，
+    # 因为冻结调仓等于把亏损组合锁死）。20% 在三档成本下与「不熔断」逐项相同。
+    max_portfolio_drawdown_pct: float = 20.0  # 峰谷最大回撤熔断线(%)
     max_daily_loss_pct: float = 3.0           # 单日最大亏损比例(%)
     max_daily_loss_abs: float = 5000.0        # 单日最大亏损金额(元)；0=不设固定金额线
     # 金额线也可按「当前权益 × 百分比」推导，账户规模变化时自动缩放。
@@ -1277,10 +1281,19 @@ class RiskSupervisor:
         if self.regime.enabled:
             s *= self.regime.weight(strategy_tag, 1.0)
         if self._heal_throttle_until and time.time() < self._heal_throttle_until:
-            s *= float(self.config.auto_resume_risk_fraction)
-        # Vol-Control：只压新开仓，不碰离场
+            s *= float(self.config.auto_resume_risk_fraction)        # Vol-Control：只压新开仓，不碰离场
         if not is_exit and self.config.vol_control_enabled and self._vol_control_factor < 1.0:
             s *= self._vol_control_factor
+        # 可观测性：这三个乘数过去**一条日志都不打**，只在仓位变小之后才被间接发现
+        # （10-27 实盘把仓位乘到 0.31，排查时只能靠 _portfolio_risk_scale 那一条日志
+        # 猜出还有别的乘数）。任何让下单量偏离 raw 的乘数都必须留下痕迹。
+        if abs(s - float(raw)) > 1e-6:
+            logger.info(
+                f"⚖️ 下单强度 {float(raw):.2f} → {s:.2f}"
+                f"（regime={self.regime.weight(strategy_tag, 1.0) if self.regime.enabled else 1.0:.2f}"
+                f" 冷静期={'开' if (self._heal_throttle_until and time.time() < self._heal_throttle_until) else '关'}"
+                f" VolCtrl={getattr(self, '_vol_control_factor', 1.0):.2f}"
+                f"｜{strategy_tag}{'·离场' if is_exit else ''}）")
         return max(0.0, min(2.0, s))
 
     def _update_vol_control(self, equity: float) -> None:

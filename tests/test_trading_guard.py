@@ -562,11 +562,19 @@ def test_no_auto_rebaseline_when_prev_account_unknown(tmp_path):
 
 
 def test_normal_drawdown_still_halts(tmp_path):
-    """回归保护：真实回撤（同账号）必须仍然熔断，不能被修复改坏。"""
+    """回归保护：真实回撤（同账号）必须仍然熔断，不能被修复改坏。
+
+    ⚠️ 阈值从配置读，**不要硬编码 8%**：2026-10-31 依据执行级回测把
+    ``max_portfolio_drawdown_pct`` 从 8 提到 20（8% 会触发 17% 的交易日，
+    就在策略正常噪声带里）。硬编码会让这条「熔断还能不能熔断」的保护
+    在阈值调整后**静默失效**——最危险的那种失效。
+    """
     sup, paper, _ = _sup_with_peak(tmp_path, peak=100_000.0)
-    paper.cash = 90_000.0          # 同账号，权益跌到 9 万 → 回撤 10% ≥ 8% 熔断线
+    thr = float(sup.config.max_portfolio_drawdown_pct)
+    dd = thr + 2.0
+    paper.cash = 100_000.0 * (1.0 - dd / 100.0)
     alerts = sup.tick_monitor()
-    assert sup.safety.halted is True
+    assert sup.safety.halted is True, f"回撤 {dd:.1f}% 已超熔断线 {thr}%，必须熔断"
     assert any("回撤" in a for a in alerts)
 
 
@@ -578,19 +586,29 @@ def test_normal_drawdown_still_halts(tmp_path):
 # （差 ¥2,754 未达线）。用户体感就是「怎么老是这样」。
 
 def test_heal_blocked_inside_hysteresis_band(tmp_path):
-    """回撤 7%（低于 8% 熔断线，但没进 6% 滞后带）→ 不得解冻。"""
+    """回撤略低于熔断线、但没进滞后带 → 不得解冻（阈值从配置读，不硬编码）。"""
+    sup0, _p, _ = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    thr = float(sup0.config.max_portfolio_drawdown_pct)
+    margin = float(sup0.config.auto_resume_drawdown_margin_pct)
+    dd = thr - margin / 2.0          # 落在 (thr-margin, thr) 之间
+    eq = 1_000_000.0 * (1.0 - dd / 100.0)
     sup, _paper, _ = _sup_with_peak(
-        tmp_path, peak=1_000_000.0, today_start=930_000.0, equity=930_000.0)
-    assert sup.safety.current_drawdown_pct(930_000.0) == pytest.approx(7.0, abs=1e-6)
-    assert sup._heal_condition_cleared(930_000.0) is False, (
+        tmp_path, peak=1_000_000.0, today_start=eq, equity=eq)
+    assert sup.safety.current_drawdown_pct(eq) == pytest.approx(dd, abs=1e-6)
+    assert sup._heal_condition_cleared(eq) is False, (
         "回撤仍在滞后带内就解冻，等于把「横跳」原封不动地保留下来")
 
 
 def test_heal_allowed_below_hysteresis_band(tmp_path):
-    """回撤 5%（< 6% 滞后带）→ 允许解冻。"""
+    """回撤明显低于滞后带下沿 → 允许解冻。"""
+    sup0, _p, _ = _sup_with_peak(tmp_path, peak=1_000_000.0)
+    thr = float(sup0.config.max_portfolio_drawdown_pct)
+    margin = float(sup0.config.auto_resume_drawdown_margin_pct)
+    dd = max(thr - margin - 1.0, 1.0)
+    eq = 1_000_000.0 * (1.0 - dd / 100.0)
     sup, _paper, _ = _sup_with_peak(
-        tmp_path, peak=1_000_000.0, today_start=950_000.0, equity=950_000.0)
-    assert sup._heal_condition_cleared(950_000.0) is True
+        tmp_path, peak=1_000_000.0, today_start=eq, equity=eq)
+    assert sup._heal_condition_cleared(eq) is True
 
 
 def test_hysteresis_band_can_be_disabled(tmp_path):

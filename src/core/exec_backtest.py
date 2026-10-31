@@ -105,6 +105,23 @@ class ExecConfig:
     vol_scale_floor: float = 0.30      # 最低仓位系数（绝不清仓）
     vol_window: int = 20               # 已实现波动的回看交易日
 
+    # ---- 回撤闸门（与实盘 GuardState 对齐，2026-10-31 新增）----
+    # 实盘有两层「越跌越轻」的机制，回测里一个都没有 —— 这是「实盘跑不过回测」
+    # 的第六处口径漂移，而且是最伤的一处。加这两个开关就是为了**量化它**。
+    #
+    # ① dd_scale_floor：渐进降仓。实盘 ``sizing.portfolio_risk_scale`` 把回撤
+    #    线性映射到 [floor, 1.0]，实盘参数 floor=0.30 / 熔断线 8%。于是
+    #    回撤 2% 就砍 18% 仓位、4% 砍 35%、8% 砍到 30%。这是纯缩放的顺周期开关。
+    #    实测证据：10-27 回撤 7.90% 时日志写着「敞口系数 0.31」。
+    # ② halt_dd_pct：回撤熔断。实盘到 8% 就冻结整轮调仓（不建仓也不清仓），
+    #    解冻还要等回撤回到 halt - margin 以下。**回测里策略的最大回撤是
+    #    -20.5%** ⇒ 8% 熔断必然在正常历史里反复触发，等于换了个策略。
+    #
+    # 0 = 关闭。要复现实盘现状就设 dd_scale_floor=0.30 + halt_dd_pct=8.0。
+    dd_scale_floor: float = 0.0        # 最深回撤时保留的敞口（0=关闭，实盘=0.30）
+    dd_scale_at_pct: float = 8.0       # 回撤到该值降到 floor（实盘=熔断线 8%）
+    halt_dd_pct: float = 0.0           # >0 时回撤≥该值冻结整轮调仓（0=关闭，实盘=8.0）
+
     # ---- 撮合 ----
     buy_at: str = "next_open"         # next_open | close
     ppy: int = 252
@@ -316,6 +333,8 @@ def run_exec_backtest(
     equity_curve = np.full(n_days, np.nan)
     turnover_amt = 0.0
     fees_paid = 0.0
+    run_peak = float(capital)      # 峰谷回撤基准（收盘口径）
+    n_halt_days = 0                # 被熔断冻结的天数（诊断「换了个策略」用）
 
     def _fee(amount: float, is_sell: bool) -> float:
         f = max(cfg.min_commission, amount * cfg.commission)
@@ -452,8 +471,15 @@ def run_exec_backtest(
         # ---------- 3) 收盘重估 + 调仓信号 ----------
         eq = _equity(i)
         equity_curve[i] = eq
+        # 峰谷回撤（收盘口径）。实盘峰值按 tick 采样，通常比收盘价更高 ⇒
+        # 实盘回撤只会比这里更深、熔断更早 ⇒ 下面的结论是**下界**。
+        run_peak = max(run_peak, eq)
+        dd = (1.0 - eq / run_peak) * 100.0 if run_peak > 0 else 0.0
+        _halted = bool(cfg.halt_dd_pct > 0 and dd >= cfg.halt_dd_pct)
+        if _halted:
+            n_halt_days += 1
 
-        if i % cfg.rebalance_days == 0 and i + 1 < n_days:
+        if i % cfg.rebalance_days == 0 and i + 1 < n_days and not _halted:
             srow = Sa[i]
             ok = np.isfinite(srow)
             if ok.sum() >= cfg.top_n:
@@ -504,6 +530,13 @@ def run_exec_backtest(
                             invest *= scale
                 if not picks:
                     continue
+                # 渐进降仓（实盘 _portfolio_risk_scale 的等价物）：回撤越深，新仓越小。
+                # 注意它缩放的是**整个组合的敞口**，不是「这一笔」—— 与实盘一致。
+                if cfg.dd_scale_floor > 0:
+                    _span = max(float(cfg.dd_scale_at_pct), 1e-9)
+                    _prog = min(max(dd, 0.0) / _span, 1.0)
+                    invest *= max(float(cfg.dd_scale_floor),
+                                  1.0 - (1.0 - float(cfg.dd_scale_floor)) * _prog)
                 # 权重
                 if cfg.weighting == "risk_parity":
                     iv = []
@@ -594,4 +627,5 @@ def run_exec_backtest(
     years = max(n_days / cfg.ppy, 1e-9)
     m["turnover_per_year"] = float(turnover_amt / capital / years)
     m["fee_pct"] = float(fees_paid / capital)
+    m["halt_days_pct"] = float(n_halt_days / max(n_days, 1))
     return ExecResult(metrics=m, equity=eq_series, trades=tr, exit_stats=exit_stats)

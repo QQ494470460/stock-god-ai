@@ -80,6 +80,23 @@ SCENARIOS: dict[str, dict] = {
                            vol_target_pct=20.0),
     "c15_vol25":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
                            vol_target_pct=25.0),
+    # ---- 回撤闸门（第六处口径漂移：实盘两层「越跌越轻」，回测一个都没有）----
+    # 基准 c15 = 不止损 + 15 日周期 + 排名滞后 3.0（唯一三档成本都站得住的格子）。
+    # dd_live 复现实盘现状：渐进降仓 floor 0.30 + 8% 熔断冻结整轮调仓。
+    "dd_live":        dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           dd_scale_floor=0.30, dd_scale_at_pct=8.0, halt_dd_pct=8.0),
+    "dd_scale":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           dd_scale_floor=0.30, dd_scale_at_pct=8.0),
+    "dd_scale50":     dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           dd_scale_floor=0.50, dd_scale_at_pct=8.0),
+    "dd_halt8":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=8.0),
+    "dd_halt12":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=12.0),
+    "dd_halt15":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=15.0),
+    "dd_halt20":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=20.0),
 }
 
 

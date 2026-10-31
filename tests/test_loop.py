@@ -622,6 +622,35 @@ def test_daily_turnover_budget_allows_building_the_whole_plan():
     assert float(GuardConfig().max_daily_turnover_pct) >= need
 
 
+def test_risk_scaling_is_off_so_drawdown_does_not_shrink_new_positions():
+    """组合回撤**不得**再压新仓规模 —— 这是被回测判死的顺周期开关。
+
+    第六处「实盘 ≠ 回测」缺口，也是杀伤力最大的一处。
+    执行级回测（1140 天 × 200 只，10bp，15 日 + slack3）：
+
+        无闸门         年化 +26.8%  夏普 1.19  回撤 -25.0%  换手 10.6x
+        渐进降仓 floor.3 年化 +14.7%  夏普 0.99  回撤 -15.0%  换手  4.5x
+        ＋8% 熔断       年化  +6.5%  夏普 0.42  回撤 -16.3%  换手  1.8x  ← 实盘现状
+
+    「越跌越轻」吃掉 3/4 的收益，只换来 8.7pp 回撤改善；而实盘只在 8% 熔断线
+    以下工作，回测最大回撤却是 -25% ⇒ 正常历史里必然反复触发，等于换了策略。
+    实测证据：10-27 回撤 7.90% 时日志写着「敞口系数 0.31」。
+    """
+    from config.settings import AppConfig
+
+    assert LoopConfig().enable_risk_scaling is False
+    assert AppConfig().trading_loop.enable_risk_scaling is False
+
+    # 行为层：回撤很深时敞口系数仍必须是 1.0（否则又回到「越跌越轻」）
+    paper = FakePaper(total=800_000.0)
+    b = FakeBroker(total=800_000.0, cash=800_000.0)
+    loop = mk_loop(broker=b, paper=paper,
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True))
+    loop.guard.safety._state.peak_equity = 1_000_000.0   # 回撤 20%，远超 8% 熔断线
+    acct = b.query_account()
+    assert loop._portfolio_risk_scale(acct) == 1.0
+
+
 def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, monkeypatch):
     """结算报告 stats 必须反映「一整天」的拦截/意图，而非结算那一刻的 0。
 
