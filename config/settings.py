@@ -334,7 +334,12 @@ class TradingLoopConfig:
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一，
     # 调高前须经 walk-forward 验证，否则退回「卖赢家、留输家」。
     hold_if_profitable_pct: float = 0.0
-    max_orders_per_tick: int = 10        # 单周期最大下单数
+    # 单 tick 最多下多少单（防雪崩闸门）。10 → 30（2026-10-31）。
+    # ⚠️ 必须 ≥ 2×max_positions：一次完整调仓 = 卖 ≤N + 买 ≤N = 2N 笔，
+    # N=8 时最多 16 笔。原来是 10，满仓换手时排在后面的买单被静默截掉，
+    # 而调仓周期标记已经写死 ⇒ 没建完的票要等 15 个交易日，账户长期半仓。
+    # 30 = 2×8 + 14 只余量，仍保留「防雪崩」意图（不是无限下单）。
+    max_orders_per_tick: int = 30
     settle_hour: int = 15                # 收盘结算时刻（时）
     settle_minute: int = 5               # 收盘结算时刻（分）
     notify: bool = True                  # 事件/日报推送

@@ -518,6 +518,110 @@ def test_rebalance_period_gate_skips_and_persists(force_trading_time, tmp_path, 
     assert loop2._rebalance_due() is False
 
 
+# ======================================================================
+# 防雪崩闸门 vs 周期记账（顺序陷阱）
+# ======================================================================
+
+def _four_target_plan():
+    """4 只等权 20% 的目标组合：满仓换手需要「卖 4 + 买 4」共 8 笔。"""
+    return mk_plan([(c, 90 - i, 0.20) for i, c in enumerate(
+        ["600519", "600000", "000858", "601318"])])
+
+
+def test_truncated_rebalance_does_not_mark_period_done(force_trading_time, tmp_path):
+    """闸门截断委托时**绝不能**写周期标记 —— 否则剩下的票要等一整个周期。
+
+    回归背景（2026-10-31 实测）：闸门原值 10，而一次完整调仓是「卖 ≤8 + 买 ≤8」
+    共 16 笔。截断发生在**排序之后**，被截掉的恰好是排在后面的**全部买单**；
+    而 ``_last_rebalance_date`` 在循环之前就写死了 ⇒ 「8 只只建了 2 只，剩下
+    6 只等 15 个交易日」。账户因此长期半仓、九成现金闲置，收益自然上不去 ——
+    这类 bug 不会报错、不会告警，只会安静地让仓位变轻。
+    """
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    cfg = LoopConfig(auto_build_plan=False, dry_run=False, rebalance_days=15,
+                     max_orders_per_tick=2,
+                     heartbeat_file=str(tmp_path / "hb.json"))
+    loop = mk_loop(broker=b, paper=paper, cfg=cfg)
+    loop.plan = _four_target_plan()
+
+    rep = loop.tick()
+
+    assert rep.n_intents > 2, f"本用例需要构造出被截断的场景，实际 {rep.n_intents} 笔"
+    assert loop._last_rebalance_date == "", "被截断就不算调完，不得写周期标记"
+    assert loop._rebalance_due() is True, "下个 tick 必须能接着做剩下的委托"
+
+    # 第二道保险的语义：截断只影响「有没有调完」，不影响已下单部分的成交
+    assert rep.n_executed == 2, f"应只执行前 2 笔，实际 {rep.n_executed}"
+
+
+def test_untruncated_rebalance_marks_period_done(force_trading_time, tmp_path):
+    """未截断（正常情况）仍要写周期标记 —— 空转也必须记账。
+
+    与上一条互为对照：修 bug 时最容易的错法是「干脆不写周期标记」，
+    那会把 15 天周期悄悄变成逐 tick 调仓，换手与成本直接翻倍。
+    """
+    paper = FakePaper(total=1_000_000.0)
+    b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
+    cfg = LoopConfig(auto_build_plan=False, dry_run=False, rebalance_days=15,
+                     max_orders_per_tick=30,
+                     heartbeat_file=str(tmp_path / "hb.json"))
+    loop = mk_loop(broker=b, paper=paper, cfg=cfg)
+    loop.plan = _four_target_plan()
+
+    rep = loop.tick()
+
+    assert rep.n_intents <= 30
+    assert loop._last_rebalance_date, "未截断时必须记下本次调仓日"
+    assert loop._rebalance_due() is False, "周期内不得再次调仓"
+    assert rep.n_executed == rep.n_intents, "未截断时不该有委托被闸门吞掉"
+
+
+def test_default_order_gate_covers_a_full_rebalance():
+    """默认闸门必须 ≥ 2×max_positions，且**两处默认值**都要满足。
+
+    这是算术不变量，不是口味问题：一次完整调仓 = 卖 ≤N + 买 ≤N = 2N 笔。
+    生产权威值是 ``config.settings.AppConfig().trading_loop``（``LoopConfig``
+    只是 app_config 缺失时的兜底），所以两处一起断言 —— 只改一处等于白改。
+    """
+    from config.settings import AppConfig
+
+    cfg = LoopConfig()
+    assert cfg.max_orders_per_tick >= 2 * cfg.max_positions, (
+        f"LoopConfig 闸门 {cfg.max_orders_per_tick} < 2×{cfg.max_positions}")
+
+    tl = AppConfig().trading_loop
+    assert tl.max_orders_per_tick >= 2 * tl.max_positions, (
+        f"TradingLoopConfig 闸门 {tl.max_orders_per_tick} < 2×{tl.max_positions}")
+
+
+def test_daily_turnover_budget_allows_building_the_whole_plan():
+    """当日换手预算必须够「从现金一天建满目标组合」—— 否则建仓要花两个多月。
+
+    第五处「实盘 ≠ 回测」缺口（2026-10-31 由一条断言意外暴露）。
+    回测是 T+1 一次性把仓位建满，**没有**当日买入上限；实盘却把当日买入压在
+    总资产 30%。于是「8 只 / 保留 10% 现金」需要 90% 敞口的一天建不完，
+    只能建 1/3，而调仓周期是 15 个交易日 ⇒ 满仓要 45 个交易日。
+    实测证据：``data/turnover_state.json`` 记录 2026-10-27 当日买入 ¥1,382,444，
+    当时权益约 ¥4.55M，正好是 30.4% —— 卡死在上限上。
+
+    「抑制来回翻仓」的职责已由 ``rebalance_days`` + ``band_pct`` 承担；
+    本条只需保证「一天最多建满一次」这个物理上限不误伤正常建仓。
+    """
+    from config.settings import AppConfig
+    from src.trading.guard import GuardConfig
+
+    tl = AppConfig().trading_loop
+    need = 1.0 - float(tl.cash_reserve_pct)
+
+    # 生产权威来源是 YAML（scripts/run_loop.py 显式加载），先验它
+    yaml_cfg = GuardConfig.from_yaml(str(ROOT / "config" / "trading_guard.yaml"))
+    assert float(yaml_cfg.max_daily_turnover_pct) >= need, (
+        f"生产 YAML 换手预算 {yaml_cfg.max_daily_turnover_pct:.0%} < 建满所需 {need:.0%}")
+    # 再验兜底默认值（YAML 缺失时生效，两处不一致 = 改哪份生效全看运气）
+    assert float(GuardConfig().max_daily_turnover_pct) >= need
+
+
 def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, monkeypatch):
     """结算报告 stats 必须反映「一整天」的拦截/意图，而非结算那一刻的 0。
 

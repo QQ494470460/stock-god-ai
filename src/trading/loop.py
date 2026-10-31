@@ -153,7 +153,11 @@ class LoopConfig:
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一。
     # 调高前须经 walk-forward 验证，否则退回「卖赢家、留输家」。
     hold_if_profitable_pct: float = 0.0
-    max_orders_per_tick: int = 10        # 单 tick 最多下多少单（防雪崩）
+    # 单 tick 最多下多少单（防雪崩闸门）。
+    # ⚠️ 必须 ≥ 2×max_positions：一次完整调仓是「卖 ≤N + 买 ≤N」共 2N 笔，
+    # N=8 时最多 16 笔。原来 10 会在满仓换手时把排在后面的买单截掉，
+    # 而周期标记已写死 ⇒ 剩下的票要等一整个周期（15 个交易日），账户长期半仓。
+    max_orders_per_tick: int = 30
     settle_hour: int = 15                # 收盘结算时刻
     settle_minute: int = 5
     notify: bool = True                  # 是否推送事件/日报
@@ -876,16 +880,32 @@ class TradingLoop:
                 getattr(self.config, "hold_rank_slack", 1.0) or 1.0),
         )
         report.n_intents = len(intents)
-        # 无论本次有没有产生委托，都记「已发起」：调仓是**按周期**驱动的，
-        # 不是「想调就调」。若只在有成交时才记账，一个因带内/资金不足而空转的
-        # 调仓日会每 tick 重算一次，直到某天碰巧成交 —— 等于把周期悄悄改回逐 tick。
-        self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
-        self._save_runtime()
+        # ⚠️ 「防雪崩闸门」与「周期记账」的先后顺序很容易搞错，这里钉死：
+        # 一次完整调仓需要「卖 ≤N + 买 ≤N」共 2N 笔（N = max_positions）。
+        # N=8 时最多 16 笔，若闸门 < 16，排在后面（**全是买单**）的委托会被
+        # 静默丢弃；而周期标记若已经写死，就变成「8 只只建了 2 只，剩下 6 只
+        # 等 15 个交易日」—— 账户长期半仓、大量现金闲置，收益自然上不去。
+        # 两道保险：① 闸门默认值已提到 30（≥ 2×8 + 余量）；
+        #           ② 万一仍被截断，**不写周期标记**，下个 tick 接着做。
+        _limit = int(getattr(self.config, "max_orders_per_tick", 0) or 0)
+        _truncated = bool(_limit > 0 and len(intents) > _limit)
+        if not _truncated:
+            # 空转（带内/资金不足）也要记账：调仓是按**周期**驱动的，不是
+            # 「想调就调」。只在有成交时记账，会让空转的调仓日每 tick 重算，
+            # 直到某天碰巧成交 —— 等于把周期悄悄改回逐 tick。
+            self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
+            self._save_runtime()
+        else:
+            logger.warning(
+                f"⚠️ 本轮调仓委托 {len(intents)} 笔超过单 tick 上限 {_limit} 笔，"
+                f"只执行前 {_limit} 笔；**不记周期标记**，下个 tick 继续"
+                f"（记了的话剩下的委托要等 "
+                f"{getattr(self.config, 'rebalance_days', '?')} 个交易日）")
         if not intents:
             return
 
         score_map = {t.code: t.score for t in self.plan.targets}
-        for it in intents[: self.config.max_orders_per_tick]:
+        for it in (intents[:_limit] if _limit > 0 else intents):
             ok, msg, order, detail = self._place(
                 code=it.code, name=it.name, side=it.side,
                 quantity=it.quantity, price=it.price, reason=it.reason,

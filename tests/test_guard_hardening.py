@@ -208,8 +208,11 @@ def test_turnover_survives_restart(tmp_path):
     assert f.exists()
 
     # 模拟进程重启：新实例（同一文件）
-    # 关掉风险预算这条，隔离出「换手预算」单独验证
-    g2 = _guard(tmp_path, turnover_file=f, max_risk_per_trade_pct=1.0)
+    # 关掉风险预算这条，隔离出「换手预算」单独验证。
+    # 换手比例也显式钉成 0.30：生产默认已放宽到 0.95（见 GuardConfig 里的
+    # 口径说明），这里验的是「记账能否跨重启恢复」，不该被默认值变动带跑。
+    g2 = _guard(tmp_path, turnover_file=f, max_risk_per_trade_pct=1.0,
+                max_daily_turnover_pct=0.30)
     assert g2._turnover_amount == pytest.approx(120_000.0)
 
     # 预算应被历史消耗打掉：总资产 100 万 × 30% = 30 万，已用 12 万 → 剩 18 万

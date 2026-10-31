@@ -86,7 +86,13 @@ max_risk_per_trade_pct: 0.02        # 单笔潜在亏损 ≤ 总资产 × 2%（�
 # 一句话：**individual 层不再做止损，风险预算不许再当主约束**。
 risk_budget_use_stop_ceiling: false
 risk_budget_stop_pct: 0.05          # 预算换算用的静态止损距离下限（个股止损已关，这是唯一来源）
-max_daily_turnover_pct: 0.30        # 当日买入总额 ≤ 总资产 × 30%
+# 当日买入总额 ≤ 总资产 × 该比例（仅买侧）。
+# ⚠️ 必须 ≥ 1 - cash_reserve_pct(0.10)，否则「从现金建满 8 只」一天做不完：
+#    原值 0.30 时每次调仓只能建 1/3 仓位，而周期是 15 个交易日 ⇒ 要两个多月才建满，
+#    期间长期低仓。回测是 T+1 一次性建满，没有这道闸门（口径漂移实测证据：
+#    data/turnover_state.json 记录 2026-10-27 买入 ¥1,382,444 ≈ 权益的 30.4%）。
+#    「抑制来回翻仓」已由 rebalance_days=15 + band_pct=0.15 承担。
+max_daily_turnover_pct: 0.95
 
 # ---- 组合尾部风险（相关性 VaR）----
 # 名义分散 ≠ 风险分散：20 只同涨同跌的票，风险约等于 1 只加杠杆。
