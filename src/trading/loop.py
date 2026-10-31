@@ -143,6 +143,11 @@ class LoopConfig:
     # 依据见 settings.py 里的注解：5 天周期在 50bp 成本下夏普塌到 0.41，
     # 15 天周期在三档成本下 1.19/1.06/0.95 —— 周期是成本敏感性的决定性参数。
     rebalance_days: int = 15
+    # 排名滞后系数（1.0=关闭）。持仓只要还在「前 top_n×slack 名」以内就保留。
+    # 生产权威值在 config/settings.py:TradingLoopConfig.hold_rank_slack。
+    # 依据：执行级回测 15 天周期下 slack3.0 vs 1.0 在 50bp 成本下
+    # 年化 21.1% vs 14.7%、夏普 0.95 vs 0.68（换手 9.3x vs 14.3x）。
+    hold_rank_slack: float = 3.0
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一。
@@ -867,6 +872,8 @@ class TradingLoop:
             adv_provider=self._adv_provider(),
             participation=self._participation(),
             hold_if_profitable_pct=self.config.hold_if_profitable_pct,
+            hold_rank_slack=float(
+                getattr(self.config, "hold_rank_slack", 1.0) or 1.0),
         )
         report.n_intents = len(intents)
         # 无论本次有没有产生委托，都记「已发起」：调仓是**按周期**驱动的，
@@ -1678,6 +1685,8 @@ class TradingLoop:
             adv_provider=self._adv_provider(),
             participation=self._participation(),
             hold_if_profitable_pct=self.config.hold_if_profitable_pct,
+            hold_rank_slack=float(
+                getattr(self.config, "hold_rank_slack", 1.0) or 1.0),
         ) if (self.plan and account) else []
 
         stops = []

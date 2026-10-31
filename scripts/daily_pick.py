@@ -118,9 +118,26 @@ def main() -> int:
 
     # ---- 可选：立刻刷新交易计划 ----
     if args.build_plan:
+        from config.settings import config as _app_cfg
         from src.trading.trade_plan import build_trade_plan
 
+        # ⚠️ 必须显式传生产配置。不传会落到 build_trade_plan 的函数默认值上，
+        # 而那里有两处与生产**不一致**的坑：
+        #   ① weighting 默认 "equal"，生产是 "risk_parity"（真·样本外验证过）；
+        #   ② 不传 max_positions / cash_reserve_pct 会触发 REGIME_POSITION_OVERRIDES
+        #      的「熊市 → 6 只 / 20% 现金」覆盖 —— 回测里没有这套择时，实测
+        #      2026-10-31 手动 --build-plan 就生成了 6 只 / 20% 现金 / 等权的计划，
+        #      而闭环自己重建时是 8 只 / 10% / 风险平价。两个入口产出两个不同的
+        #      组合，是「计划≠成交」最隐蔽的来源。
         kwargs = {}
+        _tl = getattr(_app_cfg, "trading_loop", None)
+        if _tl is not None:
+            kwargs["max_positions"] = int(_tl.max_positions)
+            kwargs["cash_reserve_pct"] = float(_tl.cash_reserve_pct)
+            kwargs["weighting"] = str(_tl.weighting)
+            kwargs["tilt_strength"] = float(_tl.tilt_strength)
+            kwargs["weight_cap"] = float(_tl.weight_cap)
+        # CLI 显式参数优先级最高，放在后面覆盖
         if args.weighting:
             kwargs["weighting"] = args.weighting
         if args.tilt is not None:

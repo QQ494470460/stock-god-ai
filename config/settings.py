@@ -258,7 +258,11 @@ class SchedulerConfig:
     timezone: str = "Asia/Shanghai"
     # 每日推荐产物
     report_dir: str = "data/daily_reports"
-    max_picks: int = 20
+    max_picks: int = 40
+    # 20 → 40（2026-10-31）：交易计划的「排名滞后」需要「前 top_n×slack」的
+    # 名次信息（8×3.0 = 24 名）。只取 20 只时第 21~24 名永久缺失，slack 会被
+    # 截断到 2.5 以下，回测收益吃不满。截断仍由 trading_loop.max_positions=8 负责，
+    # 这里只是把候选池加宽，不改变实际持仓只数。
     pick_pool: str = "zz500"
     # 多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票后
     # 「集体看空则剔除、一致看多则加权」。默认关，需显式开启；
@@ -314,6 +318,17 @@ class TradingLoopConfig:
     # 分别是 1.19 / 1.06 / 0.95，是唯一「成本变差 5 倍仍成立」的组合。
     # ⚠️ 这是「交易强度」参数，改动必须重跑 scripts/exec_ab.py --grid 验证。
     rebalance_days: int = 15
+    # 排名滞后系数（1.0=关闭，等于「跌出目标组合即清仓」）。
+    # 语义：持仓只要还在「前 top_n×slack 名」以内就保留、不换出。
+    # 依据 = 执行级回测（1140 天 × 200 只，OIHC 撮合）:
+    #         10bp  15天 slack1.0 年化 24.7% 夏普 1.09 换手 17.8x
+    #         10bp  15天 slack3.0 年化 26.8% 夏普 1.19 换手 10.6x
+    #         50bp  15天 slack1.0 年化 14.7% 夏普 0.68 换手 14.3x
+    #         50bp  15天 slack3.0 年化 21.1% 夏普 0.95 换手  9.3x
+    # 成本假设越差缺口越大 ⇒ 它是「降换手从而降成本敏感性」的杠杆，
+    # 与 rebalance_days 是同一件事的两个旋钮（周期管节奏，滞后管名次边界）。
+    # ⚠️ 依赖 TradePlan.raw_rank（计划截断前生成），缺它则自动退化为 1.0。
+    hold_rank_slack: float = 3.0
     min_trade_amount: float = 5000.0     # 最小交易金额（元）
     # 持有纪律阈值（0=关闭）。持仓不在目标组合但浮盈≥该比例时不强制清仓，
     # 改由止损/止盈托管。实测「每日换票必卖赢家」是盈亏比 0.15 的根因之一，

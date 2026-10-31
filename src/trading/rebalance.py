@@ -98,6 +98,7 @@ def compute_rebalance_orders(
     adv_provider=None,
     participation: float = 0.01,
     hold_if_profitable_pct: float = 0.0,
+    hold_rank_slack: float = 1.0,
 ) -> List[RebalanceIntent]:
     """计算调仓订单意图（卖单在前，买单在后）。
 
@@ -123,6 +124,10 @@ def compute_rebalance_orders(
             改由止损/止盈线托管。直接「跌出榜单就卖」会在每日换票时把赢家甩掉、
             把还没跌的输家留下，等于做「卖赢家、留输家」的逆向选择——实测正是
             盈亏比 0.15 的根因之一。阈值需经 walk-forward 验证后再上调，不要拍脑袋。
+        hold_rank_slack: 排名滞后系数（1.0=关闭，等于「跌出目标组合即清仓」）。
+            持仓只要还在 ``top_n × slack`` 名以内就保留、不换出。回测里这是
+            唯一三档成本都站得住的配置（15 日周期 + 3.0 ⇒ 50bp 夏普 0.95 vs
+            1.0 时的 0.68），本质是降低换手从而降低对成本假设的敏感性。
 
     Returns:
         List[RebalanceIntent]，已排序为「先卖后买」。
@@ -158,6 +163,43 @@ def compute_rebalance_orders(
 
     sells: List[RebalanceIntent] = []
     buys: List[RebalanceIntent] = []
+
+    # ---------------- A0. 排名滞后：仍在带宽内的老持仓不换出 ----------------
+    # 回测（1140 天、执行级撮合）里这是**唯一三档成本都站得住**的配置：
+    # 15 日周期 + 排名滞后 3.0 ⇒ 10bp / 50bp 夏普 1.19 / 0.95、年换手 10.6x / 9.3x。
+    # 缺了它，实盘等价于 slack=1.0（换手 17.8x / 14.3x，50bp 下年化只有 14.7%
+    # 而不是 21.1%）—— 成本假设越差，缺口越大。
+    #
+    # 语义：持仓只要还在「前 top_n × slack 名」以内就继续拿着，把名次让给更靠前
+    # 的票；腾出来的名额再由新票填。这不是「不止损」，它只影响**换出时机**。
+    if hold_rank_slack > 1.0 and plan.raw_rank:
+        _cap = max(int(plan.max_positions or 0), 1)
+        keep_rank = int(round(_cap * float(hold_rank_slack)))
+        keepable = [
+            c for c in pos_map
+            if c not in target_weight
+            and plan.raw_rank.get(c) is not None
+            and int(plan.raw_rank[c]) < keep_rank
+        ]
+        # 名次从优到劣，截到 top_n —— 与回测 kept[:top_n] 一致，
+        # 防止持仓数超上限时把新票的名额全占掉。
+        keepable.sort(key=lambda c: int(plan.raw_rank[c]))
+        keepable = keepable[:_cap]
+        for c in keepable:
+            _pos = pos_map[c]
+            _mv = float(getattr(_pos, "market_value", 0) or 0)
+            if _mv <= 0:
+                _mv = price_of(c) * float(getattr(_pos, "quantity", 0) or 0)
+            # 目标权重 = 当前权重 ⇒ B/C 段算出的偏离为 0，不产生任何委托，
+            # 效果就是「原样持有」。绝不能给 0（会被当跌出组合清仓），也不能
+            # 用 plan 里的权重（它本来就不在计划里，没有那个数）。
+            target_weight[c] = (_mv / total_asset) if total_asset > 0 else 0.0
+            target_name[c] = _pos.name or c
+        if keepable:
+            logger.info(
+                f"调仓：排名滞后 slack={hold_rank_slack:.1f}（保留线前 {keep_rank} 名）"
+                f"⇒ 保留 {len(keepable)} 只老持仓，不清仓：{', '.join(keepable)}"
+            )
 
     # ---------------- A. 退出：持仓不在目标组合 ----------------
     if allow_sell:

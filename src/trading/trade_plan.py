@@ -50,11 +50,20 @@ from config.settings import DATA_DIR
 # （个股口径）是两回事，二者可合法不一致。这里用指数级 regime 做组合层面的
 # 防御性调整（全市场走熊 → 少而精 + 多留现金），与个股判断互不干扰。
 # 显式传入的参数永远优先（手动/测试可覆盖）。
-REGIME_POSITION_OVERRIDES = {
-    "bear":    {"max_positions": 6,  "cash_reserve_pct": 0.20},
-    "bull":    {"max_positions": 12, "cash_reserve_pct": 0.05},
-    # sideways / 未知 / 空：不调整，沿用默认 10 只 / 现金 10%
-}
+REGIME_POSITION_OVERRIDES: dict = {}
+# 市场状态 → 组合参数覆盖。**已停用（故意保持为空）**。
+#
+# 历史：bear 压缩到 6 只 / 20% 现金，bull 放宽到 12 只 / 5% 现金。
+# 停用理由（2026-10-31）：
+#   1. 它是一套**顺周期择时** —— 越跌仓位越轻，反弹时恰好最轻。而执行级
+#      回测（1140 天，含 2022 熊市与 2024 年初急跌）用的始终是固定
+#      「8 只 / 10% 现金」，年化 +25%。用一个回测里不存在的机制去改造
+#      被验证过的配置，等于把验证作废（同类问题：绝对分数门槛、ma60 闸门）。
+#   2. 它制造入口不一致：手动 `--build-plan` 命中覆盖（6 只 / 20% 现金 /
+#      equal 权重），闭环重建时显式传参（8 只 / 10% / risk_parity）——
+#      同一份选股产出两个不同的组合。
+# 恢复方式：把 `{"bear": {...}, "bull": {...}}` 加回来。恢复前请先跑
+# `scripts/exec_ab.py` 验证这套覆盖到底有没有正贡献，别凭直觉。
 
 
 # ----------------------------------------------------------------------------
@@ -100,6 +109,11 @@ class TradePlan:
     max_positions: int = 10              # 目标持仓上限
     weighting: str = "equal"             # equal / score
     notes: str = ""
+    # code → 当日候选池内的评分名次（0 起）。给「排名滞后」用：
+    # 老持仓只要还在 ``top_n × hold_rank_slack`` 名以内就保留，不因为
+    # 「今天没进前 8」被换掉。没有它，实盘只能按「跌出目标组合即清仓」，
+    # 换手率是回测最优配置的 1.7 倍（50bp 成本下年化差 6.4pp）。
+    raw_rank: Dict[str, int] = field(default_factory=dict)
 
     # ---------- 便捷视图 ----------
     @property
@@ -129,6 +143,11 @@ class TradePlan:
             max_positions=int(d.get("max_positions", 10) or 10),
             weighting=str(d.get("weighting", "equal")),
             notes=str(d.get("notes", "")),
+            raw_rank={
+                str(k): int(v)
+                for k, v in (d.get("raw_rank") or {}).items()
+                if str(k).strip()
+            },
         )
 
     # ---------- 有效性 ----------
@@ -517,6 +536,11 @@ def build_trade_plan(
     # 「跳空不追」校验误以为拿到了真实锚点。历史计划用 backfill_prices() 手动补。
 
     # 2. 目标只数收口（计划本身不得超限）
+    # ⚠️ 排名表必须在截断**之前**生成：截断后只剩 top_n 只，「排名滞后」
+    # 需要的 9~(top_n×slack) 名信息就永久丢失了，届时 slack 只能退化成 1.0。
+    raw_rank: Dict[str, int] = {
+        str(r["code"]): i for i, r in enumerate(rows) if r.get("code")
+    }
     limit = max_positions if top_n is None else min(top_n, max_positions)
     rows = rows[: max(0, limit)]
 
@@ -544,6 +568,7 @@ def build_trade_plan(
         cash_reserve_pct=cash_reserve_pct,
         max_positions=max_positions,
         weighting=weighting,
+        raw_rank=raw_rank,
     )
 
     if write:
@@ -669,5 +694,18 @@ if __name__ == "__main__":  # 手动生成一次
         plan = backfill_prices(a.backfill or a.plan_date)
         print(plan.summary() if plan else "未找到计划")
     else:
-        p = build_trade_plan(write=True)
+        # 与闭环 / 调度器同源：显式吃生产配置，不吃函数默认值（equal 权重）。
+        from config.settings import config as _app_cfg
+
+        _kw = {}
+        _tl = getattr(_app_cfg, "trading_loop", None)
+        if _tl is not None:
+            _kw = dict(
+                max_positions=int(_tl.max_positions),
+                cash_reserve_pct=float(_tl.cash_reserve_pct),
+                weighting=str(_tl.weighting),
+                tilt_strength=float(_tl.tilt_strength),
+                weight_cap=float(_tl.weight_cap),
+            )
+        p = build_trade_plan(write=True, **_kw)
         print(p.summary())

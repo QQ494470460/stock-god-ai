@@ -122,34 +122,38 @@ def _make_picks(n: int, price: float = 9.0):
 
 
 def test_build_trade_plan_bear_deweights():
-    """熊市（指数级 regime）：未显式传参时自动收敛仓位 + 多留现金。"""
+    """熊市 regime **不再**自动收敛仓位（2026-10-31 起停用顺周期覆盖）。
+
+    历史行为是 bear → 6 只 / 20% 现金。停用理由：执行级回测（1140 天，含
+    2022 熊市与 2024 年初急跌）始终用固定 8 只 / 10% 现金，年化 +25%；
+    实盘自己加的这套「越跌越轻」在回测里不存在，反弹时仓位恰好最轻，
+    还会让手动 --build-plan（命中覆盖）与闭环重建（显式传参）产出两个
+    不同的组合。regime 现在只做**标注**，不再改动组合参数。
+    """
     picks = _make_picks(8)
     plan = build_trade_plan(
         picks=picks, pool="zz500", min_score=55.0, regime="bear",
         weighting="equal", write=False,
     )
-    assert plan.regime == "bear"
-    assert plan.max_positions == 6          # 熊市上限 6
-    assert abs(plan.cash_reserve_pct - 0.20) < 1e-9   # 熊市现金 20%
-    assert len(plan.targets) == 6           # 8 只里只留 6 只
-    # 可投资 80%，6 等权 -> 各 ~13.33%
+    assert plan.regime == "bear", "regime 仍要如实记录，只是不再改仓位"
+    assert plan.max_positions == 10                   # 函数默认，未被覆盖
+    assert abs(plan.cash_reserve_pct - 0.10) < 1e-9   # 默认现金 10%
+    assert len(plan.targets) == 8                     # 候选有多少给多少
     for t in plan.targets:
-        assert abs(t.weight - 0.80 / 6) < 1e-9
-        assert t.price == 9.0               # 参考价照常透传
+        assert abs(t.weight - 0.90 / 8) < 1e-9
+        assert t.price == 9.0                         # 参考价照常透传
 
 
 def test_build_trade_plan_bull_expands():
-    """牛市（指数级 regime）：未显式传参时略放开（更多标的、更少现金）。"""
+    """牛市 regime 同样不再放开 —— 口径必须与回测一致（见上一用例说明）。"""
     picks = _make_picks(14)
     plan = build_trade_plan(
         picks=picks, pool="zz500", min_score=50.0, regime="bull",
         weighting="equal", write=False,
     )
-    assert plan.max_positions == 12
-    assert abs(plan.cash_reserve_pct - 0.05) < 1e-9
-    assert len(plan.targets) == 12
-    for t in plan.targets:
-        assert abs(t.weight - 0.95 / 12) < 1e-9
+    assert plan.max_positions == 10
+    assert abs(plan.cash_reserve_pct - 0.10) < 1e-9
+    assert len(plan.targets) == 10
 
 
 def test_build_trade_plan_sideways_unchanged():

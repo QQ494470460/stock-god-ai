@@ -30,6 +30,7 @@ from config.settings import config as app_config
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
 from src.models.evolution import evolution
+from src.models.evolution import THRESHOLD_MIN as _SCORE_FLOOR
 
 
 # 大盘状态 → 中文语境（与 evolution.detect_regime 返回值对齐）
@@ -147,6 +148,70 @@ def _apply_ensemble_vote(
                  "boosted": n_boosted, "skipped": n_skipped, "fallback": False}
 
 
+def _apply_score_threshold(
+    df: pd.DataFrame,
+    min_score: float,
+    target_n: int,
+    report: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    """按「过关优先 + 排名补足」筛选候选，而不是用绝对门槛一票否决。
+
+    **为什么改**：熊市里全市场评分整体下移，而 ``regime_adj`` 还会把阈值
+    再加 5 分（50→55），于是通过数掉到 4~6 只 —— 实测 2026-10-26 只有 4 只、
+    10-27 只有 6 只。后果有两层：
+
+    1. 组合被动集中：4 只票 vs 回测假设的 8 只，单票权重翻倍，波动与回撤
+       都被放大。回测的 +25%/年、-25% 回撤是按 8 只算的，实盘根本不是同一个
+       组合，两个数字天然不可比。
+    2. 它其实是个**顺周期开关**：越跌→分数越低→通过越少→仓位越轻，反弹时
+       恰好仓位最轻。回测里没有这个概念（永远按排名取前 N 只）。
+
+    所以改成：达标的照常优先，不足目标只数时按评分从高到低补足，但补位票
+    不得低于硬底线 ``THRESHOLD_MIN``（30 分），避免把明显不合格的标的塞进来。
+    这样「选择性」由排名承担，「门槛」只做极端兜底 —— 与回测口径一致。
+
+    Args:
+        df: 按评分降序的完整榜单（应按 ``max(max_picks, target_n)`` 宽取）
+        min_score: 当前生效阈值（基线 + 进化 + 市场状态）
+        target_n: 目标持仓只数（``trading_loop.max_positions``）
+
+    Returns:
+        过滤后的 DataFrame，仍为评分降序；不足目标数时返回尽可能多的票。
+    """
+    if df is None or len(df) == 0:
+        return df
+    col = "评分" if "评分" in df.columns else None
+    if col is None:
+        return df
+
+    scores = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    passed = df[scores >= float(min_score)]
+    n_pass = len(passed)
+    if report is not None:
+        report["n_passed_strict"] = int(n_pass)
+
+    need = int(target_n) - n_pass
+    if need <= 0:
+        if report is not None:
+            report["n_filled"] = 0
+        return passed
+
+    fillable = df[(scores < float(min_score)) & (scores >= float(_SCORE_FLOOR))]
+    fill = fillable.head(need)
+    if report is not None:
+        report["n_filled"] = int(len(fill))
+        if len(fill):
+            report["fill_note"] = (
+                f"达标仅 {n_pass} 只（阈值 {min_score:.1f}），按评分补足 "
+                f"{len(fill)} 只到目标 {int(target_n)} 只 —— 保持与回测一致的"
+                f"分散度，避免熊市里组合被动集中"
+            )
+            logger.warning(report["fill_note"])
+    if len(fill) == 0:
+        return passed
+    return pd.concat([passed, fill]) if len(passed) else fill
+
+
 def generate_daily_picks(
     pool: Optional[str] = None,
     max_picks: Optional[int] = None,
@@ -218,9 +283,14 @@ def generate_daily_picks(
         except Exception as e:
             logger.debug(f"股票列表获取失败，使用代码作名称: {e}")
 
-        df = pred.get_top_recommendations(
-            stock_data, stock_names, top_n=max_picks, min_score=min_score
+        # 宽取榜单（先不做绝对门槛），再由 _apply_score_threshold 做
+        # 「过关优先 + 排名补足」—— 只取到 max_picks 会让补位无从下手。
+        _target_n = int(getattr(app_config.trading_loop, "max_positions", 8) or 8)
+        _wide_n = max(int(max_picks), _target_n)
+        df_wide = pred.get_top_recommendations(
+            stock_data, stock_names, top_n=_wide_n, min_score=0.0
         )
+        df = _apply_score_threshold(df_wide, float(min_score), _target_n, report)
 
         # 参考价：把推荐时点的最新收盘价带进 picks，供交易计划 / 执行侧做
         # 「跳空太多就不追」这类校验。早期没有这一步，计划里 price 恒为 0.0，
