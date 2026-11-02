@@ -45,7 +45,7 @@ from loguru import logger
 
 from src.core.single_instance import SingleInstanceLock
 
-from config.settings import DATA_DIR, config as app_config
+from config.settings import DATA_DIR, ExecutionConfig, config as app_config
 from src.trading.broker import BrokerAPI, OrderSide, Position, AccountInfo, Order
 from src.trading.guard import RiskSupervisor, build_supervisor, TradingMode
 from src.trading.sanity import QuoteSanityGuard, wrap_broker
@@ -144,6 +144,21 @@ class LoopConfig:
     # 现在风险边界交给「15 日周期 + 8 只分散 + 8% 熔断」，不再额外压新仓规模。
     enable_risk_scaling: bool = False
     risk_scale_floor: float = 0.30       # 关闭时无效；保留字段供快速回滚/实验
+    # ---- T3 组合层风控覆盖层（**默认关闭**）。生产权威值在
+    # config/settings.py:TradingLoopConfig 的 derisk_* / vol_* / risk_blend。
+    # ⚠️ 已实测在生产口径（hold_rank_slack=3.0）下为**负贡献**，故关闭：
+    #    它与「排名滞后 3.0」是替代关系（都在降换手/降回撤），叠加重复扣分。
+    #    详见 settings.py 里那张 slack=3.0 的对照表。
+    derisk_mode: str = "off"             # off / asymmetric / procyclical
+    derisk_engage_pct: float = 12.0      # ⚠️ 启用时不得 < 10%，否则退回顺周期
+    derisk_max_dd_pct: float = 20.0
+    derisk_floor: float = 0.60
+    derisk_release_hysteresis_pct: float = 2.0
+    vol_target_pct: float = 0.0          # 0=关闭；百分数
+    vol_scale_floor: float = 0.5
+    vol_window_days: int = 20
+    vol_min_obs: int = 10
+    risk_blend: str = "mul"              # mul（回测口径）/ avg（未验证）
     # 调仓容忍带。生产权威值在 config/settings.py:TradingLoopConfig.band_pct
     # （此处只是 app_config 缺失时的兜底，两处须保持一致，否则谁读谁生效全看运气）。
     band_pct: float = 0.15
@@ -173,16 +188,31 @@ class LoopConfig:
     dry_run: bool = False                # True=只预演不下单
     price_fallback: bool = True          # 无 tick 时回退日线收盘价
     heartbeat_file: str = ""             # tick 心跳落盘路径（空=data/loop_heartbeat.json）
+    # 执行层智能下单（T2）：默认 None（关闭）；启用后由 _build_exec_scheduler 接管调仓分片。
+    execution: "ExecutionConfig" = None
 
     @classmethod
     def from_app_config(cls) -> "LoopConfig":
-        """从全局配置的 trading_loop 段构造（缺失则用安全默认）。"""
+        """从全局配置的 trading_loop 段构造（缺失则用安全默认）。
+
+        ⚠️ 嵌套配置必须还原成对象：``asdict`` 会把 ``execution`` 深度转成
+        ``dict``，而 ``_build_exec_scheduler`` 是用 ``getattr(ec, "smart_routing")``
+        读的 —— 拿到 dict 会恒为 False，等于「配置里开了、进程里没开」。
+        这类静默失效正是本项目最大的坑，故在此显式重建。
+        """
         try:
             sec = getattr(app_config, "trading_loop", None)
             if sec is None:
                 return cls()
-            return cls(**{k: v for k, v in asdict(sec).items()
-                          if k in cls.__dataclass_fields__})
+            kwargs = {k: v for k, v in asdict(sec).items()
+                      if k in cls.__dataclass_fields__}
+            ex = kwargs.get("execution")
+            if isinstance(ex, dict):
+                from dataclasses import fields as _dc_fields
+                allowed = {f.name for f in _dc_fields(ExecutionConfig)}
+                kwargs["execution"] = ExecutionConfig(
+                    **{k: v for k, v in ex.items() if k in allowed})
+            return cls(**kwargs)
         except Exception:  # noqa: BLE001
             return cls()
 
@@ -260,6 +290,26 @@ class TradingLoop:
         # 抢不到 = 已经有一个实例在跑 → 拒绝启动，避免重复下单。
         self._instance_lock = SingleInstanceLock(lock_path) if lock_path else None
         self.config = config or LoopConfig.from_app_config()
+        # 执行层智能下单（T2）：opt-in，默认 None（行为不变）；启用后接管调仓分片。
+        self._exec_scheduler = self._build_exec_scheduler()
+        # 组合层风控覆盖层（T3）：带恢复滞回的非顺周期降仓斜坡，懒建；默认不建。
+        self._derisk_ramp = None
+        # 一启动就把覆盖层口径打进日志 —— 否则「到底有没有生效」只能靠猜，
+        # 而这类静默失效（配置改了、进程没重读）本项目已经踩过多次。
+        _dm = str(getattr(self.config, "derisk_mode", "off") or "off")
+        _vt = float(getattr(self.config, "vol_target_pct", 0.0) or 0.0)
+        if _dm != "off" or _vt > 0:
+            logger.info(
+                f"🛡 组合层风控覆盖层: 回撤腿={_dm}"
+                f"({getattr(self.config, 'derisk_engage_pct', 0):.0f}%/"
+                f"{getattr(self.config, 'derisk_max_dd_pct', 0):.0f}%/"
+                f"floor {getattr(self.config, 'derisk_floor', 0):.2f})"
+                f" 波动腿={'off' if _vt <= 0 else f'{_vt:.0f}%'}"
+                f"(floor {getattr(self.config, 'vol_scale_floor', 0):.2f})"
+                f" 合成={getattr(self.config, 'risk_blend', 'mul')}"
+            )
+        else:
+            logger.info("🛡 组合层风控覆盖层: 关闭（回撤腿/波动腿均未启用）")
 
         # 报价合法性守卫：一个坏价格就是一笔坏交易。
         # 数据源会偶发返回昨收/复权价/错位价，而止损是按价格判定的 ——
@@ -865,6 +915,57 @@ class TradingLoop:
             logger.debug(f"调仓周期判定失败，按「到期」处理: {e}")
             return True
 
+    def _build_exec_scheduler(self):
+        """构建执行调度器（T2）。仅当 execution.smart_routing 开启时返回实例，
+        否则返回 None（闭环走原「单 tick 一次性下单」路径，行为完全不变）。
+        """
+        ec = getattr(self.config, "execution", None)
+        if ec is None or not getattr(ec, "smart_routing", False):
+            return None
+        try:
+            import os as _os
+            from src.trading.execution.scheduler import ExecutionScheduler
+            from src.trading.execution.slippage import (
+                SimSlippageModel, set_active_slippage_model,
+            )
+            # 增强滑点模型（opt-in，仅 participation 模式注册）
+            if getattr(ec, "slippage_model", "simple") == "participation":
+                set_active_slippage_model(SimSlippageModel(
+                    base_bps=2.0,
+                    participation=float(getattr(ec, "slippage_participation", 0.01)),
+                    partial_fill=bool(getattr(ec, "partial_fill_sim", False)),
+                ))
+            persist = None
+            if getattr(ec, "persist_state", True):
+                data_dir = _os.path.join(
+                    _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                        _os.path.abspath(__file__)))), "data")
+                persist = _os.path.join(data_dir, "exec_scheduler_state.json")
+                if _os.path.exists(persist):
+                    try:
+                        import json as _json
+                        with open(persist, encoding="utf-8") as f:
+                            return ExecutionScheduler.from_dict(
+                                _json.load(f), persist_path=persist)
+                    except Exception:
+                        pass
+            return ExecutionScheduler(
+                strategy=getattr(ec, "slice_strategy", "twap"),
+                window_min=int(getattr(ec, "window_min", 300)),
+                max_slices=int(getattr(ec, "max_slices", 10)),
+                overnight=bool(getattr(ec, "overnight_preopen", True)),
+                retry_cfg={
+                    "max_attempts": int(getattr(ec, "retry_max_attempts", 3)),
+                    "step_bps": float(getattr(ec, "retry_step_bps", 8.0)),
+                    "timeout_sec": float(getattr(ec, "retry_timeout_sec", 60.0)),
+                    "escalate_to_market": bool(getattr(ec, "escalate_to_market", True)),
+                },
+                persist_path=persist,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"执行调度器构建失败（回退为一次性下单）: {e}")
+            return None
+
     def _run_rebalance(self, positions, account, prices, report: TickReport):
         if self.plan is None or not self.plan.targets:
             report.note = "无有效交易计划，跳过调仓"
@@ -889,6 +990,16 @@ class TradingLoop:
                 getattr(self.config, "hold_rank_slack", 1.0) or 1.0),
         )
         report.n_intents = len(intents)
+        # T2 智能下单（opt-in）：切片在时间维度摊薄，天然规避单 tick 雪崩，
+        # 因此不受 max_orders_per_tick 截断；入队后即记周期标记，避免重复入队。
+        if self._exec_scheduler is not None and intents:
+            n_q = self._exec_scheduler.enqueue(intents, datetime.now().date())
+            self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
+            self._save_runtime()
+            report.note = (
+                f"⚙️ 执行调度已接管 {n_q} 笔调仓意图，"
+                f"将于盘中按 {getattr(self.config.execution, 'slice_strategy', 'twap')} 分片发出")
+            return
         # ⚠️ 「防雪崩闸门」与「周期记账」的先后顺序很容易搞错，这里钉死：
         # 一次完整调仓需要「卖 ≤N + 买 ≤N」共 2N 笔（N = max_positions）。
         # N=8 时最多 16 笔，若闸门 < 16，排在后面（**全是买单**）的委托会被
@@ -928,39 +1039,226 @@ class TradingLoop:
             else:
                 report.n_blocked += 1
 
-    def _portfolio_risk_scale(self, account) -> float:
-        """按组合当前回撤推导敞口系数（连续渐进降仓，非清仓）。
-
-        用 guard 记录的峰值权益与当前权益算峰谷回撤，再交给
-        ``sizing.portfolio_risk_scale`` 线性映射到 [floor, 1.0]。
-
-        取不到峰值/权益时返回 1.0（不降仓）—— **数据缺失不能当成「回撤很深」**
-        而误砍仓位，这一点与「未知波动率时降级为固定比例」同源。
-        """
-        if not self.config.enable_risk_scaling:
-            return 1.0
+    def _drain_exec_scheduler(self, now, report: TickReport):
+        """T2：每个交易 tick 让调度器吐出「此刻该发」的切片，并经 guard 下单。"""
         try:
-            from src.trading.sizing import drawdown_pct, portfolio_risk_scale
+            due = self._exec_scheduler.release_due(now)
+            if not due:
+                return
+            score_map = ({t.code: t.score for t in self.plan.targets}
+                         if self.plan and self.plan.targets else {})
+            for ro in due:
+                ok, msg, order, detail = self._place(
+                    code=ro.code, name=ro.name, side=ro.side,
+                    quantity=ro.qty, price=ro.price, reason=ro.reason,
+                    ai_score=float(score_map.get(ro.code, 50.0)),
+                    risk_exit=(ro.side == OrderSide.SELL),
+                    tag="exec_slice",
+                )
+                report.actions.append(detail or {})
+                if ok:
+                    report.n_executed += 1
+                    self._exec_scheduler.on_fill(ro.slice_id, ro.qty, now)
+                else:
+                    report.n_blocked += 1
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"执行调度出队失败: {e}")
+
+    # ------------------------------------------------------------------
+    # 组合层风控覆盖层（T3）
+    # ------------------------------------------------------------------
+    def _portfolio_drawdown_pct(self, account) -> Optional[float]:
+        """当前组合峰谷回撤（百分数，正数表示回撤）；取不到返回 None。
+
+        **绝不把「取不到」当成「回撤很深」**：guard 状态文件缺失/权益为 0 时
+        返回 None，调用方按「不干预」处理。反过来（缺失→满仓）与（缺失→空仓）
+        两种误判里，只有前者是可接受的错误方向。
+        """
+        try:
+            from src.trading.sizing import drawdown_pct
 
             peak = float(getattr(self.guard.safety._state, "peak_equity", 0) or 0)
             equity = float(getattr(account, "total_asset", 0) or 0)
             if peak <= 0 or equity <= 0:
-                return 1.0
-            dd = drawdown_pct(equity, peak)
-            scale = portfolio_risk_scale(
-                dd,
-                self.guard.config.max_portfolio_drawdown_pct,
-                floor=self.config.risk_scale_floor,
-            )
+                return None
+            dd = float(drawdown_pct(equity, peak))
+            if not (dd == dd) or dd < 0:   # NaN / 负值
+                return None
+            return dd
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"组合回撤计算失败，本 tick 不干预：{e}")
+            return None
+
+    def _realized_portfolio_vol(self) -> float:
+        """用逐日起始权益序列估组合年化波动率；样本不足返回 0.0（fail-open）。
+
+        数据源是 ``self._day_start_equity``（``{date: equity}``，已随
+        ``data/loop_runtime.json`` 落盘），所以重启不清零、不需要新状态文件。
+
+        ⚠️ 与回测的头寸无关，只差估计量：回测用窗口内**简单标准差**，这里用
+        EWMA(span=window)（等价 ewm，近期权重更大，对波动骤升反应更快）。两者
+        在同一窗口上的差别通常 < 10%，落在敞口系数上约 ±2%，不影响方向；
+        若以后发现「实盘波动腿砍得比回测狠」，第一个要怀疑的就是这里，
+        届时把 ``vol_estimator`` 切成简单标准差即可，不必改回测。
+        """
+        try:
+            from src.trading.risk.volatility import ewma_vol_annualized
+
+            series = getattr(self, "_day_start_equity", None) or {}
+            window = max(int(getattr(self.config, "vol_window_days", 20) or 20), 3)
+            min_obs = max(int(getattr(self.config, "vol_min_obs", 10) or 10), 2)
+
+            pts = []
+            for k, v in series.items():
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0:
+                    pts.append((str(k), fv))
+            pts.sort(key=lambda kv: kv[0])
+            eq = [v for _, v in pts[-(window + 1):]]
+            if len(eq) < min_obs + 1:
+                return 0.0
+            rets = [eq[i] / eq[i - 1] - 1.0 for i in range(1, len(eq)) if eq[i - 1] > 0]
+            if len(rets) < min_obs:
+                return 0.0
+            return float(ewma_vol_annualized(rets, span=window, periods_per_year=252))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"组合波动率估计失败，波动腿不干预：{e}")
+            return 0.0
+
+    def _derisk_scale_from_dd(self, dd: Optional[float]) -> float:
+        """回撤腿：非顺周期斜坡（介入线 12%，不是 0%）。"""
+        if dd is None:
+            return 1.0
+        mode = str(getattr(self.config, "derisk_mode", "off") or "off").strip().lower()
+        try:
+            if mode == "asymmetric":
+                if self._derisk_ramp is None:
+                    from src.trading.risk.derisk import DeriskRamp
+                    self._derisk_ramp = DeriskRamp(
+                        engage_pct=float(getattr(self.config, "derisk_engage_pct", 12.0)),
+                        max_dd_pct=float(getattr(self.config, "derisk_max_dd_pct", 20.0)),
+                        floor=float(getattr(self.config, "derisk_floor", 0.60)),
+                        release_hysteresis_pct=float(getattr(
+                            self.config, "derisk_release_hysteresis_pct", 2.0)),
+                    )
+                before = self._derisk_ramp.current()
+                scale = self._derisk_ramp.update(dd)
+                if scale < 1.0 and scale != before:
+                    logger.info(
+                        f"📉 回撤 {dd:.2f}%（介入以来最深 "
+                        f"{self._derisk_ramp.peak_drawdown_pct:.2f}%）→ 新买入系数 "
+                        f"{scale:.2f}（只缩新仓，不强制卖出）")
+                return float(scale)
+            if mode == "procyclical":
+                # 旧口径（已被回测证伪，仅保留供 A/B 回滚）
+                from src.trading.sizing import portfolio_risk_scale
+                return float(portfolio_risk_scale(
+                    dd, self.guard.config.max_portfolio_drawdown_pct,
+                    floor=self.config.risk_scale_floor))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"回撤腿计算失败，不干预：{e}")
+        return 1.0
+
+    def _vol_target_scale(self) -> float:
+        """波动腿：实测组合波动 > 目标时按比例缩新买入（只缩不放）。"""
+        target = float(getattr(self.config, "vol_target_pct", 0.0) or 0.0)
+        if target <= 0.0:
+            return 1.0
+        rv = self._realized_portfolio_vol()
+        if rv <= 0.0:
+            return 1.0
+        try:
+            from src.trading.risk.portfolio_vol import portfolio_vol_target_scale
+
+            floor = float(getattr(self.config, "vol_scale_floor", 0.5) or 0.5)
+            scale = float(portfolio_vol_target_scale(
+                rv, target / 100.0, floor=floor, ceil_=1.0))
             if scale < 1.0:
                 logger.info(
-                    f"📉 组合回撤 {dd:.2f}% → 敞口系数 {scale:.2f}"
-                    f"（连续降仓，保留 {scale:.0%} 仓位在场）"
-                )
+                    f"🌊 实测组合波动 {rv * 100:.1f}% > 目标 {target:.1f}% → "
+                    f"新买入系数 {scale:.2f}（只缩不放）")
             return scale
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"敞口系数计算失败，按满仓处理：{e}")
+            logger.debug(f"波动腿计算失败，不干预：{e}")
             return 1.0
+
+    def _portfolio_risk_scale(self, account) -> float:
+        """组合层敞口系数：缩放**可投敞口**（deployable = 总资产 × 系数）。
+
+        ⚠️ 语义澄清（很重要，别被「只缩新买入」这种说法误导）：
+        系数最终传给 ``rebalance`` 的 ``risk_scale``，那里算的是
+        ``deployable = total_asset × risk_scale``，目标金额 = deployable × 权重。
+        所以系数一旦调低，**已持仓超过「目标 × (1 + band_pct)」的部分会被减仓**。
+        也就是说它缩的是「整个组合的目标敞口」，不是「这一笔买单的手数」。
+        这一点与 ``exec_backtest`` 里 ``invest = eq × (1-cash) × scale`` 的口径
+        完全一致 —— 回测 E 方案就是按这个语义跑出来的，实盘必须同口径，
+        否则又是一处「回测里有、实盘不一样」的漂移。
+
+        两条正交的腿，都可独立开关，默认全关：
+
+        * **回撤腿**（``derisk_mode``）：非顺周期斜坡，回撤 < 12% 完全不干预，
+          12%→20% 线性压到 0.60，且带 2% 恢复滞回（修到 10% 才完全放开）。
+          与旧的 ``enable_risk_scaling`` 的唯一区别就是「介入线 0 还是 12%」——
+          从 0 开始砍 = 顺周期 = 卖在低点，回测里吃掉 9pp 收益。
+        * **波动腿**（``vol_target_pct``）：实测组合年化波动超目标时按
+          ``target/realized`` 缩，地板 0.5，**只缩不放**（低波动不加杠杆）。
+
+        合成方式由 ``risk_blend`` 决定，默认 ``mul``（= 回测 E 方案口径，
+        最差 0.60×0.50=0.30）；``avg`` 是算术平均（地板 0.55，但**未验证**）。
+
+        取不到峰值/权益/波动样本时**不干预**（返回 1.0）—— 数据缺失不能当成
+        「回撤很深」，否则一次读盘失败就会把仓位砍半。
+        """
+        mode = str(getattr(self.config, "derisk_mode", "off") or "off").strip().lower()
+        vol_target = float(getattr(self.config, "vol_target_pct", 0.0) or 0.0)
+        legacy = bool(getattr(self.config, "enable_risk_scaling", False))
+
+        if mode == "off" and not legacy:
+            # 旧开关没开时，derisk_mode=off 就彻底不介入（不必算 dd）。
+            if vol_target <= 0.0:
+                return 1.0
+            return self._vol_target_scale()
+
+        dd = self._portfolio_drawdown_pct(account)
+        scales = []
+
+        if mode == "asymmetric":
+            scales.append(self._derisk_scale_from_dd(dd))
+        elif mode == "procyclical" or legacy:
+            if dd is not None:
+                try:
+                    from src.trading.sizing import portfolio_risk_scale
+                    s = float(portfolio_risk_scale(
+                        dd, self.guard.config.max_portfolio_drawdown_pct,
+                        floor=self.config.risk_scale_floor))
+                    if s < 1.0:
+                        logger.info(
+                            f"📉 组合回撤 {dd:.2f}% → 敞口系数 {s:.2f}"
+                            f"（顺周期渐进降仓）")
+                    scales.append(s)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"顺周期降仓计算失败，不干预：{e}")
+
+        if vol_target > 0.0:
+            scales.append(self._vol_target_scale())
+
+        if not scales:
+            return 1.0
+        if len(scales) == 1:
+            return max(0.0, min(float(scales[0]), 1.0))
+
+        blend = str(getattr(self.config, "risk_blend", "mul") or "mul").strip().lower()
+        a, b = float(scales[0]), float(scales[1])
+        if blend == "avg":
+            try:
+                from src.trading.risk.portfolio_vol import blend_scales
+                return float(blend_scales(a, b, 0.5))
+            except Exception:  # noqa: BLE001
+                pass
+        return max(0.0, min(a * b, 1.0))
 
     def _adv_provider(self):
         """流动性上限提供者（计划层事前封顶用）；关闭或失败时返回 None。
@@ -1547,6 +1845,10 @@ class TradingLoop:
             # --- ⑧ 目标组合调仓 ---
             if self.config.enable_rebalance and account:
                 self._run_rebalance(positions, account, prices, report)
+
+            # T2 智能下单：每个交易 tick 让调度器吐出「此刻该发」的片
+            if self._exec_scheduler is not None:
+                self._drain_exec_scheduler(now, report)
 
             # 日内累计：把本 tick 的止损/意图/成交/拦截并入「当日」计数器，
             # 供收盘结算报告使用（否则只记结算那一刻，盘中拦截全丢）。

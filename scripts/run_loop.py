@@ -458,6 +458,7 @@ def _run() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ 无头调度自动拉起失败（已忽略，闭环继续）: {e}", file=sys.stderr)
 
+    intentional_stop = False
     try:
         if args.preview:
             _print_preview(loop)

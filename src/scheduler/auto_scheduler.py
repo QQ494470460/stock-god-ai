@@ -391,6 +391,68 @@ def _job_rolling_ic_impl(days: int = 5, dry_run: bool = False) -> Dict:
     return {"job": "rolling_ic", **res, "at": datetime.now().isoformat(timespec="seconds")}
 
 
+def job_drift_retrain() -> Dict:
+    """T4 漂移触发重训（**默认关闭**，受 ``scheduler.drift_retrain_enabled`` 控制）。
+
+    与 ``job_evolution`` 的分工：进化作业是「定期搜参数/重训」的常客，
+    本作业是「**只在检测到显著漂移时**才动模型」的哨兵。它不做任何落地——
+    产出永远是待批准候选，人工 ``evolve.py --approve/--apply`` 后才生效。
+    """
+    if not getattr(app_config.scheduler, "drift_retrain_enabled", False):
+        return {"job": "drift_retrain", "status": "disabled",
+                "reason": "scheduler.drift_retrain_enabled=False（默认关闭）",
+                "at": datetime.now().isoformat(timespec="seconds")}
+    with _job_lease("drift_retrain", ttl_sec=7200) as ok:
+        if not ok:
+            return _skipped("drift_retrain", 7200)
+        return _job_drift_retrain_impl()
+
+
+def _job_drift_retrain_impl() -> Dict:
+    """跑 ``scripts/drift_retrain.py --run``（子进程）。
+
+    为什么用子进程而不是在调度进程内直接调：重训是会吃掉几十分钟 CPU/内存的
+    长任务，放在 APScheduler 线程里会把整个调度进程一起拖住（其他作业到点不触发）。
+    子进程还能给出硬超时，超时即杀，不留僵尸。
+    """
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    script = root / "scripts" / "drift_retrain.py"
+    if not script.exists():
+        return {"job": "drift_retrain", "status": "error",
+                "error": f"脚本不存在: {script}",
+                "at": datetime.now().isoformat(timespec="seconds")}
+    timeout = int(getattr(app_config.scheduler, "drift_retrain_timeout_min", 150)) * 60
+    try:
+        cp = subprocess.run(
+            [sys.executable, str(script), "--run", "--json"],
+            cwd=str(root), capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace",
+        )
+        out = (cp.stdout or "").strip()
+        res: Dict = {"job": "drift_retrain", "status": "ok" if cp.returncode == 0 else "error",
+                     "returncode": cp.returncode,
+                     "at": datetime.now().isoformat(timespec="seconds")}
+        try:
+            # loguru 走 stderr，stdout 只有 --json 的那一个 JSON 对象
+            res.update(json.loads(out) if out.startswith("{") else {"raw": out[-2000:]})
+        except Exception:  # noqa: BLE001
+            res["raw"] = out[-2000:]
+        if cp.returncode != 0:
+            res["stderr"] = (cp.stderr or "")[-2000:]
+        return res
+    except subprocess.TimeoutExpired:
+        logger.error(f"漂移重训超时（{timeout // 60} 分钟）")
+        return {"job": "drift_retrain", "status": "timeout", "timeout_min": timeout // 60,
+                "at": datetime.now().isoformat(timespec="seconds")}
+    except Exception as e:  # noqa: BLE001
+        logger.exception("漂移重训作业失败")
+        return {"job": "drift_retrain", "status": "error", "error": str(e),
+                "at": datetime.now().isoformat(timespec="seconds")}
+
+
 # ----------------------------------------------------------------------------
 # 调度器控制
 # ----------------------------------------------------------------------------
@@ -444,6 +506,13 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
              getattr(app_config.scheduler, "industry_map_cron", "0 * * * *"),
              job_industry_map),
         ]
+        # T4 漂移哨兵：默认关闭，只有显式打开 config.scheduler.drift_retrain_enabled
+        # 才注册（「没打开却挂着作业」会让人误以为它在保护模型）。
+        if getattr(app_config.scheduler, "drift_retrain_enabled", False):
+            jobs.append(("drift_retrain",
+                         getattr(app_config.scheduler, "drift_retrain_cron",
+                                 "30 19 * * mon-fri"),
+                         job_drift_retrain))
         for jid, cron, fn in jobs:
             trig = _make_trigger(cron)
             if trig is None:

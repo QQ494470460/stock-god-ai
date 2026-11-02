@@ -207,6 +207,29 @@ class MLConfig:
     # 无行业映射（fetcher.get_industry_map 取不到）时自动跳过，零影响。
     cross_sectional_neutralize: bool = True
 
+    # ------------------------------------------------------------------
+    # 跨日评分平滑（T1 信号层，2026-11-03 启用）
+    # ------------------------------------------------------------------
+    # 做法：对每只票的**当日最终评分**做 EMA（score_t = α·raw_t + (1-α)·ema_{t-1}），
+    # 抑制单日模型噪声。只用 <=t 的数据，无前视；历史缓冲落盘，重启不清零。
+    #
+    # 依据 = panel_oos（1140 天 × 200 只）× 三档成本，含 T3 覆盖层的同口径回测：
+    #   alpha   年化(10/30/50bp)      夏普             回撤(10bp)
+    #   1.00    23.7/18.9/14.4     1.18/0.96/0.74     -22.5%   ← 不平滑（原状）
+    #   0.90    27.1/22.4/18.5     1.30/1.09/0.91     -17.9%
+    #   0.85    26.7/21.7/17.5     1.28/1.06/0.87     -17.8%   ← 采纳
+    #   0.80    26.1/21.9/17.4     1.26/1.07/0.86     -16.1%
+    #   0.70    25.9/21.8/17.4     1.25/1.06/0.86     -17.3%
+    #   0.60    22.8/18.3/15.2     1.10/0.90/0.75     -16.2%
+    #   0.50    22.8/18.8/15.2     1.11/0.93/0.76     -19.2%
+    #   0.30    13.9/10.6/ 4.0     0.72/0.56/0.20     -20.8%   ← 过度平滑，反噬
+    # 0.65~0.90 是平滑的平台区（不是单点尖峰），且前后半段样本各自独立成立
+    # （H1 夏普 1.00→1.13，H2 1.42→1.55），故取平台中心 0.85。
+    # ⚠️ alpha 不得低于 0.5：0.3 会让年化从 23.7% 掉到 13.9%（信号被抹平成慢变量）。
+    signal_fusion_enabled: bool = True
+    signal_fusion_alpha: float = 0.85
+    signal_fusion_days: int = 10     # 历史缓冲天数（有效记忆约 1/(1-α) ≈ 6.7 天）
+
 
 @dataclass  
 class DataConfig:
@@ -255,6 +278,13 @@ class SchedulerConfig:
     # 而映射一旦拿到就永久落盘、之后不再打网络 —— 所以值得每小时给一次机会。
     # 全 A 只要翻几页列表接口，网络不通时秒级失败，不会拖住其它作业。
     industry_map_cron: str = "0 * * * *"        # 每小时整点
+    # T4 漂移触发重训（哨兵作业）。**默认关闭**：它会在检测到显著漂移时启动一次
+    # 重训（几十分钟 CPU），且产出永远是待批准候选 —— 不会自动换模型。
+    # 打开前建议先连续几天跑 `python scripts/drift_retrain.py`（只判定不训练）看判定
+    # 是否合理；阈值是 max(0.010, 2σ) 动态算的，样本 < 10 个交易日不判定。
+    drift_retrain_enabled: bool = False
+    drift_retrain_cron: str = "30 19 * * mon-fri"   # 跑在进化作业（19:00）之后
+    drift_retrain_timeout_min: int = 150            # 子进程硬超时（分钟）
     timezone: str = "Asia/Shanghai"
     # 每日推荐产物
     report_dir: str = "data/daily_reports"
@@ -273,6 +303,30 @@ class SchedulerConfig:
     push_webhook_url: str = ""                  # 留空则不推送
     # 调度自身的状态/日志
     log_file: str = "logs/scheduler.log"
+
+
+@dataclass
+class ExecutionConfig:
+    """执行层智能下单配置（T2，默认全关，开启需回测/演练验证）。
+
+    开启 ``smart_routing`` 后，调仓意图不再于单个 tick 一次性全部发出，
+    而是按 TWAP/VWAP 在 [盘前/开盘, 开盘+window_min] 时间窗内分片摊薄，
+    降低开盘冲击、对齐真实撮合；限价单未全成时按重试策略抬价/转市价。
+    """
+    smart_routing: bool = False         # 总开关（False=完全关闭，闭环行为不变）
+    slice_strategy: str = "twap"        # twap / vwap
+    window_min: int = 300               # 切片铺开的时间窗（分钟）
+    max_slices: int = 10                # 单笔委托最多切片数
+    overnight_preopen: bool = True      # 首片提前到 09:15 盘前报送（集合竞价）
+    retry_enabled: bool = True          # 限价单未全成时重试
+    retry_max_attempts: int = 3
+    retry_step_bps: float = 8.0         # 每次重试抬价/压价基点
+    retry_timeout_sec: float = 60.0     # 两次重试最小间隔
+    escalate_to_market: bool = True     # 超过重试上限转市价单确保成交
+    slippage_model: str = "simple"      # simple / participation
+    slippage_participation: float = 0.01
+    partial_fill_sim: bool = False      # 模拟部分成交（默认 100% 成交）
+    persist_state: bool = True          # 挂单落盘，崩溃续传
 
 
 @dataclass
@@ -348,10 +402,52 @@ class TradingLoopConfig:
     # 风险边界改由「15 日周期 + 8 只分散 + 8% 组合回撤熔断」承担。
     enable_risk_scaling: bool = False
     risk_scale_floor: float = 0.30       # 关闭时无效，保留供回滚/实验
+
+    # ------------------------------------------------------------------
+    # T3 组合层风控覆盖层（**默认关闭**；代码保留，参数留作实验记录）
+    # ------------------------------------------------------------------
+    # ⚠️⚠️ 关键教训（2026-11-03）：这个覆盖层在 slack=1.0 下是正贡献，
+    # 在**生产口径 slack=3.0** 下是负贡献。同一份代码、同一批数据，只因为
+    # `hold_rank_slack` 不同，结论就反了 —— 因为「波动率目标」和「排名滞后」
+    # 是**替代关系**而不是叠加关系：两者都在降换手、降回撤，叠加等于重复扣分。
+    #
+    # 证据（1140 天 × 200 只，top8/15日/risk_parity，EMA0.85 信号）：
+    #   配置（slack=3.0）      年化(10/30/50bp)      夏普              回撤(10bp)   Calmar均值
+    #   off  ← 生产采纳       30.8/26.0/24.2     1.34/1.15/1.08    -25.5%      1.025
+    #   dd_only(12/20/0.6)    27.9/24.7/22.5     1.26/1.13/1.03    -24.4%      1.001
+    #   vt22                  23.2/20.6/17.9     1.14/1.02/0.90    -22.7%      0.876
+    #   vt30                  26.5/24.8/19.9     1.21/1.14/0.94    -25.1%      0.907
+    #   vt40                  30.3/26.8/22.6     1.33/1.19/1.01    -25.5%      1.007
+    #   dd+vt30               27.3/24.0/18.5     1.26/1.12/0.90    -24.1%      0.937
+    # 即：三档成本下「off」的收益/夏普/Calmar 全部最高，回撤只差 1~3pp。
+    # 回撤 -25.5% 由「8 只分散 + 15 日周期 + 排名滞后 3.0」承担，不需要再加一层。
+    #
+    # 之前的 slack=1.0 结论（vt22 有效）已作废：那是 `ExecConfig` 的
+    # `hold_rank_slack` 默认值 1.0 导致的**口径漂移**，不是策略规律。
+    # 教训写进 tests/test_loop.py：任何回测脚本都必须显式传 hold_rank_slack=3.0。
+    derisk_mode: str = "off"             # off（生产）/ asymmetric / procyclical
+    derisk_engage_pct: float = 12.0      # 介入线：回撤 < 12% 完全不干预
+    derisk_max_dd_pct: float = 20.0      # 到此回撤压到地板
+    derisk_floor: float = 0.60           # 地板：缩「可投敞口」，不是清仓
+    derisk_release_hysteresis_pct: float = 2.0   # 恢复滞回：修到 10% 才完全放开
+    vol_target_pct: float = 0.0          # 组合波动率目标（百分数）；0=关闭
+    vol_scale_floor: float = 0.5         # 波动腿地板（只缩不放，ceil 固定 1.0）
+    vol_window_days: int = 20            # 实测波动窗口（交易日）
+    vol_min_obs: int = 10                # 样本不足则不估（fail-open 返回 1.0）
+    # 两条腿同时开启时的合成方式：
+    #   mul = 相乘（回测 E 方案口径，最差 0.6×0.5=0.30）
+    #   avg = 算术平均（最差 0.55，地板更高，但**未在回测里验证过**）
+    # 默认 mul —— 「回测里有吗」的答案是「回测就是相乘」，实盘必须同口径。
+    risk_blend: str = "mul"
+
     settle_hour: int = 15                # 收盘结算时刻（时）
     settle_minute: int = 5               # 收盘结算时刻（分）
     notify: bool = True                  # 事件/日报推送
     dry_run: bool = False                # True=只预演不下单
+
+    # 执行层智能下单（T2）：TWAP/VWAP 切片、限价重试、隔夜预挂、滑点建模。
+    # 默认关闭（smart_routing=False）：关闭时闭环行为完全不变。
+    execution: "ExecutionConfig" = field(default_factory=ExecutionConfig)
 
 
 @dataclass

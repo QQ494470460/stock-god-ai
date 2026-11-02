@@ -208,6 +208,15 @@ def apply_slippage(price: float, side: str, amount: float,
     买入往上滑（更贵）、卖出往下滑（更便宜），结果保留 2 位小数。
     ``side`` 接受 ``"buy"/"sell"`` 或 OrderSide。
     """
+    # opt-in 增强滑点模型（执行层 T2）：若已注册参与度滑点模型则优先使用；
+    # 未注册时走下方原逻辑（默认行为完全不变）。
+    try:
+        from src.trading.execution.slippage import get_active_slippage_model
+        _m = get_active_slippage_model()
+        if _m is not None:
+            return _m.fill_price(price, side, amount)
+    except Exception:
+        pass
     if not price or price <= 0:
         return price
     s = str(getattr(side, "value", side)).lower()

@@ -20,7 +20,7 @@ from loguru import logger
 # 而启动时只需要知道"模型文件在不在"，真正用到模型是点选股/预测时的事。
 # 顶层导入会把这 5 秒白白加在每次启动上（打包后还要额外映射 143MB 的 xgboost.dll）。
 # 注：lightgbm 已从本项目移除（单模型 xgboost，见 trainer.py），不再有第三方库的导入开销。
-from config.settings import config as app_config, MODEL_DIR
+from config.settings import config as app_config, MODEL_DIR, DATA_DIR
 from src.features.engine import feature_engine
 from src.models.scoring import compute_score, get_score_interpretation
 from src.models.signal_quality import neutralize_cross_section
@@ -144,6 +144,12 @@ class Predictor:
         self._industry_map_cache: Optional[Dict[str, str]] = None
         # 诊断：最近一次中性化实际使用的分组口径（"industry"/"board"/None）
         self._last_neutral_kind: Optional[str] = None
+
+        # T1 跨日评分平滑：{日期: {代码: 当日原始评分}}，懒加载 + 落盘。
+        # 注意存的是**平滑前**的原始分 —— 若存平滑后的值，明天会在平滑值上再平滑，
+        # 等效于把 alpha 一路压低（0.85 连乘三天就掉到 0.6 区间），最终变成
+        # 回测里被证伪的「过度平滑」。
+        self._score_history: Optional[Dict[str, Dict[str, float]]] = None
 
     @property
     def trainer(self):
@@ -754,6 +760,105 @@ class Predictor:
             self._last_neutral_kind = None
             logger.debug(f"截面中性化跳过（安全降级）: {e}")
 
+    # ------------------------------------------------------------------
+    # T1 跨日评分平滑（EMA）
+    # ------------------------------------------------------------------
+    @property
+    def _score_history_file(self):
+        from pathlib import Path as _Path
+        return _Path(DATA_DIR) / "signal_score_history.json"
+
+    def _load_score_history(self) -> Dict[str, Dict[str, float]]:
+        """读回滚动评分历史（{日期: {代码: 原始评分}}）；坏文件一律当空处理。"""
+        if self._score_history is not None:
+            return self._score_history
+        hist: Dict[str, Dict[str, float]] = {}
+        try:
+            f = self._score_history_file
+            if f.exists():
+                import json as _json
+                raw = _json.loads(f.read_text(encoding="utf-8"))
+                for d, m in (raw or {}).items():
+                    if isinstance(m, dict) and m:
+                        hist[str(d)] = {str(k): float(v) for k, v in m.items()
+                                        if isinstance(v, (int, float))}
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"评分历史读取失败（按空处理，退化为不平滑）: {e}")
+            hist = {}
+        self._score_history = hist
+        return hist
+
+    def _save_score_history(self, hist: Dict[str, Dict[str, float]]) -> None:
+        """落盘滚动历史（只保留最近 N 天）。失败不影响主流程。"""
+        try:
+            days = max(int(getattr(app_config.ml, "signal_fusion_days", 10) or 10), 2)
+            keys = sorted(hist.keys())[-days:]
+            trimmed = {k: hist[k] for k in keys}
+            self._score_history = trimmed
+            f = self._score_history_file
+            f.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            f.write_text(_json.dumps(trimmed, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"评分历史落盘失败（已忽略）: {e}")
+
+    def _apply_signal_fusion(self, predictions: List["StockPrediction"],
+                             as_of_date: str = "") -> None:
+        """用跨日 EMA 平滑当日评分（原地修改 pred.score）。
+
+        为什么值得做：单日评分信息比率偏低，选股却完全由单日排名驱动。
+        真面板回测（1140 天 × 200 只 × 三档成本）显示 alpha=0.85 的 EMA 让
+        年化 23.7%→26.7%、夏普 1.18→1.28、回撤 -22.5%→-17.8%，三档成本一致；
+        但 alpha 压到 0.3 会反向崩塌（年化 13.9%）—— 所以参数区间是硬的。
+
+        实现要点：
+          * 历史里存的是**平滑前的原始分**（否则等效 alpha 逐日连乘、越滑越钝）；
+          * 当日键即为 as_of，``cross_day_ema`` 只用 <= as_of 的数据，无前视；
+          * 任何异常都保持原分值（宁可少一层平滑，也不能让选股停摆）。
+        """
+        if not getattr(app_config.ml, "signal_fusion_enabled", False) or not predictions:
+            return
+        raw_today = {p.code: float(p.score) for p in predictions}
+        try:
+            import pandas as pd
+            from src.models.signal_fusion import SignalFusion
+
+            as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
+            hist = self._load_score_history()
+            frames = {d: pd.DataFrame({"code": list(m.keys()),
+                                       "score": list(m.values())})
+                      for d, m in hist.items() if d != as_of and m}
+            today_df = pd.DataFrame({"code": list(raw_today.keys()),
+                                     "score": list(raw_today.values())})
+            frames[as_of] = today_df
+
+            sf = SignalFusion(
+                enabled=True,
+                ema_alpha=float(getattr(app_config.ml, "signal_fusion_alpha", 0.85)),
+                # 中性化由 _neutralize_scores 负责，这里再来一次是重复去偏
+                neutralize=False,
+            )
+            fused = sf.fuse(today_df, frames)
+            if fused is not None and not fused.empty and "code" in fused.columns:
+                m = {str(c): float(s) for c, s in zip(fused["code"], fused["score"])}
+                changed = 0
+                for p in predictions:
+                    if p.code in m and m[p.code] == m[p.code]:
+                        if abs(m[p.code] - p.score) > 1e-9:
+                            changed += 1
+                        p.score = m[p.code]
+                logger.info(
+                    f"🧮 跨日评分平滑: alpha="
+                    f"{getattr(app_config.ml, 'signal_fusion_alpha', 0.85):.2f} "
+                    f"历史 {len(frames)} 天，调整 {changed}/{len(predictions)} 只")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"跨日评分平滑失败（保持原始评分）: {e}")
+        finally:
+            # 无论平滑成功与否都要记住**今天的原始分**，否则明天没有基准
+            hist = self._score_history if self._score_history is not None else {}
+            hist[as_of_date or datetime.now().strftime("%Y-%m-%d")] = raw_today
+            self._save_score_history(hist)
+
     @staticmethod
     def _read_industry_map_status_note() -> str:
         """读取 fetcher 写好的 ``industry_map_status.json``，返回降级根因（无则返回空串）。"""
@@ -805,6 +910,10 @@ class Predictor:
         # 横截面行业中性化（默认开启）：在排序前对整批评分去行业水位，
         # 让排名不被「模型系统性偏好某些行业」带偏，降低单日 IC 的板块噪声。
         self._neutralize_scores(predictions)
+
+        # T1 跨日平滑（默认开）：在「最终排名用的评分」上做 EMA，
+        # 位置必须在中性化**之后**（平滑的是真正驱动排序的那个数），排序之前。
+        self._apply_signal_fusion(predictions)
 
         # 按评分排序
         predictions.sort(key=lambda x: x.score, reverse=True)

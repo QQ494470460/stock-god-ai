@@ -4602,7 +4602,9 @@ def render_safety_panel():
     sc = app_config.scheduler
     st.caption(
         f"数据更新 {sc.data_update_cron} ｜ 每日推荐 {sc.daily_pick_cron} ｜ "
-        f"进化验证 {sc.evolution_cron}（{sc.timezone}）"
+        f"进化验证 {sc.evolution_cron} ｜ 漂移哨兵 "
+        f"{getattr(sc, 'drift_retrain_cron', '—') if getattr(sc, 'drift_retrain_enabled', False) else '关闭'}"
+        f"（{sc.timezone}）"
     )
     st.info("调度仅做数据/推荐/进化验证，绝不下单。勾选启用后点击「启动调度」即可拉起后台定时器；"
             "开关会持久化，重启看板后仍记得上次状态。")

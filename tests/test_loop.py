@@ -641,14 +641,24 @@ def test_risk_scaling_is_off_so_drawdown_does_not_shrink_new_positions():
     assert LoopConfig().enable_risk_scaling is False
     assert AppConfig().trading_loop.enable_risk_scaling is False
 
-    # 行为层：回撤很深时敞口系数仍必须是 1.0（否则又回到「越跌越轻」）
+    # 行为层：**浅回撤不得砍新仓**（顺周期最烧钱的地方就在这一段）。
+    # 2026-11-03 起了 T3 非顺周期覆盖层，但它 12% 才介入，8% 仍必须是 1.0。
     paper = FakePaper(total=800_000.0)
     b = FakeBroker(total=800_000.0, cash=800_000.0)
     loop = mk_loop(broker=b, paper=paper,
                    cfg=LoopConfig(auto_build_plan=False, dry_run=True))
-    loop.guard.safety._state.peak_equity = 1_000_000.0   # 回撤 20%，远超 8% 熔断线
+    loop.guard.safety._state.peak_equity = 869_565.0     # 回撤 8%
     acct = b.query_account()
     assert loop._portfolio_risk_scale(acct) == 1.0
+
+    # 覆盖层整体关掉时（derisk_mode=off 且 vol_target_pct=0）也必须回到 1.0
+    b2 = FakeBroker(total=800_000.0, cash=800_000.0)
+    loop2 = mk_loop(broker=b2, paper=FakePaper(total=800_000.0),
+                    cfg=LoopConfig(auto_build_plan=False, dry_run=True,
+                                   derisk_mode="off", vol_target_pct=0.0))
+    loop2._day_start_equity = {}
+    loop2.guard.safety._state.peak_equity = 1_000_000.0   # 回撤 20%
+    assert loop2._portfolio_risk_scale(b2.query_account()) == 1.0
 
 
 def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, monkeypatch):
@@ -1495,3 +1505,205 @@ def test_regime_weights_keep_risk_exit_always_allowed():
         w = REGIME_STRATEGY_WEIGHTS[regime]
         for tag in ("stop", "stop_loss", "stop_profit", "trail_stop"):
             assert w.get(tag) == pytest.approx(1.0), f"{regime}/{tag} 会被降权"
+
+
+# ======================================================================
+# T3 组合层风控覆盖层（非顺周期降仓 + 波动率目标）
+# ======================================================================
+
+def _loop_with_dd(peak: float, total: float, **cfg_kw):
+    """造一个「峰值 peak / 当前权益 total」的 loop，用于直接喂回撤。
+
+    ⚠️ 默认把波动腿关掉并清空 ``_day_start_equity``：loop 构造时会 ``_load_runtime()``
+    读到**真实的** ``data/loop_runtime.json``，那里的波动率会让波动腿随机介入，
+    使「只验回撤腿」的断言变成薛定谔的测试。
+    """
+    cfg_kw.setdefault("vol_target_pct", 0.0)
+    b = FakeBroker(total=total, cash=total)
+    loop = mk_loop(broker=b, paper=FakePaper(total=total),
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True, **cfg_kw))
+    loop._day_start_equity = {}
+    loop.guard.safety._state.peak_equity = float(peak)
+    return loop, b.query_account()
+
+
+def test_t3_production_switches_are_off_after_slack3_evidence():
+    """T3 覆盖层**生产关闭** + 参数留档（slack=3.0 实测负贡献）。
+
+    踩过的坑：在 slack=1.0 口径下 vt22 看起来是正贡献，换上生产口径 slack=3.0
+    之后收益/夏普/Calmar 三档全输。原因是「波动率目标」和「排名滞后」都在降
+    换手、降回撤，**是替代关系不是叠加关系**，叠加等于重复扣分。
+    参数保留是为了让后续实验有个已记录的起点，不是因为它们在生效。
+    """
+    from config.settings import AppConfig
+
+    for c in (LoopConfig(), AppConfig().trading_loop):
+        assert c.derisk_mode == "off", "生产必须关闭：slack=3.0 下是负贡献"
+        assert c.vol_target_pct == 0.0
+        assert c.risk_blend == "mul"
+        # 参数留档（改这些不会生效，但开回来时要保持非顺周期）
+        assert (c.derisk_engage_pct, c.derisk_max_dd_pct, c.derisk_floor) == (12.0, 20.0, 0.60)
+        assert (c.derisk_release_hysteresis_pct, c.vol_scale_floor) == (2.0, 0.5)
+
+
+def test_t3_params_never_regress_to_procyclical():
+    """硬约束：介入线不得 < 10%、两个地板不得 < 0.5。
+
+    把 engage 调回 0 就是被证伪的顺周期版（回测里吃掉 9pp 收益）；
+    地板调到 0.5 以下就变成「跌了就清仓」。将来谁要重新启用，先过这条线。
+    """
+    from config.settings import AppConfig
+
+    for c in (LoopConfig(), AppConfig().trading_loop):
+        assert c.derisk_engage_pct >= 10.0, "介入线过低 = 顺周期，回测已证伪"
+        assert c.derisk_floor >= 0.5, "地板 < 0.5 = 接近清仓"
+        assert c.vol_scale_floor >= 0.5, "波动腿地板 < 0.5 = 波动一高就停手"
+        assert c.derisk_max_dd_pct > c.derisk_engage_pct, "斜坡上限必须大于介入线"
+
+
+def test_t3_off_mode_never_shrinks_even_at_deep_drawdown():
+    """开关关闭时，20% 回撤也必须返回 1.0（回滚路径必须真的关得掉）。"""
+    loop, acct = _loop_with_dd(1_000_000.0, 800_000.0, derisk_mode="off")
+    assert loop._portfolio_risk_scale(acct) == 1.0
+
+
+def test_t3_asymmetric_does_not_engage_below_engage_line():
+    """回撤 < 12% 完全不干预 —— 这是「非顺周期」与旧版的唯一区别所在。
+
+    旧的 portfolio_risk_scale 从 dd=0 就开始砍，8% 回撤时系数已 0.55；
+    本方案 8% 必须仍是 1.0，否则又变成「跌一点就缩手」。
+    """
+    loop, acct = _loop_with_dd(1_000_000.0, 920_000.0, derisk_mode="asymmetric")
+    assert loop._portfolio_risk_scale(acct) == 1.0
+    # 11.9% 也不该介入
+    loop2, acct2 = _loop_with_dd(1_000_000.0, 881_000.0, derisk_mode="asymmetric")
+    assert loop2._portfolio_risk_scale(acct2) == 1.0
+
+
+def test_t3_asymmetric_ramps_then_floors():
+    """12%→20% 线性压到 0.60；超过 20% 一直是 0.60（不清仓、不归零）。"""
+    loop, acct = _loop_with_dd(1_000_000.0, 840_000.0, derisk_mode="asymmetric")  # dd 16%
+    s16 = loop._portfolio_risk_scale(acct)
+    assert 0.60 < s16 < 1.0
+    assert s16 == pytest.approx(0.8, abs=0.02)
+
+    loop2, acct2 = _loop_with_dd(1_000_000.0, 700_000.0, derisk_mode="asymmetric")  # dd 30%
+    assert loop2._portfolio_risk_scale(acct2) == pytest.approx(0.60)
+
+
+def test_t3_asymmetric_ratchets_and_hysteresis():
+    """棘轮 + 滞回：介入后小反弹不放开，修到 10% 以下才完全回 1.0。
+
+    没有滞回就会出现「15% 减仓 → 反弹到 12.5% 满仓 → 再跌回 15% 再减仓」
+    的来回摩擦，正是顺周期最烧钱的地方。
+    """
+    loop, _ = _loop_with_dd(1_000_000.0, 840_000.0, derisk_mode="asymmetric")
+    assert loop._portfolio_risk_scale(_acct(840_000.0)) == pytest.approx(0.8, abs=0.02)
+    # 反弹到 88.5 万（dd 11.5%，已低于介入线但高于放开线 10%）
+    s = loop._portfolio_risk_scale(_acct(885_000.0))
+    assert s == pytest.approx(0.8, abs=0.02), "滞回区间内应保持介入以来的水平"
+    # 修到 9%（< 10% 放开线）→ 完全放开
+    assert loop._portfolio_risk_scale(_acct(910_000.0)) == 1.0
+
+
+class _Acct:
+    def __init__(self, total):
+        self.total_asset = float(total)
+
+
+def _acct(total: float):
+    return _Acct(total)
+
+
+def test_t3_vol_target_only_shrinks_and_fails_open():
+    """波动腿：高波动才缩，低波动绝不放杠杆；样本不足时不干预。"""
+    loop = mk_loop(broker=FakeBroker(total=1_000_000.0, cash=1_000_000.0),
+                   cfg=LoopConfig(auto_build_plan=False, dry_run=True,
+                                  vol_target_pct=15.0))
+    # 样本不足（< min_obs）→ fail-open
+    loop._day_start_equity = {"2026-01-0%d" % i: 1_000_000.0 for i in range(1, 6)}
+    assert loop._vol_target_scale() == 1.0
+
+    # 日波动 ±5% → 年化 ~80% → 0.15/0.80 低于地板 0.5 → 夹到 0.5
+    eq = {}
+    v = 1_000_000.0
+    for i in range(25):
+        eq["2026-02-%02d" % (i + 1)] = v
+        v *= 1.05 if i % 2 == 0 else 0.95
+    loop._day_start_equity = eq
+    assert loop._vol_target_scale() == pytest.approx(0.5)
+
+    # 日波动 ±0.3% → 年化 ~5% < 目标 15% → 只缩不放，返回 1.0
+    eq2 = {}
+    v = 1_000_000.0
+    for i in range(25):
+        eq2["2026-03-%02d" % (i + 1)] = v
+        v *= 1.003 if i % 2 == 0 else 0.997
+    loop._day_start_equity = eq2
+    assert loop._vol_target_scale() == 1.0
+
+
+def test_t3_blend_is_multiplicative_by_default():
+    """默认 mul（= 回测 E 方案口径）：两腿都在时系数是两者相乘。"""
+    loop, acct = _loop_with_dd(1_000_000.0, 700_000.0,
+                               derisk_mode="asymmetric", vol_target_pct=15.0)
+    eq = {}
+    v = 1_000_000.0
+    for i in range(25):
+        eq["2026-02-%02d" % (i + 1)] = v
+        v *= 1.05 if i % 2 == 0 else 0.95
+    loop._day_start_equity = eq
+    # 回撤 30% → 0.60；波动腿 → 0.50；mul → 0.30
+    assert loop._portfolio_risk_scale(acct) == pytest.approx(0.30)
+
+
+def test_from_app_config_restores_execution_object():
+    """回归：asdict 会把嵌套配置变 dict，必须还原成对象。
+
+    否则 ``getattr(dict, "smart_routing")`` 恒 False —— T2 智能下单
+    「配置里开了、进程里没开」，而且不报任何错。
+    """
+    import src.trading.loop as loopmod
+    from config.settings import ExecutionConfig, TradingLoopConfig
+
+    sec = TradingLoopConfig(
+        execution=ExecutionConfig(smart_routing=True, slice_strategy="vwap",
+                                  max_slices=6))
+    # asdict 只认真 dataclass，所以必须用 TradingLoopConfig 实例当替身
+    old = loopmod.app_config
+    try:
+        loopmod.app_config = type("C", (), {"trading_loop": sec})()
+        cfg = loopmod.LoopConfig.from_app_config()
+        assert isinstance(cfg.execution, ExecutionConfig)
+        assert cfg.execution.smart_routing is True
+        assert cfg.execution.slice_strategy == "vwap"
+        assert cfg.execution.max_slices == 6
+        # 且真的能建出调度器（原来 dict 时这里恒为 None）
+        loop = mk_loop(cfg=cfg)
+        assert loop._exec_scheduler is not None
+    finally:
+        loopmod.app_config = old
+
+
+def test_backtest_scripts_must_pass_production_slack():
+    """口径守卫：回测脚本必须显式传 hold_rank_slack，且等于生产值。
+
+    2026-11-03 踩过的坑：`ExecConfig.hold_rank_slack` 默认 **1.0**，而生产是 **3.0**。
+    一个漏传就让「波动率目标有效」的结论翻转成「无效」—— 同一批数据、同一个策略。
+    这类口径漂移在代码里看不出来（不报错、不告警），只能靠断言守着。
+    """
+    import re
+    from config.settings import AppConfig
+
+    prod = float(AppConfig().trading_loop.hold_rank_slack)
+    assert prod == 3.0, "生产 slack 变了就必须重新验证所有 slack 敏感结论"
+
+    for name in ("validate_risk_overlay.py", "exec_ab.py"):
+        p = ROOT / "scripts" / name
+        if not p.exists():
+            continue
+        src = p.read_text(encoding="utf-8")
+        hits = re.findall(r"hold_rank_slack\s*=\s*([0-9.]+)", src)
+        assert hits, f"{name} 没显式传 hold_rank_slack，会用 ExecConfig 默认 1.0"
+        assert any(abs(float(h) - prod) < 1e-9 for h in hits), (
+            f"{name} 里没有任何方案用生产值 {prod}")

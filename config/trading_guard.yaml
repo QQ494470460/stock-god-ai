@@ -38,8 +38,8 @@ max_daily_loss_abs_pct: 3.0         # 金额线 = 权益 × 3.0%（与比例线�
 # 无滞后带时解冻只需「回撤刚好不超 8%」，账户必然在 8% 线上反复横跳：
 # 10-26 收 7.54% 解冻 → 10-27 建仓 138 万 → 收 8.70% 再熔断 → 10-28 收 8.06%
 # （差 ¥2,754 未达线）。用户体感就是「怎么老是这样」。
-# 现在解冻要求回撤回落到 (8% − margin) 之下；margin=0 退回旧行为。
-auto_resume_drawdown_margin_pct: 2.0   # 滞后带：回撤需 < 6% 才解冻
+# 现在解冻要求回撤回落到 (熔断线 − margin) 之下（旧 8% 线时期即 8%−margin；当前 20% 线即 20%−2%=18%）；margin=0 退回旧行为。
+auto_resume_drawdown_margin_pct: 2.0   # 滞后带：回撤需 < (max_portfolio_drawdown_pct − 本值) = 20%−2% = 18% 才解冻
 auto_resume_throttle_days: 2.0         # 解冻后按「交易日」计的半仓冷静期（0=用 throttle_sec）
 auto_resume_throttle_sec: 1800         # 冷静期秒级兜底（throttle_days<=0 或日历不可用时）
 auto_resume_risk_fraction: 0.5         # 冷静期内下单强度折扣（半仓）

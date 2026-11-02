@@ -120,6 +120,9 @@ class ExecConfig:
     # 0 = 关闭。要复现实盘现状就设 dd_scale_floor=0.30 + halt_dd_pct=8.0。
     dd_scale_floor: float = 0.0        # 最深回撤时保留的敞口（0=关闭，实盘=0.30）
     dd_scale_at_pct: float = 8.0       # 回撤到该值降到 floor（实盘=熔断线 8%）
+    # 非顺周期关键旋钮：回撤到该值才开始降仓（0=从 0 开始，即旧的顺周期行为；
+    # 设 12 = 只在回撤≥12% 才介入，回撤 < 12% 满仓照跑）。与 T3 asymmetric_derisk_scale 口径一致。
+    dd_start_cut_pct: float = 0.0
     halt_dd_pct: float = 0.0           # >0 时回撤≥该值冻结整轮调仓（0=关闭，实盘=8.0）
 
     # ---- 撮合 ----
@@ -533,8 +536,9 @@ def run_exec_backtest(
                 # 渐进降仓（实盘 _portfolio_risk_scale 的等价物）：回撤越深，新仓越小。
                 # 注意它缩放的是**整个组合的敞口**，不是「这一笔」—— 与实盘一致。
                 if cfg.dd_scale_floor > 0:
-                    _span = max(float(cfg.dd_scale_at_pct), 1e-9)
-                    _prog = min(max(dd, 0.0) / _span, 1.0)
+                    _start = max(float(getattr(cfg, "dd_start_cut_pct", 0.0)), 0.0)
+                    _span = max(float(cfg.dd_scale_at_pct) - _start, 1e-9)
+                    _prog = min(max(dd - _start, 0.0) / _span, 1.0)
                     invest *= max(float(cfg.dd_scale_floor),
                                   1.0 - (1.0 - float(cfg.dd_scale_floor)) * _prog)
                 # 权重
