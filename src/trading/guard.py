@@ -157,8 +157,19 @@ class GuardConfig:
     auto_resume_cooldown_sec: int = 3600      # 熔断后至少冷却多久才允许自愈评估
     auto_resume_require_drawdown_clear: bool = True   # 自愈前回撤必须已回落到熔断线之下
     auto_resume_require_dailyloss_clear: bool = True  # 自愈前单日亏损必须已收复
-    auto_resume_throttle_sec: int = 1800      # 自愈后「降权冷静期」时长（throttle_days<=0 时生效）
-    auto_resume_risk_fraction: float = 0.5    # 冷静期内 signal_strength 折扣（部分解冻）
+    # ⚠️ 2026-11-04 起「降权冷静期」默认**关闭**（三条都置零/置一，双保险）。
+    #    它是第 15 处「实盘有、回测没有」的顺周期机制，而且是最典型的一处：
+    #    **按构造必然在谷底减仓** —— 熔断由深回撤触发，解冻发生在回撤刚修复时，
+    #    冷静期于是正好罩住「谷底后的第一个调仓日」。
+    #    1140 天实测（生产口径 c15，相位扫 0..14，10/30/50bp 三档）：
+    #      · 相位平均 −0.67pp 年化、最差相位 −3.27pp，最大回撤几乎不动
+    #        （−26.69% vs 基准 −26.84%，等于零保护）；
+    #      · offset=0 那一次真的撞上了：2022-04-26 回撤见底 −25.00% → 04-28 解冻
+    #        → 05-05 的调仓日被砍半 → 之后 15 天正是反弹最猛的一段
+    #        （回撤 14.76% → 6.14%），单次事件吃掉 6% 权益（年化 −1.42pp）。
+    #    保留旋钮与实现（可用于复盘/取证），只是默认不启用。
+    auto_resume_throttle_sec: int = 0         # 自愈后「降权冷静期」秒级兜底（0=不留窗口）
+    auto_resume_risk_fraction: float = 1.0    # 冷静期内 signal_strength 折扣（1.0=不折扣）
     # ★ 自愈滞后带：解冻要求回撤回落到「熔断线 − margin」之下，而不是「刚好不超线」。
     # 没有滞后带时账户必在 8% 线上反复横跳：实测 10-26 收 7.54% 解冻 → 10-27 建仓
     # 138 万 → 收 8.70% 再熔断 → 10-28 收 8.06%（差 ¥2,754 未达线），用户体感就是
@@ -166,7 +177,8 @@ class GuardConfig:
     auto_resume_drawdown_margin_pct: float = 2.0
     # 解冻后按**交易日**计的半仓冷静期（<=0 时退回 auto_resume_throttle_sec）。
     # 必须按交易日：周五解冻 + 2 个自然日 = 周日，等于没有冷静期。
-    auto_resume_throttle_days: float = 2.0
+    # 默认 0 = 关闭，理由见上面 auto_resume_risk_fraction 处的实测证据。
+    auto_resume_throttle_days: float = 0.0
 
     # ---- 持仓约束 ----
     max_positions: int = 20                  # 最大持仓只数

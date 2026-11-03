@@ -307,3 +307,131 @@ def test_max_sector_without_map_is_noop():
     a = run_exec_backtest(scores, ohlc, _cfg(**cfg_kw))
     b = run_exec_backtest(scores, ohlc, _cfg(max_sector_pct=0.30, industry_map=None, **cfg_kw))
     assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# 半仓冷静期（实盘 auto_resume_throttle_days / auto_resume_risk_fraction）
+# ---------------------------------------------------------------------------
+
+def test_resume_throttle_off_is_bit_identical():
+    """默认关闭必须零影响 —— 任何新增顺周期闸门都不能偷偷改历史结论。"""
+    scores, ohlc = _crash_panel()
+    a = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=1, daily_halt_pct=3.0))
+    b = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=1, daily_halt_pct=3.0,
+                                            resume_throttle_days=0,
+                                            resume_risk_fraction=0.5))
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+    assert a.metrics["throttle_rebalance_count"] == 0.0
+
+
+@pytest.mark.parametrize("days,expect", [(1, 1.0), (2, 2.0), (3, 3.0)])
+def test_resume_throttle_window_covers_exactly_n_days(days, expect):
+    """冷静期长度必须精确等于 N 个交易日 —— 少一天等于没测，多一天等于多扣。
+
+    面板里只有 i=10 这一天暴跌 -8%（触发熔断），i>=11 天天调仓，
+    所以「被打折的调仓次数」就是冷静期的天数。
+    """
+    scores, ohlc = _crash_panel()
+    m = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=1, daily_halt_pct=3.0,
+                                            resume_throttle_days=days,
+                                            resume_risk_fraction=0.5)).metrics
+    assert m["daily_halt_count"] >= 1.0
+    assert m["throttle_rebalance_count"] == expect
+
+
+def test_resume_throttle_costs_return_after_a_crash():
+    """半仓冷静期是纯拖累：熔断后正好半仓错过反弹，收益必须更低。
+
+    这就是它存在的意义 —— 量化「越跌越轻」的代价，而不是凭感觉保留它。
+
+    ⚠️ 必须用**换仓**面板，不能用单标的满仓：
+    引擎里 ``invest`` 缩放只作用在 ``tgt_v = tw*invest`` 的买入侧，
+    **不会因为目标变小就卖出**（这与实盘「只缩小新开仓的风险预算、
+    不强制减老仓」一致）。单标的满仓时目标永远低于现仓 ⇒ 一笔都不会成交，
+    实测 total_return 逐位相同（0.482 == 0.482），看起来像「没生效」。
+    必须让冷静期撞上一次「卖 A 买 B」，才看得出它只买了半个 B。
+    """
+    scores, ohlc = _rotation_panel()
+    base = run_exec_backtest(scores, ohlc, _cfg(top_n=1, rebalance_days=1,
+                                                daily_halt_pct=3.0))
+    thr = run_exec_backtest(scores, ohlc, _cfg(top_n=1, rebalance_days=1,
+                                               daily_halt_pct=3.0,
+                                               resume_throttle_days=2,
+                                               resume_risk_fraction=0.5))
+    assert thr.metrics["throttle_rebalance_count"] >= 1.0
+    assert thr.metrics["total_return"] < base.metrics["total_return"]
+
+
+def test_resume_dd_margin_extends_the_freeze():
+    """解冻滞后带：回撤回到「熔断线 - margin」以下才算解除，否则冻结天数被低估。
+
+    面板：涨到 10 → 跌到 8.8（回撤 12%，触发 10% 线）→ 反弹到 9.15（回撤 8.5%）。
+    margin=0 时 8.5% < 10% 立刻解冻；margin=2 时要跌破 8% 才解冻 ⇒ 冻结天数更多。
+    """
+    closes = [10.0] * 10 + [8.8] + [8.9] * 5 + [9.15] * 6
+    scores, ohlc = _panel(closes)
+    loose = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5, halt_dd_pct=10.0,
+                                                 resume_dd_margin_pct=0.0)).metrics
+    tight = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5, halt_dd_pct=10.0,
+                                                 resume_dd_margin_pct=2.0)).metrics
+    assert loose["halt_days_pct"] > 0.0
+    assert tight["halt_days_pct"] > loose["halt_days_pct"]
+
+
+def test_resume_dd_margin_default_is_identity():
+    """margin 默认 0，与旧口径（当日回撤低于线即解除）逐位相同。"""
+    closes = [10.0] * 10 + [8.8] + [8.9] * 5 + [9.15] * 6
+    scores, ohlc = _panel(closes)
+    a = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5, halt_dd_pct=10.0))
+    b = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5, halt_dd_pct=10.0,
+                                            resume_dd_margin_pct=0.0,
+                                            resume_throttle_days=0))
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# 调仓相位（检验「某条熔断线的成本」是不是相位运气）
+# ---------------------------------------------------------------------------
+
+def test_rebalance_offset_default_is_identity():
+    """offset=0 必须与旧口径（i % rebalance_days == 0）逐位相同。"""
+    scores, ohlc = _crash_panel()
+    a = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5))
+    b = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5, rebalance_offset=0))
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+def test_rebalance_offset_actually_shifts_trading_days():
+    """相位旋钮必须真的移动调仓日，否则「相位噪声」这件事根本测不出来。
+
+    背景：回撤熔断只在深回撤里触发，若那几天恰好没有调仓日，这条线的历史成本
+    就是 0 —— 那是运气不是安全。扫相位是唯一能把它变成分布的办法。
+    ⚠️ 必须用换仓面板：单标的满仓时每次调仓都是「继续持有」，
+    相位怎么移都不产生成交（实测逐位相同）。
+    """
+    scores, ohlc = _rotation_panel()
+    a = run_exec_backtest(scores, ohlc, _cfg(top_n=1, rebalance_days=5))
+    b = run_exec_backtest(scores, ohlc, _cfg(top_n=1, rebalance_days=5,
+                                             rebalance_offset=2))
+    assert not np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+def test_phase_sweep_exposes_hidden_halt_cost():
+    """相位扫描必须能把「单相位下零成本」的熔断线翻出真实拖累。
+
+    这条守的是方法论本身：任何「这条风控线不花钱」的结论，如果只在某一个
+    调仓相位上验证过，都不成立 —— 必须看它在全部相位上的分布。
+    换仓面板：A 暴跌 -8% 后阴跌、B 上涨；熔断线 8% 会被撞到，
+    但只有部分相位才会让「被冻结的调仓」与「本该发生的换仓」重合。
+    """
+    scores, ohlc = _rotation_panel()
+    diffs = []
+    for off in range(5):
+        base = run_exec_backtest(scores, ohlc,
+                                 _cfg(top_n=1, rebalance_days=5, rebalance_offset=off))
+        halt = run_exec_backtest(scores, ohlc,
+                                 _cfg(top_n=1, rebalance_days=5, rebalance_offset=off,
+                                      halt_dd_pct=8.0))
+        diffs.append(halt.metrics["total_return"] - base.metrics["total_return"])
+    assert any(abs(d) > 1e-9 for d in diffs), "全部相位都一样 ⇒ 熔断从未撞上调仓日，这条测试失去意义"
+    assert any(d < 0 for d in diffs), "熔断冻结了本该换仓的调仓日，至少一个相位必须更差"

@@ -1698,7 +1698,7 @@ def test_backtest_scripts_must_pass_production_slack():
     prod = float(AppConfig().trading_loop.hold_rank_slack)
     assert prod == 3.0, "生产 slack 变了就必须重新验证所有 slack 敏感结论"
 
-    for name in ("validate_risk_overlay.py", "exec_ab.py"):
+    for name in ("validate_risk_overlay.py", "exec_ab.py", "exec_phase.py"):
         p = ROOT / "scripts" / name
         if not p.exists():
             continue

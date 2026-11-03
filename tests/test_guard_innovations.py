@@ -430,3 +430,26 @@ def test_var_monitor_and_credibility_explicitly_off_in_production_yaml():
     cfg = yaml.safe_load(open("config/trading_guard.yaml", encoding="utf-8"))
     assert cfg.get("var_monitor_enabled") is False
     assert cfg.get("credibility_enabled") is False
+
+
+def test_heal_throttle_default_off():
+    """回归护栏：熔断自愈后的「半仓冷静期」默认关闭。
+
+    第 15 处顺周期机制，且是按构造必然在谷底减仓：熔断由深回撤触发、
+    解冻发生在回撤刚修复时，冷静期正好罩住「谷底后的第一个调仓日」。
+    1140 天实测（相位平均，10/30/50bp 三档）：−0.67pp 年化、最差相位 −3.27pp，
+    最大回撤几乎不动（−26.69% vs −26.84%）⇒ 换不来任何保护。
+    """
+    g = GuardConfig()
+    assert g.auto_resume_risk_fraction == 1.0, "冷静期折扣必须为 1.0（不折扣）"
+    assert g.auto_resume_throttle_days == 0.0, "冷静期交易日数必须为 0"
+    assert g.auto_resume_throttle_sec == 0, "秒级兜底也必须为 0，否则 days=0 时会漏出 30 分钟窗口"
+
+
+def test_heal_throttle_explicitly_off_in_production_yaml():
+    """生产权威配置必须显式写死 —— 否则改默认值会让这条负贡献规则悄然复活。"""
+    import yaml
+    cfg = yaml.safe_load(open("config/trading_guard.yaml", encoding="utf-8"))
+    assert cfg.get("auto_resume_risk_fraction") == 1.0
+    assert cfg.get("auto_resume_throttle_days") == 0.0
+    assert cfg.get("auto_resume_throttle_sec") == 0

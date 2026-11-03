@@ -47,6 +47,12 @@ class ExecConfig:
     # ---- 组合构建（与 trading_loop.* 对齐）----
     top_n: int = 8
     rebalance_days: int = 5
+    # 调仓相位偏移（0 = 从第 0 天起每 rebalance_days 天调一次，历史口径）。
+    # 存在的唯一目的：**检验「某条熔断线的成本」是不是相位运气**。
+    # 回撤熔断只在深回撤里触发，如果那几天恰好没有调仓日，这条线的历史成本
+    # 就是 0 —— 但这不是「安全」，是「这次没撞上」。扫 0..N-1 个相位才能看出
+    # 它的真实成本分布（实测 20% 线在 15 个相位里就会撞上）。
+    rebalance_offset: int = 0
     weighting: str = "equal"          # equal | risk_parity
     # 在风险权重之上叠加 alpha 倾斜（口径与 src/trading/optimizer.alpha_tilt 一致：
     # **按秩**而不是原始分做乘子，strength=0.25 表示最好的一只 ×1.25、最差 ×0.75）。
@@ -151,6 +157,20 @@ class ExecConfig:
     # 冷静期（signal_strength × 0.5）；这里用「多冻结 N 天」近似其收益拖累，
     # 因为半仓与冻结在「少赚」这个方向上同号，而冻结是它的上界。
     daily_halt_cooldown_days: int = 0
+
+    # ---- 熔断自愈后的「半仓冷静期」（第 15 处口径漂移）----
+    # 实盘 ``auto_resume_throttle_days=2`` + ``auto_resume_risk_fraction=0.5``：
+    # 熔断解除后头 2 个交易日只按一半风险预算开仓。这又是一条「越跌越轻」的
+    # 顺周期规则 —— 回测里从来没有，等于实盘多背了一个没人验证过的拖累。
+    # 上面的 ``daily_halt_cooldown_days`` 只是它的粗糙代理（把半仓当冻结），
+    # 真正的口径是「仓位打折」而不是「停止交易」，故单独建旋钮。
+    # 语义：任一熔断（回撤/单日）由「生效」翻转为「解除」的次日起，连续 N 个
+    # 交易日的目标敞口乘以 risk_fraction。0 / 1.0 = 关闭（默认）。
+    resume_throttle_days: int = 0
+    resume_risk_fraction: float = 1.0
+    # 解冻滞后带：回撤要回到 (熔断线 - margin) 以下才算解除（实盘 = 2.0）。
+    # 0 = 无滞后（当日回撤低于熔断线即解除），与历史口径逐位相同。
+    resume_dd_margin_pct: float = 0.0
 
     # ---- 撮合 ----
     buy_at: str = "next_open"         # next_open | close
@@ -367,6 +387,10 @@ def run_exec_backtest(
     n_halt_days = 0                # 被熔断冻结的天数（诊断「换了个策略」用）
     n_daily_halt = 0               # 单日亏损熔断触发次数（诊断用）
     daily_freeze_until = -1        # 单日亏损熔断冻结到的日索引（含）
+    dd_halted = False              # 回撤熔断的状态量（带滞后带，见下方状态机）
+    was_halted = False             # 昨日是否有任一熔断生效（识别「刚解除」）
+    throttle_until = -1            # 半仓冷静期覆盖到的日索引（含）
+    n_throttle_rebalances = 0      # 被打折的调仓次数（诊断用）
 
     def _fee(amount: float, is_sell: bool) -> float:
         f = max(cfg.min_commission, amount * cfg.commission)
@@ -507,7 +531,18 @@ def run_exec_backtest(
         # 实盘回撤只会比这里更深、熔断更早 ⇒ 下面的结论是**下界**。
         run_peak = max(run_peak, eq)
         dd = (1.0 - eq / run_peak) * 100.0 if run_peak > 0 else 0.0
-        _halted = bool(cfg.halt_dd_pct > 0 and dd >= cfg.halt_dd_pct)
+        # 回撤熔断是**状态量**，不是当日条件：实盘 ``halted`` 一旦置位，要等回撤
+        # 回到 (熔断线 - auto_resume_drawdown_margin_pct) 以下才解除。
+        # 两者之间的滞后带里状态仍为「冻结」—— 取当日条件会低估冻结天数。
+        # margin=0 时与旧口径（dd >= 线 即冻结）逐位相同。
+        if cfg.halt_dd_pct > 0:
+            if dd >= cfg.halt_dd_pct:
+                dd_halted = True
+            elif dd < max(float(cfg.halt_dd_pct) - max(float(cfg.resume_dd_margin_pct), 0.0), 1e-9):
+                dd_halted = False
+        else:
+            dd_halted = False
+        _halted = dd_halted
         if _halted:
             n_halt_days += 1
 
@@ -526,7 +561,17 @@ def run_exec_backtest(
         if _daily_halted:
             n_halt_days += 1
 
-        if (i % cfg.rebalance_days == 0 and i + 1 < n_days
+        # 半仓冷静期：任一熔断「由生效翻转成解除」的次日起，连续 N 个交易日
+        # 目标敞口打折（实盘 auto_resume_throttle_days=2 / risk_fraction=0.5）。
+        # 注意 days=1 表示只覆盖「解除后的第 1 天」，故窗口末端是 i + days - 1。
+        _halt_now = bool(_halted or _daily_halted)
+        if was_halted and not _halt_now and cfg.resume_throttle_days > 0:
+            throttle_until = max(throttle_until,
+                                 i + max(int(cfg.resume_throttle_days), 1) - 1)
+        was_halted = _halt_now
+        _throttled = i <= throttle_until
+
+        if ((i - int(cfg.rebalance_offset)) % cfg.rebalance_days == 0 and i + 1 < n_days
                 and not _halted and not _daily_halted):
             srow = Sa[i]
             ok = np.isfinite(srow)
@@ -586,6 +631,12 @@ def run_exec_backtest(
                     _prog = min(max(dd - _start, 0.0) / _span, 1.0)
                     invest *= max(float(cfg.dd_scale_floor),
                                   1.0 - (1.0 - float(cfg.dd_scale_floor)) * _prog)
+                # 半仓冷静期（顺周期）：熔断刚解除的 N 个交易日，目标敞口打折。
+                # 放在所有其它缩放之后、行业额度之前 —— 与实盘「先算风险预算、
+                # 再按 auto_resume_risk_fraction 打折」的顺序一致。
+                if _throttled and cfg.resume_risk_fraction < 1.0:
+                    invest *= max(float(cfg.resume_risk_fraction), 0.0)
+                    n_throttle_rebalances += 1
                 # 权重
                 if cfg.weighting == "risk_parity":
                     iv = []
@@ -722,4 +773,5 @@ def run_exec_backtest(
     m["fee_pct"] = float(fees_paid / capital)
     m["halt_days_pct"] = float(n_halt_days / max(n_days, 1))
     m["daily_halt_count"] = float(n_daily_halt)
+    m["throttle_rebalance_count"] = float(n_throttle_rebalances)
     return ExecResult(metrics=m, equity=eq_series, trades=tr, exit_stats=exit_stats)

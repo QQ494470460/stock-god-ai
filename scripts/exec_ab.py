@@ -97,6 +97,53 @@ SCENARIOS: dict[str, dict] = {
                            halt_dd_pct=15.0),
     "dd_halt20":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
                            halt_dd_pct=20.0),
+    # ---- 熔断自愈的完整生命周期（第 15 处口径漂移）----
+    # 生产现状的四件套：回撤熔断 20% + 解冻滞后带 2% + 自愈后 2 日半仓冷静期
+    # + 单日亏损熔断 5%。基准 = c15（不止损 + 15 日 + slack3）。
+    # ⚠️ halt_dd_pct=20 不是「理论上才有」的闸门：策略最大回撤 -25.5% ⇒
+    #    1140 天里必然撞线。以前所有「回测没有这条线」的结论都默认它零成本，未经验证。
+    "prod_risk":      dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=20.0, resume_dd_margin_pct=2.0,
+                           resume_throttle_days=2, resume_risk_fraction=0.5,
+                           daily_halt_pct=5.0),
+    "prod_halt20":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=20.0),
+    "prod_halt20_m2": dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=20.0, resume_dd_margin_pct=2.0),
+    "prod_throttle":  dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=20.0, resume_throttle_days=2,
+                           resume_risk_fraction=0.5),
+    "prod_thr_1d":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           daily_halt_pct=5.0, resume_throttle_days=1,
+                           resume_risk_fraction=0.5),
+    "prod_thr_3d":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           daily_halt_pct=5.0, resume_throttle_days=3,
+                           resume_risk_fraction=0.5),
+    "prod_thr_f75":   dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           daily_halt_pct=5.0, resume_throttle_days=2,
+                           resume_risk_fraction=0.75),
+    "prod_daily5":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           daily_halt_pct=5.0),
+    "prod_halt25":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=25.0, resume_dd_margin_pct=2.0,
+                           resume_throttle_days=2, resume_risk_fraction=0.5,
+                           daily_halt_pct=5.0),
+    "prod_halt30":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           halt_dd_pct=30.0, resume_dd_margin_pct=2.0,
+                           resume_throttle_days=2, resume_risk_fraction=0.5,
+                           daily_halt_pct=5.0),
+    # ---- 相位平均复核用（11-04 发现单相位结论会被 16.6pp 的相位噪声淹没）----
+    # 这三组当初都是在 offset=0 上单点选出来的，差值只有 1~4pp，必须用相位均值重判。
+    "tilt10":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           tilt_strength=0.10),
+    "tilt25":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           tilt_strength=0.25),
+    "cash00":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           cash_reserve_pct=0.0),
+    "cash05":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           cash_reserve_pct=0.05),
+    "cash15":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           cash_reserve_pct=0.15),
 }
 
 
