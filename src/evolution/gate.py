@@ -96,6 +96,11 @@ class GateCriteria:
     require_walk_forward: bool = False
     #: walk-forward 至少要在多少折上胜过基准（样本外胜率门槛）
     min_wf_folds: int = 3
+    #: 相位平均的抽样个数（1 = 只看第 0 个调仓相位，即旧行为）。
+    #   只把调仓日整体平移几天，本策略 1140 天的年化就在 12.7%~29.4% 之间跳，
+    #   单相位的配对差方向会随相位翻转 ⇒ 闸门会按 10~20% 的概率把噪声批成改进。
+    #   3 个相位把成本压到 6 次回测，已足够压掉大部分相位运气。
+    phase_samples: int = 3
 
     # ---- 第五层：回测-实盘一致性（防「回测很好看、实盘一直亏」的模拟失真）----
     #: 是否启用一致性校验。默认关闭 —— 真实业绩样本不足时它本来就会自动跳过，
@@ -168,6 +173,17 @@ BACKTEST_MAP: Dict[str, Tuple[str, type]] = {
     "trading_loop.min_trade_amount": ("min_trade_amount", float),
     "trading_loop.weighting": ("weighting", str),
     "trading_loop.tilt_strength": ("tilt_strength", float),
+    # ⚠️ 2026-11-04 补：这两个是**口径**而不是可进化参数（都不在参数空间里），
+    #    但必须出现在基准侧，否则闸门评估的是**另一套策略**：
+    #      · rebalance_days 缺省时 run_backtest 用 5 天周期，而生产是 15 天。
+    #        「5 天周期在结构上必亏」（边际收益 0.5% vs 往返成本 1.1%）——
+    #        等于拿一个必亏的策略去判断「改 max_positions 好不好」。
+    #      · hold_rank_slack 缺省时回测没有排名滞后这个概念，而生产是 3.0。
+    #        memory §11 的实测：同一批数据、同一个策略，slack 1→3 会把结论
+    #        **正反颠倒**（波动率目标在 slack1 下像正贡献、slack3 下全输）。
+    #    闸门是「决定什么上线」的路径，这里的口径漂移比回测脚本更贵。
+    "trading_loop.rebalance_days": ("rebalance_days", int),
+    "trading_loop.hold_rank_slack": ("hold_rank_slack", float),
 }
 
 
@@ -192,12 +208,28 @@ def map_changes(changes: List[Change]) -> Tuple[Dict[str, Any], List[str]]:
     return overrides, unmappable
 
 
+def _production_value(key: str):
+    """从生产配置（``config.settings.AppConfig``）读取 ``a.b.c`` 形式的生效值。
+
+    兜底顺序里的最后一环：外挂 overrides → 参数空间默认 → **生产配置**。
+    没有这一环，凡「不在可进化空间里、但会改变结果」的口径参数（周期、排名滞后）
+    都会落到 ``run_backtest`` 的隐式默认上，基准就变成了另一套策略。
+    """
+    from config.settings import AppConfig
+
+    obj = AppConfig()
+    for part in key.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
 def _current_backtest_params() -> Dict[str, Any]:
     """当前生效参数 → 回测参数（A/B 的基准侧）。
 
     取不到生效值时**回退到参数空间默认值**，绝不留给 ``run_backtest``
     的隐式默认（``top_n=20``）—— 那会让「基准」变成另一套参数，
-    A/B 对比就不再是 A/B。
+    A/B 对比就不再是 A/B。参数空间里也没登记的（口径类参数），
+    再回退到生产配置 ``AppConfig``。
     """
     from src.evolution.overrides import read_effective
 
@@ -209,7 +241,10 @@ def _current_backtest_params() -> Dict[str, Any]:
             try:
                 out[bt_key] = caster(space.get_default(key))
             except Exception:  # noqa: BLE001
-                logger.warning(f"无法确定 {key} 的基准值，A/B 对比将不可靠")
+                try:
+                    out[bt_key] = caster(_production_value(key))
+                except Exception:  # noqa: BLE001
+                    logger.warning(f"无法确定 {key} 的基准值，A/B 对比将不可靠")
     return out
 
 
@@ -418,21 +453,29 @@ def evaluate(
     cand_params = dict(base_params)
     cand_params.update(overrides)
 
-    base_metrics = _run(score_panel, close_panel, bench, base_params)
-    if base_metrics is None:
-        return _fail("gate:no-data", "基准参数回测失败（面板数据不足）")
-
-    cand_metrics = _run(score_panel, close_panel, bench, cand_params)
-    if cand_metrics is None:
-        return _fail("gate:no-data", "候选参数回测失败（面板数据不足）")
-
-    # 防「假阳性」：参数若对回测毫无影响，说明映射没生效
+    # 防「假阳性」：参数若对回测毫无影响，说明映射没生效。
+    # ⚠️ 必须在跑回测**之前**判 —— 否则每次都要白跑 2×phase_samples 次。
     touched = {k: (base_params.get(k), cand_params.get(k)) for k in overrides}
     if all(a == b for a, b in touched.values()):
         return _fail("gate:unmappable",
                      f"候选参数与当前值相同（{touched}），无对比可言")
 
+    phases = max(int(getattr(criteria, "phase_samples", 1)), 1)
+    base_metrics, cand_metrics, phase_sharpes = _ab_over_phases(
+        score_panel, close_panel, bench, base_params, cand_params, phases)
+    if base_metrics is None:
+        return _fail("gate:no-data", "基准参数回测失败（面板数据不足）")
+    if cand_metrics is None:
+        return _fail("gate:no-data", "候选参数回测失败（面板数据不足）")
+
     passed, reasons, delta = compare_metrics(base_metrics, cand_metrics, criteria)
+    # 相位一致性：均值过关但方向随相位翻转的，必须让人看见（不许静默放行）。
+    if phases > 1 and phase_sharpes:
+        neg = sum(1 for d in phase_sharpes if d < 0)
+        reasons.append(
+            f"相位平均：{phases} 个调仓相位的夏普差均值 {sum(phase_sharpes)/len(phase_sharpes):+.3f}"
+            f"，其中 {neg}/{len(phase_sharpes)} 个相位为负"
+            + ("（方向不一致，需人工复核）" if 0 < neg < len(phase_sharpes) else ""))
     if warnings:
         reasons = reasons + ["（提醒）" + w for w in warnings]
 
@@ -473,17 +516,70 @@ def evaluate(
 
 
 def _run(score_panel, close_panel, bench, params: Dict[str, Any]) -> Optional[Dict]:
-    """跑一次回测。``params`` 里的键直接作为 ``run_backtest`` 的组合参数。"""
-    try:
-        from src.core.backtest import run_backtest
+    """跑一次回测。``params`` 里的键直接作为 ``run_backtest`` 的组合参数。
 
-        kwargs = {k: v for k, v in params.items() if k in gate_backtest_keys()}
+    过滤依据是 ``BacktestConfig`` 的字段，而不是 ``BACKTEST_MAP`` 的值域 ——
+    后者只包含「可进化的参数」，而 ``rebalance_offset`` 这类**评估用旋钮**
+    也需要透传给引擎（相位平均要靠它）。
+    """
+    try:
+        from src.core.backtest import BacktestConfig, run_backtest
+
+        allowed = set(BacktestConfig.__dataclass_fields__)
+        kwargs = {k: v for k, v in params.items() if k in allowed}
         res = run_backtest(score_panel, close_panel, benchmark_close=bench, **kwargs)
         m = dict(res.metrics or {})
         return m if m.get("n_periods") else None
     except Exception as e:  # noqa: BLE001
         logger.warning(f"回测执行失败: {e}")
         return None
+
+
+def _mean_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把多个相位的指标按数值平均（非数值键取第一个）。"""
+    out: Dict[str, Any] = {}
+    keys = set().union(*[set(r) for r in runs])
+    for k in keys:
+        vals = [r.get(k) for r in runs]
+        nums = [float(v) for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if len(nums) == len(vals) and nums:
+            out[k] = sum(nums) / len(nums)
+        else:
+            out[k] = next((v for v in vals if v is not None), None)
+    return out
+
+
+def _ab_over_phases(
+    score_panel, close_panel, bench,
+    base_params: Dict[str, Any], cand_params: Dict[str, Any], phases: int,
+) -> Tuple[Optional[Dict], Optional[Dict], List[float]]:
+    """在多个调仓相位上做 A/B，返回 (基准均值, 候选均值, 逐相位夏普差)。
+
+    为什么必须相位平均：只把调仓日整体平移几天，本策略 1140 天的年化就能在
+    12.7%~29.4% 之间跳（离散 16.6pp）。单相位配对差的方向会随相位翻转
+    （实测某方案 15 个相位里 2 个为负、最差 −1.24pp、最好 +8.87pp），
+    于是闸门有 10~20% 的概率把「噪声」批成「改进」。
+
+    相位是同一份数据的重叠切分，不是独立样本 ⇒ 这里只做**均值**与**方向一致性**
+    统计，不做严格显著性检验。
+    """
+    base_runs: List[Dict[str, Any]] = []
+    cand_runs: List[Dict[str, Any]] = []
+    sharpes: List[float] = []
+    for off in range(max(int(phases), 1)):
+        b = _run(score_panel, close_panel, bench, {**base_params, "rebalance_offset": off})
+        c = _run(score_panel, close_panel, bench, {**cand_params, "rebalance_offset": off})
+        if b is None or c is None:
+            return None, None, []
+        base_runs.append(b)
+        cand_runs.append(c)
+        bs = b.get("sharpe")
+        cs = c.get("sharpe")
+        if isinstance(bs, (int, float)) and isinstance(cs, (int, float)):
+            sharpes.append(float(cs) - float(bs))
+    if not base_runs:
+        return None, None, []
+    return _mean_metrics(base_runs), _mean_metrics(cand_runs), sharpes
 
 
 def _walk_forward_verdict(

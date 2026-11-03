@@ -71,6 +71,17 @@ class BacktestConfig:
     # 但未实现浮盈 ≥ 该百分比时不强制卖出，保留漂移权重继续持有，其余目标仓位
     # 缩到剩余预算。0 = 关闭（默认，行为与历史完全一致）。
     hold_if_profitable_pct: float = 0.0
+    # 排名滞后（口径与 ``exec_backtest.hold_rank_slack`` 完全一致）：已持仓标的只要
+    # 仍排在 top_n × slack 名以内就继续持有，不因「跌出前 8」被换掉。1.0 = 关闭。
+    #
+    # 为什么这个引擎也必须有：进化闸门用本引擎给候选打分，而生产是 slack=3.0。
+    # 没有这个概念时，闸门等于在**另一套换手纪律**下评估候选 —— 而 §memory
+    # 已实测「同一批数据、同一个策略，slack 1→3 会把结论正反颠倒」（波动率目标
+    # 在 slack1 下像正贡献、slack3 下全输）。口径不一致的审批比不审批更危险。
+    hold_rank_slack: float = 1.0
+    # 调仓相位偏移（0 = 从第 0 天开始）。用于「相位平均」评估：只平移调仓日，
+    # 实测本策略 1140 天的年化就能在 12.7%~29.4% 之间跳，单相位 A/B 不可信。
+    rebalance_offset: int = 0
     tilt_strength: float = 0.0        # alpha 倾斜强度（risk 加权之上叠加，0=纯风险平价；真OOS验证 0.0 全面更优）
 
 
@@ -313,7 +324,7 @@ class WalkForwardBacktester:
         # 每只票的建仓成本价（用于「持有纪律」判定浮盈）。买入时记当日价，
         # 持有则保留，卖出则清除 —— 与实盘 paper 账户的 avg_cost 同口径。
         entry_price: Dict[str, float] = {}
-        i = 0
+        i = max(int(cfg.rebalance_offset), 0)
         n = len(dates)
         while i + cfg.rebalance_days < n:
             t = dates[i]
@@ -322,7 +333,23 @@ class WalkForwardBacktester:
             if len(srow) == 0:
                 i += cfg.rebalance_days
                 continue
-            top = srow.nlargest(min(cfg.top_n, len(srow))).index.tolist()
+            ranked = srow.sort_values(ascending=False)
+            top = ranked.index[: min(cfg.top_n, len(srow))].tolist()
+            # 排名滞后：语义与 ``exec_backtest`` 逐条对齐（同样的 keep_rank 边界、
+            # 同样的「先按当前排名留仓、再用榜单补位」顺序），否则两个引擎的
+            # 同名参数会给出不同答案。
+            if cfg.hold_rank_slack > 1.0 and w_held:
+                rank = {c: r for r, c in enumerate(ranked.index)}
+                keep_rank = int(round(cfg.top_n * cfg.hold_rank_slack))
+                held = [c for c in w_held if c in rank]
+                held.sort(key=lambda c: rank[c])
+                merged = [c for c in held if rank[c] < keep_rank][: cfg.top_n]
+                for c in top:
+                    if len(merged) >= cfg.top_n:
+                        break
+                    if c not in merged:
+                        merged.append(c)
+                top = merged
 
             # 目标权重（含现金保留与单票封顶）
             target = self._target_weights(srow, top, t_date=t)

@@ -419,7 +419,11 @@ def test_to_bt_params_uses_gate_map(env):
     assert p["top_n"] == 10
     assert p["band_pct"] == pytest.approx(0.25)
     assert p["weighting"] == "equal"
-    assert set(p) == gate.gate_backtest_keys()
+    # 这里只返回基因组自己的覆盖项 —— 生产口径（周期 / 排名滞后）由**闸门**
+    # 的基准侧负责，不在这里叠加。叠加会把 GA 的搜索空间压到「已是最优邻域」，
+    # 让它每轮空手而归（提案者失效，闸门再准也没东西可审）。详见 _to_bt_params 注释。
+    assert set(p) <= gate.gate_backtest_keys()
+    assert "rebalance_days" not in p and "hold_rank_slack" not in p
 
 
 def test_registered_in_registry():

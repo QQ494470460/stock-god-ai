@@ -496,3 +496,88 @@ def test_default_panel_provider_survives_a_broken_cache(monkeypatch):
 
     assert gate.default_panel_provider() is None
 
+
+
+# ------------------------------------------------------------------ 口径一致性（2026-11-04）
+
+def test_backtest_map_covers_the_two_caliber_params():
+    """周期与排名滞后必须进映射表 —— 它们是**口径**，不是可调参数。
+
+    缺 ``rebalance_days`` 时闸门用引擎默认 5 天周期，而生产是 15 天：
+    「5 天周期在结构上必亏」（边际收益 0.5% vs 往返成本 1.1%），
+    等于拿一个必亏的策略去判断「改 max_positions 好不好」。
+    缺 ``hold_rank_slack`` 时回测没有排名滞后概念，而生产是 3.0；
+    §memory 实测同一批数据 slack 1→3 会把结论正反颠倒。
+    """
+    assert gate.BACKTEST_MAP["trading_loop.rebalance_days"] == ("rebalance_days", int)
+    assert gate.BACKTEST_MAP["trading_loop.hold_rank_slack"] == ("hold_rank_slack", float)
+
+
+def test_current_backtest_params_matches_production_caliber():
+    """基准侧必须落到生产值，而不是回测引擎的隐式默认。
+
+    ``rebalance_days`` / ``hold_rank_slack`` 都**不在**可进化参数空间里，
+    所以取不到 overrides、也取不到 space 默认值 —— 必须由生产配置兜底。
+    没有这层兜底，两者会静默退到 5 / 1.0，基准就成了另一套策略。
+    """
+    from config.settings import AppConfig
+
+    p = gate._current_backtest_params()
+    loop = AppConfig().trading_loop
+    assert p["rebalance_days"] == int(loop.rebalance_days) == 15
+    assert p["hold_rank_slack"] == pytest.approx(float(loop.hold_rank_slack)) == 3.0
+    assert p["top_n"] == int(loop.max_positions)
+
+
+def test_phase_samples_default_is_more_than_one():
+    """默认必须相位平均：单相位的配对差方向会随相位翻转（实测最差 −1.24pp、
+    最好 +8.87pp），闸门会按 10~20% 的概率把噪声批成改进。"""
+    assert GateCriteria().phase_samples >= 3
+
+
+def test_ab_over_phases_sweeps_offsets_and_averages(monkeypatch):
+    """相位平均必须真的扫 0..k-1 并把指标取均值。"""
+    seen = []
+
+    # 用 top_n 是否被改成 1 来区分「候选」与「基准」
+    def fake(score, close, bench, params):
+        seen.append(params["rebalance_offset"])
+        cand = params.get("top_n") == 1
+        base_s = 1.0
+        cand_s = 1.0 + (0.4 if params["rebalance_offset"] % 2 == 0 else -0.1)
+        return {"n_periods": 30, "sharpe": cand_s if cand else base_s,
+                "ann_return": 0.1, "ann_vol": 0.15, "max_drawdown": -0.1}
+
+    monkeypatch.setattr(gate, "_run", fake)
+    b, c, diffs = gate._ab_over_phases(None, None, None,
+                                       {"top_n": 8}, {"top_n": 1}, 4)
+    assert seen == [0, 0, 1, 1, 2, 2, 3, 3], "每个相位都要跑基准与候选各一次"
+    assert b["sharpe"] == pytest.approx(1.0)
+    assert c["sharpe"] == pytest.approx(1.0 + 0.15)
+    assert diffs == pytest.approx([0.4, -0.1, 0.4, -0.1])
+
+
+def test_evaluate_reports_phase_agreement(monkeypatch):
+    """判定理由里必须写明相位均值与「几个相位方向相反」。
+
+    方向随相位翻转却只报一个漂亮的单点，是这套闸门最隐蔽的失效方式。
+    """
+    monkeypatch.setattr(gate, "_current_backtest_params",
+                        lambda: {"top_n": 20})
+
+    def fake(score, close, bench, params):
+        cand = params.get("top_n") == 5
+        off = params.get("rebalance_offset", 0)
+        base_s = 1.0
+        cand_s = 1.5 if off == 0 else (0.8 if off == 1 else 1.4)
+        return {"n_periods": 30, "sharpe": cand_s if cand else base_s,
+                "ann_return": 0.10 + (0.05 if cand else 0.0),
+                "ann_vol": 0.15, "max_drawdown": -0.10}
+
+    monkeypatch.setattr(gate, "_run", fake)
+    ev = gate.evaluate(_cand([Change("trading_loop.max_positions", 20, 5)]),
+                      provider=_provider(_panels()))
+    txt = " ".join(ev.reasons)
+    assert "相位平均" in txt
+    assert "1/3" in txt, "必须报出方向相反的相位个数"
+    assert "方向不一致" in txt

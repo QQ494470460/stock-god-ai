@@ -427,7 +427,22 @@ def generate(
 
 
 def _to_bt_params(genome: Dict[str, Any]) -> Dict[str, Any]:
-    """基因组 → ``run_backtest`` 形参（复用闸门的映射表，保持单一来源）。"""
+    """基因组 → ``run_backtest`` 形参（复用闸门的映射表，保持单一来源）。
+
+    ⚠️ 这里**故意只返回基因组自己的覆盖项**，不叠加生产基准。职责划分：
+
+    · GA 是**提案者**。它对同一块面板、同一套口径下的一批基因组做**相对排序**，
+      目标是「在这一批里挑出最好的那个」；口径在批内是恒定的，故不影响排序本身。
+    · 「能不能上线」由**闸门**决定，而闸门的基准侧已经对齐生产口径
+      （``_current_backtest_params`` 会带上 ``rebalance_days=15`` 与
+      ``hold_rank_slack=3.0``，见 gate.py 的注释与
+      ``test_current_backtest_params_matches_production_caliber``）。
+
+    试过在这里也叠加生产基准，结果是把 GA 的搜索空间压到「当前配置已是最优邻域」
+    （合成面板上十次评估一个都赢不了）。因为真正常被 GA 提议的基因
+    （持仓数 / 容忍带 / 现金比例）会被生产口径的换手纪律吃掉，
+    于是 GA 每轮都空手而归 —— 提案者失效，闸门再准也没东西可审。
+    """
     from src.evolution.types import Change
 
     overrides, unmappable = gate.map_changes(

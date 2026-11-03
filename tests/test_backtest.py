@@ -151,3 +151,77 @@ def test_backtest_risk_parity_fallback_safe():
     cfg = BacktestConfig(top_n=4, rebalance_days=5, weighting="risk_parity", tilt_strength=0.25)
     res = WalkForwardBacktester(cfg).backtest_scores(scores, close)
     assert res.metrics is not None  # 不抛异常即通过
+
+
+# ---------------------------------------------------------------------------
+# 排名滞后 / 调仓相位（口径与 exec_backtest 对齐，2026-11-04）
+# ---------------------------------------------------------------------------
+
+def _rank_panel(n_days: int = 60, n_codes: int = 12):
+    """质量单调的面板：代码 0 最好、代码 n-1 最差，收益与质量成正比。"""
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-01", periods=n_days)
+    codes = [f"{600000 + i}" for i in range(n_codes)]
+    quality = np.linspace(1.0, 0.0, n_codes)
+    close = pd.DataFrame(1.0, index=dates, columns=codes)
+    for j, c in enumerate(codes):
+        r = 0.004 * quality[j] + rng.normal(0, 0.0008, len(dates))
+        close[c] = (1 + r).cumprod()
+    score = pd.DataFrame(np.tile(quality * 100.0, (n_days, 1)),
+                         index=dates, columns=codes)
+    return score, close
+
+
+def _bt_cfg(**kw):
+    base = dict(top_n=3, rebalance_days=5, commission=0.0, min_commission=0.0,
+                stamp_tax=0.0, slippage=0.0, weighting="equal")
+    base.update(kw)
+    return BacktestConfig(**base)
+
+
+def test_hold_rank_slack_default_is_bit_identical():
+    """slack=1.0 = 关闭，必须与旧口径逐位相同（新增旋钮不许改历史结论）。
+
+    ⚠️ 不能直接比 ``metrics`` 字典：里面含 NaN，而 ``NaN != NaN``
+    会让「完全一样」的两个结果被判成不同。
+    """
+    score, close = _rank_panel()
+    a = WalkForwardBacktester(_bt_cfg()).backtest_scores(score, close)
+    b = WalkForwardBacktester(_bt_cfg(hold_rank_slack=1.0)).backtest_scores(score, close)
+    assert a.metrics["n_periods"] == b.metrics["n_periods"]
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+    for k, v in a.metrics.items():
+        w = b.metrics[k]
+        assert (v == w) or (pd.isna(v) and pd.isna(w)), f"{k}: {v} != {w}"
+
+
+def test_hold_rank_slack_lowers_turnover():
+    """slack>1 必须真的降低换手 —— 否则闸门里这个参数形同虚设。
+
+    面板用**缓慢漂移**的榜单（峰值每期右移一位，分数 = −(代码序号−峰值)²）：
+    无 slack 时每期换掉一只，有 slack（top_n=3、slack=3 ⇒ 保留线第 9 名）时
+    上一期的三只仍在保留线内，几乎不换。
+    ⚠️ 这里踩过两次坑：①「整体倒转」的榜单会让老仓直接掉到第 10 名以后，
+    全部超出保留线 ⇒ slack 完全无效（换手逐位相同）；②「整体 roll 一位」同理，
+    因为最差的那只被瞬移到榜首。只有**平滑漂移**的榜单才测得出来。
+    """
+    score, close = _rank_panel(n_days=60, n_codes=12)
+    idx = np.arange(12, dtype=float)
+    for k, i in enumerate(range(0, len(score), 5)):
+        row = -(idx - float(k)) ** 2
+        score.iloc[i] = row
+        score.iloc[min(i + 4, len(score) - 1)] = row
+    tight = WalkForwardBacktester(_bt_cfg()).backtest_scores(score, close).metrics
+    loose = WalkForwardBacktester(_bt_cfg(hold_rank_slack=3.0)).backtest_scores(
+        score, close).metrics
+    assert loose["n_periods"] == tight["n_periods"]
+    assert loose["turnover"] < tight["turnover"], "slack 没降低换手 ⇒ 参数没生效"
+
+
+def test_rebalance_offset_shifts_the_start():
+    """相位必须真的移动 —— 否则闸门的「相位平均」只是把同一次回测跑三遍。"""
+    score, close = _rank_panel()
+    a = WalkForwardBacktester(_bt_cfg()).backtest_scores(score, close)
+    b = WalkForwardBacktester(_bt_cfg(rebalance_offset=2)).backtest_scores(score, close)
+    assert a.metrics != b.metrics or \
+        not np.allclose(a.equity.values, b.equity.values, equal_nan=True)
