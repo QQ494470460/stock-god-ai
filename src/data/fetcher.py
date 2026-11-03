@@ -454,8 +454,22 @@ class DataFetcher:
         """
         从新浪数据源（AKShare stock_zh_a_daily）获取个股历史日K线
         优点：返回多年完整历史（2018至今），价格真实复权，稳定不拒连
+
+        交易所前缀规则（曾全错在 920 段）
+        --------------------------------
+        原实现 "6/9 开头→sh，其余→sz" 把北交所 920xxx 当成沪市，
+        请求 sh920000 永远返回空，导致 354 只北交所股票长期无数据
+        且每次都要白跑一次网络。正确映射：
+          · 4xxxxx / 8xxxxx / 920xxx → bj（北交所）
+          · 6xxxxx / 9xxxxx(900 B股) → sh
+          · 其余（0/2/3）           → sz
         """
-        market = "sh" if code.startswith(("6", "9")) else "sz"
+        if code.startswith(("4", "8")) or code.startswith("920"):
+            market = "bj"
+        elif code.startswith(("6", "9")):
+            market = "sh"
+        else:
+            market = "sz"
         symbol = f"{market}{code}"
         start = start_date.replace("-", "")
         end = datetime.now().strftime("%Y%m%d")

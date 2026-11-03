@@ -253,10 +253,11 @@ class PredictorV2:
 
     def _reliability_note(self, code, latest, wide, stock_data) -> tuple:
         """
-        基于历史样本外表现给出可靠性提示，而不是模型自评置信度
+        基于历史**扣成本后**的表现给可靠性提示，而不是模型自评置信度
 
-        诚实很重要：模型说"我有90%把握"是没意义的，
-        唯一有意义的是"这个信号历史上样本外 IC 是多少"。
+        诚实很重要：模型说"我有90%把握"是没意义的；只说 IC 也不够 ——
+        IC 0.03 看着像"有信号"，但把它换算成年化超额再扣掉换手成本，
+        很可能就是负的。这里直接按成本模型算净超额，标签跟着净额走。
         """
         ic = self.metrics.get("oos_rank_ic")
         ex = self.metrics.get("oos_top_excess")
@@ -267,10 +268,21 @@ class PredictorV2:
                 else "暂无历史验证数据"
             )
 
-        ex_s = f"{ex:+.3%}" if ex is not None else "n/a"
-        if abs(ic) >= 0.03:
-            return "较强", f"样本外IC={ic:+.3f}，Top20单期超额{ex_s}"
-        return "一般", f"样本外IC={ic:+.3f}，信号强度有限"
+        h = int(self.metrics.get("horizon", 5) or 5)
+        gross = float(ex) * (252 / h) if ex is not None else float("nan")
+        cost = (252 / h) * 0.00202          # 中性双边成本 0.202%
+        net = gross - cost
+
+        if net != net:                       # NaN 兜底
+            return "一般", f"样本外IC={ic:+.3f}，缺收益口径，无法评估净超额"
+
+        detail = (f"样本外IC={ic:+.3f}；{h}日换仓年化毛超额{gross:+.2%}"
+                  f"，扣成本约{net:+.2%}")
+        if net > 0.02:
+            return "正优势", detail
+        if net > 0:
+            return "边际", detail
+        return "无成本优势", detail
 
     def model_report(self) -> str:
         """输出模型真实表现的报告"""

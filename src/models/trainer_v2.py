@@ -73,6 +73,7 @@ class WalkForwardResult:
     oos_max_drawdown: float = np.nan
     oos_accuracy: float = np.nan         # 仅作参考，非核心指标
     n_oos_samples: int = 0
+    horizon: int = 5                     # 标签窗口，决定"单期"是多长
 
     # 特征重要性
     feature_importance: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -84,7 +85,7 @@ class WalkForwardResult:
             f"模型: {self.model_name}",
             f"  样本外 RankIC      {self.oos_rank_ic:+.4f}",
             f"  IC_IR              {self.oos_ic_ir:+.2f}",
-            f"  Top20 单期超额     {self.oos_top_excess:+.4%}   (每5日，相对全市场均值)",
+            f"  Top20 单期超额     {self.oos_top_excess:+.4%}   (每{self.horizon}日，相对全市场均值)",
             f"  超额胜率           {self.oos_win_rate:.1%}   (跑赢全市场的天数占比)",
             f"  超额最大回撤       {self.oos_max_drawdown:.2%}   (相对基准的累计回撤)",
             f"  五档分类准确率     {self.oos_accuracy:.1%}   (随机猜=20%)",
@@ -92,6 +93,8 @@ class WalkForwardResult:
             "",
             "  以上均为 walk-forward 样本外指标：训练/验证严格按日期切分，",
             "  scaler 仅用训练段拟合，SMOTE 已替换为 class_weight。",
+            "  评估每隔 horizon 个交易日取一个观测（去除重叠窗口），",
+            "  否则同一段5日收益会被重复计入5次，回撤与IC_IR都被放大。",
             "  超额收益未扣手续费与冲击成本；不做复利年化（超额序列不可直接复利）。",
         ]
         return "\n".join(lines)
@@ -394,6 +397,27 @@ class LeakSafeTrainer:
             acc = accuracy_score(y_va, y_pred_cls)
             f1 = f1_score(y_va, y_pred_cls, average="macro")
 
+            # 逐折 RankIC：判断信号是"每年都在"还是"只靠某一段"
+            # 同样按 horizon 去重叠，否则重叠窗口会让单折 IC 看起来很稳
+            fold_ic = np.nan
+            try:
+                if "__code__" in va.columns and len(va) > 200:
+                    _f = pd.DataFrame({
+                        "date": pd.to_datetime(va["__date__"].values),
+                        "code": va["__code__"].astype(str).values,
+                        "score": strength,
+                        "lab": y_va,
+                    })
+                    _sp = _f.pivot(index="date", columns="code", values="score")
+                    _lp = _f.pivot(index="date", columns="code", values="lab")
+                    _h = max(int(self.horizon), 1)
+                    _sp = _sp.iloc[::_h]
+                    _lp = _lp.loc[_sp.index]
+                    if len(_sp) >= 10:
+                        fold_ic, _, _ = mean_rank_ic(_sp, _lp)
+            except Exception as e:
+                logger.debug(f"  折内 RankIC 计算失败: {e}")
+
             oof_feat_imp += np.asarray(model.feature_importances_, dtype=float)
 
             fold_rows.append({
@@ -404,10 +428,11 @@ class LeakSafeTrainer:
                 "n_valid": len(va),
                 "accuracy": acc,
                 "f1_macro": f1,
+                "rank_ic": float(fold_ic) if fold_ic == fold_ic else None,
             })
             logger.info(
                 f"  Fold {sp.fold+1}: train={len(tr)} valid={len(va)} "
-                f"acc={acc:.4f} f1={f1:.4f}"
+                f"acc={acc:.4f} f1={f1:.4f} ric={fold_ic:+.4f}"
             )
 
         if not fold_rows:
@@ -447,13 +472,30 @@ class LeakSafeTrainer:
             sp_pivot = pd.DataFrame()
             rt_pivot = pd.DataFrame()
 
+        # ---------- 重叠窗口去重（关键口径）----------
+        # 标签是"未来 horizon 日收益"，但样本是**逐日**生成的：
+        # 相邻两个观测的收益窗口有 (horizon-1)/horizon 的重叠。
+        # 直接按日累计，等于把同一个 5 日收益重复计入 5 次 ——
+        # 累计超额、最大回撤被放大 5 倍，IC_IR 也被虚高
+        #（分母低估，因为重叠样本不是独立观测）。
+        #
+        # 评估口径统一改成"每 horizon 个交易日取一个"，只保留不重叠观测。
+        # 训练仍然用全部逐日样本（样本多有益），只是**度量**时去重。
+        _h = max(int(getattr(self, "horizon", 5)), 1)
+        if len(sp_pivot) > _h * 3:
+            _idx = sp_pivot.index[::_h]
+            sp_eval = sp_pivot.loc[_idx]
+            rt_eval = rt_pivot.loc[_idx]
+        else:
+            sp_eval, rt_eval = sp_pivot, rt_pivot
+
         # ---------- RankIC ----------
         # RankIC 只需要"单调对应关系"，用档位标签算IC 没问题
         #（Spearman 只看秩，不看数值）
-        if len(sp_pivot) >= 30:
-            ic, ic_ir, n_days = mean_rank_ic(sp_pivot, rt_pivot)
+        if len(sp_eval) >= 30:
+            ic, ic_ir, n_days = mean_rank_ic(sp_eval, rt_eval)
         else:
-            ic, ic_ir, n_days = np.nan, np.nan, len(sp_pivot)
+            ic, ic_ir, n_days = np.nan, np.nan, len(sp_eval)
 
         # Top-N 组合绩效
         #
@@ -465,9 +507,9 @@ class LeakSafeTrainer:
         #
         # 所以必须传入真实的前瞻超额收益矩阵，只用它算组合收益；
         # RankIC 仍可用档位（Spearman 只看秩）。
-        if len(sp_pivot) >= 30 and fwd_excess is not None:
-            fwd = fwd_excess.reindex(index=sp_pivot.index, columns=sp_pivot.columns)
-            daily = top_portfolio_return(sp_pivot, fwd, top_n=20)
+        if len(sp_eval) >= 30 and fwd_excess is not None:
+            fwd = fwd_excess.reindex(index=sp_eval.index, columns=sp_eval.columns)
+            daily = top_portfolio_return(sp_eval, fwd, top_n=20)
             ex_metrics = portfolio_metrics(daily["excess"], periods_per_year=1)
             final_metrics = {
                 "mean_period_ret": ex_metrics["mean_period_ret"],
@@ -506,6 +548,7 @@ class LeakSafeTrainer:
             oos_max_drawdown=final_metrics.get("max_drawdown", np.nan),
             oos_accuracy=oos_accuracy,
             n_oos_samples=n_oos,
+            horizon=int(getattr(self, "horizon", 5)),
             feature_importance=imp_df,
         )
 
@@ -542,6 +585,7 @@ class LeakSafeTrainer:
         import json
         metrics = {
             "model": result.model_name,
+            "horizon": int(getattr(result, "horizon", 5)),
             "oos_rank_ic": result.oos_rank_ic,
             "oos_ic_ir": result.oos_ic_ir,
             "oos_top_excess": result.oos_top_excess,

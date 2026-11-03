@@ -126,3 +126,123 @@ def test_top_n_requires_enough_universe():
     scores, ohlc = _panel([10.0] * 10)
     res = run_exec_backtest(scores, ohlc, _cfg(top_n=3))
     assert res.metrics.get("n_trades", 0) == 0
+
+
+# ======================================================================
+# 单日亏损熔断（ExecConfig.daily_halt_pct）
+# 实盘 guard.max_daily_loss_pct 的等价物 —— 11 处漂移之外的第 12 处
+# ======================================================================
+
+def _crash_panel(rebound: bool = True):
+    """先平盘、第 11 天暴跌 -8%、随后反弹（可选）的单标的面板。
+
+    暴跌必须发生在**已持仓**之后，否则空仓状态下权益不动，
+    日收益恒为 0，熔断永远不会触发 —— 这是这类测试最容易写错的地方。
+    """
+    closes = [10.0] * 10 + [9.2] + [9.2] * 4
+    if rebound:
+        closes += [10.12, 11.13, 12.24, 13.47, 14.82]
+    closes += [closes[-1]] * 5
+    return _panel(closes)
+
+
+def test_daily_halt_off_by_default_is_bit_identical():
+    """默认 0 = 关闭：必须与完全不带该参数的旧口径逐位相同。
+
+    这条守的是「加了个新旋钮却没有偷偷改变历史结论」——
+    任何新增风控都必须先证明自己是零影响的。
+    """
+    scores, ohlc = _crash_panel()
+    a = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5))
+    b = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5,
+                                           daily_halt_pct=0.0,
+                                           daily_halt_cooldown_days=0))
+    assert a.metrics["ann_return"] == pytest.approx(b.metrics["ann_return"])
+    assert a.metrics["daily_halt_count"] == 0.0
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+def test_daily_halt_triggers_on_big_down_day():
+    """单日暴跌 8% 必须触发（3% 线）。"""
+    scores, ohlc = _crash_panel()
+    m = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5,
+                                            daily_halt_pct=3.0)).metrics
+    assert m["daily_halt_count"] >= 1.0
+    assert m["halt_days_pct"] > 0.0
+
+
+def test_daily_halt_ignores_normal_volatility():
+    """日常 ±0.5% 的波动绝不能触发 —— 阈值不能宽到「跌一点就拉闸」。
+
+    实盘 3% 线的教训：线设在策略正常日波动之内，就会每个季度付一次费。
+    """
+    closes = [10.0]
+    for i in range(30):
+        closes.append(closes[-1] * (1.005 if i % 2 == 0 else 0.995))
+    scores, ohlc = _panel(closes)
+    m = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5,
+                                            daily_halt_pct=3.0)).metrics
+    assert m["daily_halt_count"] == 0.0
+
+
+def _rotation_panel():
+    """双标的「暴跌日恰逢排行榜互换」面板 —— 专门用来证明熔断真的拦住了换仓。
+
+    为什么不能只用单标的：i=0 就建好仓，之后每次调仓都是「继续持有」，
+    冻结它不会产生任何成交差异，测出来永远是「一样」。
+    必须让被冻结的那次调仓**本来要换票**，才看得出区别。
+
+      i=0..9  A 分高 → 持有 A；i=10 起 B 分高（本该卖 A 买 B）
+      i=10    A 暴跌 -8%（触发熔断），之后 A 阴跌、B 上涨
+    """
+    n = 30
+    idx = pd.bdate_range("2026-01-05", periods=n)
+    a = [10.0] * 10 + [9.2] + [9.2 * (0.99 ** k) for k in range(1, 20)]
+    b = [10.0] * 11 + [10.0 * (1.01 ** k) for k in range(1, 20)]
+    a, b = a[:n], b[:n]
+    sc = pd.DataFrame({
+        "A": [1.0] * 10 + [0.0] * (n - 10),
+        "B": [0.0] * 10 + [1.0] * (n - 10),
+    }, index=idx)
+    mk = lambda arr, code: pd.DataFrame({code: arr}, index=idx)  # noqa: E731
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    ohlc = {
+        "open": pd.concat([mk(a, "A"), mk(b, "B")], axis=1),
+        "close": pd.concat([mk(a, "A"), mk(b, "B")], axis=1),
+        "high": pd.concat([mk(a * 1.005, "A"), mk(b * 1.005, "B")], axis=1),
+        "low": pd.concat([mk(a * 0.995, "A"), mk(b * 0.995, "B")], axis=1),
+        "volume": pd.concat([mk(np.full(n, 1e6), "A"), mk(np.full(n, 1e6), "B")], axis=1),
+    }
+    return sc, ohlc
+
+
+def test_daily_halt_freezes_the_rebalance_that_day():
+    """熔断当日必须**跳过调仓**（顺延到下一个调仓日），不是只记个数。
+
+    构造：i=10 既是调仓日、又是排行榜互换日、还是 A 暴跌 -8% 的那天。
+    关闭 → 次日卖 A 买 B，之后吃 B 的上涨；
+    开启 → 当日冻结，继续死抱下跌的 A 直到 i=15 ⇒ 期末权益必然更低。
+    这正是实盘 3% 线吃掉年化 2.7pp 的机理：**冻结调仓 = 把亏损组合锁死**。
+    """
+    scores, ohlc = _rotation_panel()
+    off = run_exec_backtest(scores, ohlc, _cfg(top_n=1, rebalance_days=5))
+    on = run_exec_backtest(scores, ohlc,
+                           _cfg(top_n=1, rebalance_days=5, daily_halt_pct=3.0))
+    assert on.metrics["daily_halt_count"] >= 1.0
+
+    end_off = float(off.equity.dropna().iloc[-1])
+    end_on = float(on.equity.dropna().iloc[-1])
+    assert end_on != pytest.approx(end_off), "冻结没改变成交时点，说明没真正拦住调仓"
+    assert end_on < end_off, "被冻结的换仓错过了替代标的的上涨，权益应更低"
+
+
+def test_daily_halt_cooldown_extends_freeze():
+    """冷却期必须真的多冻结几天（实盘解冻后的半仓冷静期用这个近似）。"""
+    scores, ohlc = _crash_panel()
+    base = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5,
+                                               daily_halt_pct=3.0,
+                                               daily_halt_cooldown_days=0)).metrics
+    cooled = run_exec_backtest(scores, ohlc, _cfg(rebalance_days=5,
+                                                 daily_halt_pct=3.0,
+                                                 daily_halt_cooldown_days=3)).metrics
+    assert cooled["halt_days_pct"] > base["halt_days_pct"]

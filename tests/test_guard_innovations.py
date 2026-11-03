@@ -187,8 +187,12 @@ def test_heal_condition_not_cleared_on_drawdown(sup):
 def test_heal_condition_not_cleared_on_daily_loss(sup):
     sup.safety._state.peak_equity = 1_000_000.0
     sup.safety._state.today_start_equity = 1_000_000.0
-    # 当日亏损 3% ≤ -3% → 未清除
-    assert sup._heal_condition_cleared(970_000.0) is False
+    # 从配置推导，别写死数值：2026-11-03 把线从 3% 提到 5% 时，
+    # 写死 -3% 的断言就变成了「假失败」（行为没坏，只是数字变了）。
+    pct = float(sup.safety.config.max_daily_loss_pct)
+    assert sup._heal_condition_cleared(1_000_000.0 * (1 - pct / 100.0)) is False
+    # 亏得比线浅 → 条件已清除（守住「不是永远 False」这一半）
+    assert sup._heal_condition_cleared(1_000_000.0 * (1 - pct / 100.0 + 0.01)) is True
 
 
 def test_heal_throttle_reduces_signal_strength(sup):
@@ -235,18 +239,38 @@ def test_set_regime_revert_needs_hold_days(sup):
 def test_effective_daily_loss_uses_market_vol(sup):
     sup.config.adaptive_kill_switch = True
     sup.config.kill_switch_ref_vol_pct = 1.5
-    # 未推送波动 → 静态 3.0
+    base = float(sup.config.max_daily_loss_pct)
+    # 未推送波动 → 静态配置值
     sup.set_market_vol(None)
-    assert sup._effective_daily_loss_pct() == pytest.approx(3.0)
-    # 高波动 → 放宽（ratio 2.0 截到 1.5 → 4.5，封顶 4.5）
+    assert sup._effective_daily_loss_pct() == pytest.approx(base)
+    # 高波动 → 放宽（ratio 2.0 截到 1.5）
     sup.set_market_vol(3.0)
-    assert sup._effective_daily_loss_pct() == pytest.approx(4.5)
-    # 低波动 → 收紧（ratio 0.5 截到 0.7 → 2.1）
+    assert sup._effective_daily_loss_pct() == pytest.approx(
+        min(base * 1.5, sup.config.kill_switch_cap_pct))
+    assert sup._effective_daily_loss_pct() > base, "高波动必须放宽，不能被 cap 反向压紧"
+    # 低波动 → 收紧（ratio 0.5 截到 0.7）
     sup.set_market_vol(0.75)
-    assert sup._effective_daily_loss_pct() == pytest.approx(2.1)
+    assert sup._effective_daily_loss_pct() == pytest.approx(
+        max(base * 0.7, sup.config.kill_switch_floor_pct))
+    assert sup._effective_daily_loss_pct() < base
     # 关闭 → 静态
     sup.config.adaptive_kill_switch = False
-    assert sup._effective_daily_loss_pct() == pytest.approx(3.0)
+    assert sup._effective_daily_loss_pct() == pytest.approx(base)
+
+
+def test_adaptive_kill_switch_bounds_wrap_the_static_line(sup):
+    """守卫：floor < 静态中枢 < cap，且 cap 不窄于「中枢 × 1.5」。
+
+    2026-11-03 的真实事故：中枢 3.0→5.0 而 cap 还留在 4.5 ⇒ 自适应逻辑
+    变成只收紧不放宽的单向压缩（min(..., 4.5) ≤ 4.5 < 5.0），
+    而在配置文件里完全看不出来。任何改动熔断中枢的人都必须先过这条线。
+    """
+    base = float(sup.config.max_daily_loss_pct)
+    floor = float(sup.config.kill_switch_floor_pct)
+    cap = float(sup.config.kill_switch_cap_pct)
+    assert floor < base < cap, f"floor {floor} < 中枢 {base} < cap {cap} 被破坏"
+    assert cap >= base * 1.5 - 1e-9, "cap 窄于限幅上限 ⇒ 放宽逻辑被吃掉"
+    assert floor <= base * 0.7 + 1e-9, "floor 高于限幅下限 ⇒ 收紧逻辑被吃掉"
 
 
 def test_effective_daily_loss_caps_and_floors(sup):

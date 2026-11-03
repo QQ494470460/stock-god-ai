@@ -33,18 +33,32 @@ from src.models.predictor_v2 import PredictorV2
 
 
 def load_pool(max_stocks: int = 400) -> Dict[str, pd.DataFrame]:
-    """从本地缓存加载行情（不联网）"""
+    """
+    从本地缓存加载行情（不联网）
+
+    股票池必须与训练时**完全一致**，否则就是典型的 train/serve 偏斜：
+    模型在"流动性前400"上训练出的排序关系，拿去给"按代码排序的前400"
+    打分，等于用一套标准去衡量另一批样本。原实现正是后者，已改为与
+    `train_v2.py --universe liquidity` 共用同一套选池逻辑。
+    """
     data_dir = Path(__file__).resolve().parent.parent / "data"
+    files = sorted(data_dir.glob("daily_*_qfq.parquet"))
+    by_code = {f.stem.split("_")[1]: f for f in files}
+    try:
+        from scripts.train_v2 import _liquidity_universe
+        order = _liquidity_universe(by_code, max_stocks)
+    except Exception:
+        # 兜底：退回代码序（不理想，但至少不中断）
+        order = [f.stem.split("_")[1] for f in files[:max_stocks]]
+
     store = {}
-    for f in sorted(data_dir.glob("daily_*_qfq.parquet")):
+    for code in order:
         try:
-            df = pd.read_parquet(f)
+            df = pd.read_parquet(by_code[code])
             if len(df) < 250:
                 continue
             df["date"] = pd.to_datetime(df["date"])
-            store[f.stem.split("_")[1]] = df.set_index("date").sort_index()
-            if len(store) >= max_stocks:
-                break
+            store[code] = df.set_index("date").sort_index()
         except Exception:
             continue
     return store

@@ -48,6 +48,12 @@ class ExecConfig:
     top_n: int = 8
     rebalance_days: int = 5
     weighting: str = "equal"          # equal | risk_parity
+    # 在风险权重之上叠加 alpha 倾斜（口径与 src/trading/optimizer.alpha_tilt 一致：
+    # **按秩**而不是原始分做乘子，strength=0.25 表示最好的一只 ×1.25、最差 ×0.75）。
+    # 用秩是为了抗极值：模型偶尔给出一只 99 分而其余 60 分时，按原值加权会把
+    # 九成资金压在一只票上；按秩只是「最好的多拿一点」。
+    # 0 = 纯风险平价（生产现状，真 OOS 面板验证过 0.0 更优）。
+    tilt_strength: float = 0.0
     cash_reserve_pct: float = 0.0
     weight_cap: float = 1.0
     band_pct: float = 0.0
@@ -124,6 +130,18 @@ class ExecConfig:
     # 设 12 = 只在回撤≥12% 才介入，回撤 < 12% 满仓照跑）。与 T3 asymmetric_derisk_scale 口径一致。
     dd_start_cut_pct: float = 0.0
     halt_dd_pct: float = 0.0           # >0 时回撤≥该值冻结整轮调仓（0=关闭，实盘=8.0）
+
+    # ③ daily_halt_pct：**单日亏损熔断**（实盘 ``guard.max_daily_loss_pct=3.0`` 的等价物）。
+    #    这是 11 处漂移之外的第 12 处：实盘每次亏 3% 就冻结当日交易，
+    #    回测里从来没有这条线 —— 等于「实盘多了一个回测没验证过的机制」。
+    #    语义：当日收盘收益 ≤ -pct% ⇒ 冻结本次调仓（顺延到下一个调仓日）。
+    #    ⚠️ 实盘是盘中 tick 触发（今天 13:17 就熔了），收盘口径的触发次数是**下界**。
+    #    0 = 关闭（默认，保持历史口径不变）。
+    daily_halt_pct: float = 0.0
+    # 熔断后额外冻结的交易日数。实盘解冻后有 ``auto_resume_throttle_days=2`` 的半仓
+    # 冷静期（signal_strength × 0.5）；这里用「多冻结 N 天」近似其收益拖累，
+    # 因为半仓与冻结在「少赚」这个方向上同号，而冻结是它的上界。
+    daily_halt_cooldown_days: int = 0
 
     # ---- 撮合 ----
     buy_at: str = "next_open"         # next_open | close
@@ -338,6 +356,8 @@ def run_exec_backtest(
     fees_paid = 0.0
     run_peak = float(capital)      # 峰谷回撤基准（收盘口径）
     n_halt_days = 0                # 被熔断冻结的天数（诊断「换了个策略」用）
+    n_daily_halt = 0               # 单日亏损熔断触发次数（诊断用）
+    daily_freeze_until = -1        # 单日亏损熔断冻结到的日索引（含）
 
     def _fee(amount: float, is_sell: bool) -> float:
         f = max(cfg.min_commission, amount * cfg.commission)
@@ -482,7 +502,23 @@ def run_exec_backtest(
         if _halted:
             n_halt_days += 1
 
-        if i % cfg.rebalance_days == 0 and i + 1 < n_days and not _halted:
+        # 单日亏损熔断（收盘口径）。与回撤熔断正交：这条只管「今天亏太多就收手」。
+        if cfg.daily_halt_pct > 0 and i > 0:
+            _prev = equity_curve[i - 1]
+            if np.isfinite(_prev) and _prev > 0:
+                _dret = (eq / _prev - 1.0) * 100.0
+                if _dret <= -abs(float(cfg.daily_halt_pct)):
+                    n_daily_halt += 1
+                    daily_freeze_until = max(
+                        daily_freeze_until,
+                        i + max(int(cfg.daily_halt_cooldown_days), 0),
+                    )
+        _daily_halted = i <= daily_freeze_until
+        if _daily_halted:
+            n_halt_days += 1
+
+        if (i % cfg.rebalance_days == 0 and i + 1 < n_days
+                and not _halted and not _daily_halted):
             srow = Sa[i]
             ok = np.isfinite(srow)
             if ok.sum() >= cfg.top_n:
@@ -552,6 +588,22 @@ def run_exec_backtest(
                          for k in range(len(picks))}
                 else:
                     w = {code: 1.0 / len(picks) for code in picks}
+                # alpha 倾斜：在风险权重上按**秩**叠加，口径同 optimizer.alpha_tilt
+                # （生产只在 risk_parity 分支调用它，这里保持一致）
+                if (cfg.tilt_strength > 0 and cfg.weighting == "risk_parity"
+                        and len(picks) > 1):
+                    sv = np.array([float(srow[cidx[c_]]) for c_ in picks], dtype=float)
+                    if not np.isfinite(sv).all():
+                        sv = np.where(np.isfinite(sv), sv, np.nanmin(sv))
+                    rk_order = np.argsort(np.argsort(sv))
+                    denom = max(len(picks) - 1, 1)
+                    rk = (rk_order / denom) * 2.0 - 1.0
+                    mult = 1.0 + min(float(cfg.tilt_strength), 1.0) * rk
+                    w = {picks[k]: w[picks[k]] * max(float(mult[k]), 0.05)
+                         for k in range(len(picks))}
+                    tot = sum(w.values())
+                    if tot > 0:
+                        w = {c_: v_ / tot for c_, v_ in w.items()}
                 # 单票封顶 + 风险预算
                 caps = {}
                 for code in picks:
@@ -632,4 +684,5 @@ def run_exec_backtest(
     m["turnover_per_year"] = float(turnover_amt / capital / years)
     m["fee_pct"] = float(fees_paid / capital)
     m["halt_days_pct"] = float(n_halt_days / max(n_days, 1))
+    m["daily_halt_count"] = float(n_daily_halt)
     return ExecResult(metrics=m, equity=eq_series, trades=tr, exit_stats=exit_stats)
