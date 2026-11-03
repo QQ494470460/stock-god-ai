@@ -39,7 +39,8 @@ import pandas as pd  # noqa: E402
 
 from src.core.exec_backtest import build_ohlc_panel  # noqa: E402
 from scripts.exec_ab import (  # noqa: E402
-    BASE, PHASE_SPREAD_PP, SCENARIOS, fmt_t, summarise, sweep_phases,
+    BASE, PHASE_SPREAD_PP, SCENARIOS, fmt_t, needs_industry_map, summarise,
+    sweep_phases,
 )
 
 DEFAULT_CASES = ["c15", "prod_halt20", "prod_halt20_m2", "prod_risk"]
@@ -57,6 +58,9 @@ def main() -> int:
     ap.add_argument("--slippage-bp", type=float, default=10.0)
     ap.add_argument("--phases", type=int, default=15, help="扫描的相位个数（=rebalance_days）")
     ap.add_argument("--only", default="", help="逗号分隔的方案名（默认 c15 + 生产风控四件套）")
+    ap.add_argument("--industry-map", default="",
+                    help="行业映射 JSON 路径。中性化/行业上限类方案必须给，"
+                         "否则会被跳过（否则会静默退化成「没打开」）")
     ap.add_argument("--baseline", default="c15", help="作为基准相减的方案名")
     ap.add_argument("--quick", action="store_true", help="只跑最近 400 个交易日")
     args = ap.parse_args()
@@ -83,6 +87,16 @@ def main() -> int:
     if args.baseline not in names:
         names.insert(0, args.baseline)
 
+    industry_map = None
+    if args.industry_map:
+        import json
+        mp = Path(args.industry_map)
+        if not mp.exists():
+            print(f"❌ 行业映射不存在：{mp}")
+            return 1
+        industry_map = json.loads(mp.read_text(encoding="utf-8"))
+        print(f"🏭 行业映射 {len(industry_map)} 条")
+
     print(f"📦 面板 {scores.shape[0]} 天 × {len(codes)} 只 ｜ 滑点 {args.slippage_bp:.0f}bp ｜ "
           f"扫 {args.phases} 个相位")
 
@@ -91,11 +105,20 @@ def main() -> int:
         over = dict(BASE)
         over.update(PROD_BASE)
         over.update(SCENARIOS[name])
+        if industry_map:
+            over["industry_map"] = industry_map
+        if needs_industry_map(over):
+            print(f"⚠️ 跳过 {name}：需要 --industry-map（否则中性化/行业上限静默失效）")
+            continue
         acc[name] = sweep_phases(scores, ohlc, over,
                                  slippage_bp=args.slippage_bp, phases=args.phases)
         s = summarise(acc[name])
         print(f"  ✓ {name:<16} 年化均值 {s['ann_mean']:>7.2f}%  "
               f"最差 {s['ann_min']:>7.2f}%  夏普 {s['sharpe_mean']:>5.3f}")
+    names = [n for n in names if n in acc]
+    if args.baseline not in acc:
+        print(f"❌ 基准 {args.baseline} 没跑成，无法算逐相位差")
+        return 1
 
     print("\n" + "=" * 92)
     print(f"{'方案':<18}{'年化均值':>10}{'最差':>9}{'最好':>9}{'夏普均值':>10}"

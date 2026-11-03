@@ -270,3 +270,55 @@ def test_phase_script_prod_base_matches_the_production_caliber(loop):
     assert float(PROD_BASE["hold_rank_slack"]) == float(loop.hold_rank_slack)
     assert PROD_BASE["stop_mode"] == "none"
 
+
+# ---------------------------------------------------------------------------
+# 八、打分后处理层（第 16 处漂移 —— 比风控层那 15 处更上游）
+# ---------------------------------------------------------------------------
+
+def test_cross_sectional_neutralize_is_off():
+    """行业中性化 2026-11-04 关闭：它是全链条最贵的单项。
+
+    1140 天 × 200 只 × 15 相位 × 三档成本，逐相位配对差
+    −4.71 / −5.11 / −5.96pp，配对 t −2.78 / −2.67 / −3.68，
+    负相位 11 / 11 / 12（共 15）。回撤每一档都更深，年换手 10.5 → 12.0。
+    **成本越贵差得越多 ⇒ 逆成本单调，不是噪声。**
+
+    为什么会长这样：模型对「行业水位」的预测本身就是 alpha，事后按行业去均值
+    等于把它剔掉。而「不要全押一个行业」在持仓层用 ``max_sector_pct`` 只需
+    −0.45pp —— 同一个目的，工具放错层级代价差一个数量级。
+
+    ⚠️ 重开之前必须回答：为什么 15 个相位 × 三档成本都指向负？只跑过单相位
+    的「有效」不构成理由（相位离散度 16.64pp）。复核命令：
+    ``python scripts/exec_phase.py --only neu --industry-map data/industry_map.json``
+    """
+    assert AppConfig().ml.cross_sectional_neutralize is False, (
+        "中性化被重新打开了 —— 先跑三档成本的相位平均，确认 Δ 不再为负")
+
+
+def test_signal_ema_stays_on_but_its_evidence_is_weaker_than_documented():
+    """跨日 EMA 保持开启，但**证据强度弱于 settings 里的旧注释**。
+
+    本轮回测（15 相位 × 10bp）：EMA(0.85) 相对原分 −1.11pp、配对 t −1.36、
+    11/15 相位为负。方向偏负但不显著 ⇒ 不动它（没有「明确有害」的证据）。
+
+    要点是别再把旧注释当成硬证据：那张表是**单相位**、且**含 T3 覆盖层**
+    （T3 现已关闭）。在 16.64pp 的相位离散度面前，4pp 的「提升」不构成结论。
+    """
+    ml = AppConfig().ml
+    assert ml.signal_fusion_enabled is True
+    assert float(ml.signal_fusion_alpha) == 0.85
+
+
+def test_backtest_signal_pipeline_defaults_are_off():
+    """回测引擎的打分后处理默认必须全关。
+
+    否则「历史结论逐位可复现」这条底线就断了：2026-11-04 之前的全部结论
+    都是在**原始 predict_proba** 上得出的，默认打开等于让所有旧数字失效。
+    """
+    from src.core.exec_backtest import ExecConfig
+
+    c = ExecConfig()
+    assert c.signal_neutralize is False
+    assert float(c.signal_ema_alpha) == 0.0
+
+

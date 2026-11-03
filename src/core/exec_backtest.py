@@ -80,6 +80,19 @@ class ExecConfig:
     max_sector_pct: float = 0.0
     industry_map: Optional[Dict[str, str]] = None
 
+    # ⑤ 打分后处理（生产的 signal pipeline）：行业中性化 → 跨日 EMA。
+    #    ⚠️ 这是 2026-11-04 发现的第 16 处「实盘有、回测没有」，而且**在打分层**，
+    #    比风控层的 15 处更上游：生产实际排序用的是
+    #        predict_proba → _neutralize_scores（行业去均值） → EMA(alpha=0.85)
+    #    而 ``panel_oos/score_panel.parquet`` 存的是**原始 predict_proba**
+    #    （scripts/walk_forward_oos.py 直接取 model.predict_proba）。
+    #    也就是说此前所有「选股层」结论都是在「生产不交易的那个分数」上得出的。
+    #    默认全关 = 历史口径逐位不变；打开后调用**生产同一个函数**
+    #    （``signal_quality.neutralize_cross_section`` / ``signal_fusion._ema_values``），
+    #    避免修一处漂移又长出一处。
+    signal_neutralize: bool = False
+    signal_ema_alpha: float = 0.0      # 0 = 关闭；生产 0.85
+
     # ---- 成本（A 股保守值）----
     commission: float = 0.0003
     min_commission: float = 5.0
@@ -314,6 +327,57 @@ def _tradable_masks(o: pd.DataFrame, h: pd.DataFrame, low: pd.DataFrame,
     return can_buy, can_sell
 
 
+_UNKNOWN_INDUSTRY = "_UNKNOWN_"   # 与 signal_quality._UNKNOWN 同值
+
+
+def _neutralize_panel(scores: pd.DataFrame,
+                      industry_map: Dict[str, str],
+                      min_group: int = 2) -> pd.DataFrame:
+    """逐日行业中性化（整块面板向量化）。
+
+    价格式与 ``signal_quality.neutralize_cross_section`` **完全一致**：
+        ``resid = score - 组均值 + 总均值``（组内样本数 ≥ min_group 才做）
+    未映射的票归入 ``_UNKNOWN_`` 组 —— 与生产同口径（生产也这么分桶）。
+
+    为什么在这里重写而不是直接 ``apply`` 生产函数：生产函数是**逐日**调用的
+    （一次处理一天），1140 天要 5.5 秒；而相位扫描一个方案就要跑 15 次。
+    这里按整块面板算 ~50 毫秒，``tests/test_exec_signal_pipeline.py`` 里有
+    与生产函数**逐位对照**的断言盯着，不允许漂。
+    """
+    if scores.empty or not industry_map:
+        return scores
+    grp = pd.Series({c: str(industry_map.get(c, _UNKNOWN_INDUSTRY))
+                     for c in scores.columns})
+    t = scores.T
+    grp_mean = t.groupby(grp).transform("mean").T
+    grp_count = t.groupby(grp).transform("count").T
+    grand = scores.mean(axis=1)          # 逐日总均值（跳过 NaN，同生产）
+    resid = scores.sub(grp_mean).add(grand, axis=0)
+    big = grp_count >= int(min_group)
+    return resid.where(big, scores)
+
+
+def apply_signal_pipeline(scores: pd.DataFrame, cfg: "ExecConfig") -> pd.DataFrame:
+    """把生产的打分后处理搬到面板上：行业中性化 → 跨日 EMA。
+
+    顺序必须与生产一致（``predictor`` 先 ``_neutralize_scores``，再
+    ``_apply_signal_fusion``，且后者内部 ``neutralize=False`` 以免重复去偏）。
+    两个开关都关时原样返回，保证历史口径逐位不变。
+    """
+    out = scores
+    if cfg.signal_neutralize and cfg.industry_map:
+        out = _neutralize_panel(out, cfg.industry_map)
+    a = float(cfg.signal_ema_alpha or 0.0)
+    if a > 0:
+        # 直接调用生产的私有递推函数：EMA 的边界（缺失沿用上期、ema_0=x_0）
+        # 很容易在「重新实现」时写歪，而它每天都在影响实盘排名。
+        from src.models.signal_fusion import _ema_values
+        a = min(max(a, 1e-6), 1.0)
+        out = out.apply(
+            lambda col: pd.Series(_ema_values(list(col.values), a), index=col.index))
+    return out
+
+
 def run_exec_backtest(
     score_panel: pd.DataFrame,
     ohlc: Dict[str, pd.DataFrame],
@@ -328,6 +392,7 @@ def run_exec_backtest(
       2. 日内：对每笔持仓按 OHLC 判定止损/止盈/移动止损（同日多触发按最坏假设）
       3. 收盘：市值重估、更新峰值；若为调仓日 → 生成次日委托
     """
+    score_panel = apply_signal_pipeline(score_panel, cfg)
     o, h, low, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
     vol = ohlc.get("volume")
     if vol is None:

@@ -155,6 +155,33 @@ SCENARIOS: dict[str, dict] = {
                            cash_reserve_pct=0.05),
     "cash15":         dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
                            cash_reserve_pct=0.15),
+    # ---- 行业集中度上限（第 13 处漂移：30%→50%）----
+    # ⚠️ 这组**必须**配 --industry-map 才有意义：引擎在 industry_map 缺失时对
+    #    该票 fail-open（豁免，不占额度），映射没传进来 ⇒ max_sector_pct 静默无效，
+    #    四个方案会跑出逐位相同的数字。exec_ab 会直接跳过它们而不是给假结论。
+    # 30% 是「20 只持仓」时代的遗留；8 只时单票 11.25%，30% 只够 2.67 只。
+    # ⚠️ 当初 30%→50% 是**单相位**定的，且档位非单调（记忆里自己写了
+    #    「差异是哪只票恰好被拒的随机扰动」）⇒ 必须用相位平均重判。
+    "sector30":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           max_sector_pct=0.30),
+    "sector40":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           max_sector_pct=0.40),
+    "sector50":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           max_sector_pct=0.50),
+    "sector70":       dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           max_sector_pct=0.70),
+    # ---- 打分后处理（第 16 处漂移，且在打分层：比风控层的 15 处更上游）----
+    # 生产排序 = predict_proba → 行业中性化 → EMA(0.85)，面板存的是原分。
+    # 记忆里那条「EMA 让年化 23.7%→26.7%」是**单相位 + 无脚本可复现**，
+    # 而 4pp 远小于 16.64pp 的相位离散度 ⇒ 必须重判。
+    "ema85":          dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           signal_ema_alpha=0.85),
+    "ema95":          dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           signal_ema_alpha=0.95),
+    "neu":            dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           signal_neutralize=True),
+    "prod_signal":    dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0,
+                           signal_neutralize=True, signal_ema_alpha=0.85),
 }
 
 
@@ -286,6 +313,20 @@ def summarise(runs: list[dict], base: list[dict] | None = None) -> dict:
     return res
 
 
+def needs_industry_map(over: dict) -> bool:
+    """该方案声明了行业上限或行业中性化，却没有拿到 industry_map。
+
+    引擎在缺映射时：行业上限对该票 **fail-open（豁免、不占额度）**，
+    中性化则**整层静默跳过**（``apply_signal_pipeline`` 里 ``and cfg.industry_map``）。
+    两者都会让参数变成**静默无效**：30% / 50% / 70% 三档跑出逐位相同的数字，
+    ``prod_signal`` 退化成「只有 EMA」。读表的人会得出「这条约束零成本」
+    ——最坏的一种假结论。
+    """
+    cap = float(over.get("max_sector_pct", 0.0) or 0.0)
+    wants_neutral = bool(over.get("signal_neutralize"))
+    return (cap > 0 or wants_neutral) and not over.get("industry_map")
+
+
 def _run_grid(scores, ohlc, args) -> None:
     """决定性网格：持有周期 × 排名滞后 × 成本三档。
 
@@ -321,7 +362,21 @@ def main() -> int:
                     help="调仓相位个数（1=只跑 offset0，与旧结果逐位相同；15=相位平均）")
     ap.add_argument("--baseline", default="c15",
                     help="算 Δ 用的基准方案名，空字符串=不算（单相位下 Δ 只是参考）")
+    ap.add_argument("--industry-map", default="",
+                    help="行业映射 JSON 路径（如 data/industry_map.json）。"
+                         "max_sector_pct 类方案必须给，否则会被跳过而不是给假结论")
     args = ap.parse_args()
+
+    industry_map = None
+    if args.industry_map:
+        import json
+        p = Path(args.industry_map)
+        if not p.exists():
+            print(f"❌ 行业映射不存在：{p}")
+            return 1
+        industry_map = json.loads(p.read_text(encoding="utf-8"))
+        print(f"🏭 行业映射 {len(industry_map)} 条"
+              f"（面板里缺映射的票按 fail-open 处理，与实盘一致）")
 
     panel = Path(args.panel)
     scores = pd.read_parquet(panel / "score_panel.parquet")
@@ -358,6 +413,12 @@ def main() -> int:
             continue
         over = dict(BASE)
         over.update(SCENARIOS[name])
+        if industry_map:
+            over["industry_map"] = industry_map
+        if needs_industry_map(over):
+            print(f"⚠️ 跳过 {name}：声明了 max_sector_pct 但没传 --industry-map，"
+                  "跑出来的会是「上限无效」的假结论")
+            continue
         runs = sweep_phases(scores, ohlc, over, slippage_bp=args.slippage_bp,
                             phases=args.phases, top_n=args.top_n)
         runs_by_name[name] = runs
@@ -433,6 +494,8 @@ def main() -> int:
         for _, row in df.head(3).iterrows():
             over = dict(BASE)
             over.update(SCENARIOS[row["方案"]])
+            if industry_map:
+                over["industry_map"] = industry_map
             line = f"  {row['方案']:<18}"
             for bp in (10.0, 30.0, 50.0):
                 runs = sweep_phases(scores, ohlc, over, slippage_bp=bp,
