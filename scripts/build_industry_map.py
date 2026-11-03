@@ -51,12 +51,38 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def merge_industry_maps(existing: dict, fresh: dict) -> dict:
+    """把新抓到的映射**合并**进已有表，绝不用「半张表换半张表」。
+
+    2026-11-04 发现的两个坑：
+
+    1) 原实现是 ``cache_file.write_text(json.dumps(got))`` —— 整表覆盖。
+       只要某次抓到的 2500 只与现有的 2621 只不重叠，就会**丢掉已经攒下的
+       映射**，而且看起来还「成功」了。东财快照是按页返回的，这种部分重叠
+       完全可能发生，所以必须合并而不是替换。
+    2) 空值不许覆盖已有值：``{"600000": ""}`` 打进来会把本来知道的行业抹掉。
+       只接受非空字符串。
+    """
+    out = dict(existing or {})
+    for code, name in (fresh or {}).items():
+        key = str(code)
+        val = str(name or "").strip()
+        if not val:
+            continue
+        out[key] = val
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="补齐行业映射（耐心重试版）")
     ap.add_argument("--attempts", type=int, default=30, help="最多试几次（默认 30）")
     ap.add_argument("--interval", type=float, default=40.0, help="每次间隔秒数（默认 40）")
     ap.add_argument("--min", type=int, default=0,
-                    help="至少覆盖多少只才算成功（默认取 fetcher 的阈值）")
+                    help="**落盘**门槛（默认取 fetcher 阈值 2500，防止空结果投毒）")
+    ap.add_argument("--target", type=int, default=4800,
+                    help="「够齐了」的目标覆盖率（A 股约 5400 只）。低于它继续重试。"
+                         "⚠️ 别把它调回 2500：那就是「半个市场就算完工」，"
+                         "集中度上限对近一半仓位会一直 fail-open")
     ap.add_argument("--timeout", type=float, default=12.0, help="单次请求超时秒数")
     ap.add_argument("--once", action="store_true", help="只试一次就退出")
     args = ap.parse_args()
@@ -68,21 +94,23 @@ def main() -> int:
 
     from src.data.fetcher import DataFetcher, fetcher
 
-    need = args.min or DataFetcher._INDUSTRY_BULK_MIN_CODES
+    floor = args.min or DataFetcher._INDUSTRY_BULK_MIN_CODES
+    target = max(int(args.target), floor)
     cache_file = Path(fetcher.cache_dir) / "industry_map.json"
 
-    # 已经有一份像样的就别折腾了
+    have: dict = {}
     if cache_file.exists():
         try:
             have = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             have = {}
-        if len(have) >= need:
-            print(f"[{_ts()}] ✅ 行业映射已存在 {len(have)} 只（≥{need}），无需重建")
+        if len(have) >= target:
+            print(f"[{_ts()}] ✅ 行业映射已覆盖 {len(have)} 只（≥{target}），无需重建")
             return 0
-        print(f"[{_ts()}] 现有缓存 {len(have)} 只（<{need}），开始重建…")
+        print(f"[{_ts()}] 现有缓存 {len(have)} 只 / 目标 {target}（覆盖 "
+              f"{len(have) / max(target, 1):.1%}），继续补齐…（只增不减）")
     else:
-        print(f"[{_ts()}] 尚无行业映射缓存，开始获取（目标 ≥{need} 只）…")
+        print(f"[{_ts()}] 尚无行业映射缓存，开始获取（目标 ≥{target} 只）…")
 
     attempts = 1 if args.once else args.attempts
     for i in range(1, attempts + 1):
@@ -92,26 +120,33 @@ def main() -> int:
             got = {}
             print(f"[{_ts()}] 第 {i}/{attempts} 次异常: {type(e).__name__}: {str(e)[:70]}")
 
-        if len(got) >= need:
-            # 走 get_industry_map 落盘，复用它的「覆盖不够就不写」与负缓存语义
-            fetcher._industry_map = got
+        merged = merge_industry_maps(have, got)
+        if len(merged) > len(have) and len(merged) >= floor:
+            # 落盘条件：**累积后**达到门槛。原实现用单次结果判定，
+            # 于是「攒了三轮的 2600 只」会被一次 200 只的新抓取判成失败。
+            gained = len(merged) - len(have)
+            have = merged
             cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(have, ensure_ascii=False), encoding="utf-8")
+            print(f"[{_ts()}] 已写入 {len(have)} 只 / {len(set(have.values()))} 个行业"
+                  f"（本轮新增 {gained}）")
+
+        if len(have) >= target:
             from collections import Counter
 
-            top = Counter(got.values()).most_common(5)
-            cache_file.write_text(json.dumps(got, ensure_ascii=False), encoding="utf-8")
-            print(f"[{_ts()}] ✅ 第 {i} 次成功：{len(got)} 只 / {len(set(got.values()))} 个行业"
-                  f" → 已写入 {cache_file}")
+            top = Counter(have.values()).most_common(5)
+            print(f"[{_ts()}] ✅ 第 {i} 次达到目标：{len(have)} 只 → {cache_file}")
             print(f"[{_ts()}]    行业 Top5: {top}")
             return 0
 
-        print(f"[{_ts()}] 第 {i}/{attempts} 次只拿到 {len(got)} 只（需 ≥{need}），"
+        print(f"[{_ts()}] 第 {i}/{attempts} 次后覆盖 {len(have)} 只（需 ≥{target}），"
               f"{args.interval:.0f}s 后重试…")
         if i < attempts:
             time.sleep(args.interval)
 
-    print(f"[{_ts()}] ❌ {attempts} 次都没拿到足够覆盖 —— 东财当前不可达，"
-          f"中性化继续走板级分组（不影响交易，只是粒度粗）")
+    print(f"[{_ts()}] ❌ {attempts} 次后覆盖仍只有 {len(have)} 只（目标 {target}）—— "
+          f"东财当前不可达/限流。已有映射保留不丢；集中度上限对未映射票继续 fail-open，"
+          f"`data/industry_map_status.json` 会写明根因")
     return 1
 
 

@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import pytest  # noqa: E402
+
 import scripts.plan_vs_fill as pvf  # noqa: E402
 
 PLAN_DAY = "20261102"
@@ -261,3 +263,61 @@ def test_missing_account_file_does_not_crash(tmp_path):
     assert rep["equity"] == 0.0
     assert rep["cash_pct"] == 0.0
     assert rep["fill_ratio"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 盲区可视化：计划里有多少仓位是「没有行业映射」的
+# ---------------------------------------------------------------------------
+
+def _industry(ddir: Path, mapping: dict):
+    (ddir / "industry_map.json").write_text(
+        json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+
+
+def test_unmapped_weight_is_reported(tmp_path):
+    """2026-11-04 实况：8 只里 4 只没有映射、占计划权重 48%。
+
+    集中度上限对未映射票 fail-open（豁免、不占额度），所以这些仓位是「免检」的。
+    这件事在任何报表里都不会报错，只能靠这个字段让它可见。
+    """
+    ddir = _env(tmp_path)
+    _plan(ddir, PLAN_DAY, _THREE)
+    _industry(ddir, {"600000": "银行"})          # 另两只没映射
+    rep = pvf.audit(PLAN_DAY, ddir, now=_after_open())
+
+    assert rep["unmapped_codes"] == ["600036", "601318"]
+    # 三只各 30%，其中两只没映射 ⇒ 0.60 / 0.90 = 2/3（报告保留 4 位小数）
+    assert rep["unmapped_weight_pct"] == pytest.approx(2 / 3, abs=1e-4)
+    assert "无行业映射" in pvf.render(rep)
+
+
+def test_unmapped_weight_is_zero_when_the_map_is_complete(tmp_path):
+    ddir = _env(tmp_path)
+    _plan(ddir, PLAN_DAY, _THREE)
+    _industry(ddir, {"600000": "银行", "600036": "银行", "601318": "保险"})
+    rep = pvf.audit(PLAN_DAY, ddir, now=_after_open())
+
+    assert rep["unmapped_weight_pct"] == 0.0
+    assert rep["unmapped_codes"] == []
+    assert "无行业映射" not in pvf.render(rep)
+
+
+def test_missing_industry_map_file_makes_everything_unmapped(tmp_path):
+    """映射文件不存在时不能崩，且必须报「全部免检」而不是报 0（那才是真危险）。"""
+    ddir = _env(tmp_path)
+    _plan(ddir, PLAN_DAY, _THREE)
+    rep = pvf.audit(PLAN_DAY, ddir, now=_after_open())
+
+    assert rep["unmapped_weight_pct"] == pytest.approx(1.0)
+    assert len(rep["unmapped_codes"]) == 3
+
+
+def test_blank_industry_string_counts_as_unmapped(tmp_path):
+    """空字符串不是「有行业」——历史上正是空值让一张半空的表看起来完整。"""
+    ddir = _env(tmp_path)
+    _plan(ddir, PLAN_DAY, _THREE)
+    _industry(ddir, {"600000": "  ", "600036": "银行", "601318": None})
+    share, codes = pvf.unmapped_weight(
+        {"600000": 0.3, "600036": 0.3, "601318": 0.3}, ddir)
+    assert codes == ["600000", "601318"]
+    assert share == pytest.approx(2 / 3)      # 0.60 / 0.90

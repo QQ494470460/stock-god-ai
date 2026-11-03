@@ -119,6 +119,24 @@ def blocks_on(date: str, data_dir: Path | None = None) -> dict[str, str]:
     return out
 
 
+def unmapped_weight(plan_w: dict, ddir: Path) -> tuple[float, list[str]]:
+    """计划权重里「没有行业映射」的那部分占比。
+
+    为什么必须单独报：行业集中度上限（``guard.max_sector_pct``）与回测里的
+    ``max_sector_pct`` 对未映射票都是 **fail-open**（豁免、不占额度）。
+    2026-11-04 的计划 8 只里有 4 只没有映射、合计占仓位 **43.4%** ——
+    也就是说那条线对近一半仓位是免检的，而这件事**在任何地方都不会报错**。
+
+    这是一条数据质量问题，不是策略问题：出路是补全 ``data/industry_map.json``
+    （只覆盖 2621 / 约 5400 只），不是调阈值。
+    """
+    ind = _load(ddir / "industry_map.json", {}) or {}
+    missing = [c for c in plan_w if not str(ind.get(c) or "").strip()]
+    tot = sum(plan_w.values())
+    share = (sum(plan_w[c] for c in missing) / tot) if tot > 0 else 0.0
+    return share, sorted(missing)
+
+
 def audit(date: str | None = None, data_dir: Path | None = None,
           now: datetime | None = None) -> dict:
     """now 可注入 —— 否则「凌晨不算缺口」这条判定在测试里无法确定性复现。"""
@@ -165,6 +183,8 @@ def audit(date: str | None = None, data_dir: Path | None = None,
     pending = bool(key) and (key > today or (key == today and pre_open))
     healthy = pending or ratio >= HEALTHY_RATIO
 
+    unmapped_share, unmapped_codes = unmapped_weight(plan_w, ddir)
+
     return {
         "at": now.isoformat(timespec="seconds"),
         "plan_date": key,
@@ -178,6 +198,8 @@ def audit(date: str | None = None, data_dir: Path | None = None,
         "healthy": healthy,
         "n_missing": n_missing,
         "n_partially_filled": n_partial,
+        "unmapped_weight_pct": round(unmapped_share, 4),
+        "unmapped_codes": unmapped_codes,
         "cash_pct": round((snap["cash"] / total) if total > 0 else 0.0, 4),
         "equity": round(total, 2),
         "positions": rows,
@@ -188,6 +210,11 @@ def render(rep: dict) -> str:
     lines = []
     lines.append(f"计划日期 {rep['plan_date']}（{rep['plan_source']}，regime={rep['plan_regime']}）")
     lines.append(f"权益 ¥{rep['equity']:,.0f}   现金占比 {rep['cash_pct']:.1%}")
+    share = rep.get("unmapped_weight_pct") or 0.0
+    if share > 0:
+        flag = "⚠️ 集中度上限对该部分免检" if share >= 0.30 else "（集中度上限对其免检）"
+        lines.append(f"🏭 无行业映射：{share:.1%} 的计划权重、{len(rep.get('unmapped_codes') or [])} 只 "
+                     f"{flag} —— 数据质量问题，修 industry_map 而不是调阈值")
     if rep.get("pending"):
         lines.append(f"⏳ 该计划尚未开始执行（未到执行日 / 今天还没开盘）："
                      f"计划权重 {rep['weight_plan_total']:.1%}，当前建满 {rep['weight_filled_total']:.1%}"
