@@ -35,13 +35,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from src.core.exec_backtest import (  # noqa: E402
-    ExecConfig, build_ohlc_panel, run_exec_backtest,
+from src.core.exec_backtest import build_ohlc_panel  # noqa: E402
+from scripts.exec_ab import (  # noqa: E402
+    BASE, PHASE_SPREAD_PP, SCENARIOS, fmt_t, summarise, sweep_phases,
 )
-from scripts.exec_ab import BASE, SCENARIOS  # noqa: E402
 
 DEFAULT_CASES = ["c15", "prod_halt20", "prod_halt20_m2", "prod_risk"]
 
@@ -49,12 +48,6 @@ DEFAULT_CASES = ["c15", "prod_halt20", "prod_halt20_m2", "prod_risk"]
 # ``ExecConfig.hold_rank_slack`` 默认 1.0 而生产是 3.0，漏传会把结论正反颠倒
 # （见 memory §11）。tests/test_loop.py 有静态守卫盯着这一行。
 PROD_BASE = dict(stop_mode="none", rebalance_days=15, hold_rank_slack=3.0)
-
-
-def _fmt(v: float, pct: bool = False) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return "—"
-    return f"{v*100:+.2f}%" if pct else f"{v:.3f}"
 
 
 def main() -> int:
@@ -93,50 +86,46 @@ def main() -> int:
     print(f"📦 面板 {scores.shape[0]} 天 × {len(codes)} 只 ｜ 滑点 {args.slippage_bp:.0f}bp ｜ "
           f"扫 {args.phases} 个相位")
 
-    acc: dict[str, list[tuple[float, float, float, float]]] = {n: [] for n in names}
-    for off in range(args.phases):
-        for name in names:
-            over = dict(BASE)
-            over.update(PROD_BASE)
-            over.update(SCENARIOS[name])
-            m = run_exec_backtest(
-                scores, ohlc,
-                ExecConfig(slippage_bp=args.slippage_bp, rebalance_offset=off, **over),
-            ).metrics
-            acc[name].append((m["ann_return"] * 100, m["sharpe"],
-                              m["max_drawdown"] * 100, m["total_return"]))
+    acc: dict[str, list[dict]] = {}
+    for name in names:
+        over = dict(BASE)
+        over.update(PROD_BASE)
+        over.update(SCENARIOS[name])
+        acc[name] = sweep_phases(scores, ohlc, over,
+                                 slippage_bp=args.slippage_bp, phases=args.phases)
+        s = summarise(acc[name])
+        print(f"  ✓ {name:<16} 年化均值 {s['ann_mean']:>7.2f}%  "
+              f"最差 {s['ann_min']:>7.2f}%  夏普 {s['sharpe_mean']:>5.3f}")
 
     print("\n" + "=" * 92)
     print(f"{'方案':<18}{'年化均值':>10}{'最差':>9}{'最好':>9}{'夏普均值':>10}"
           f"{'夏普最差':>10}{'回撤均值':>10}")
     print("-" * 92)
     for name in names:
-        a = np.array(acc[name])
-        print(f"{name:<18}{a[:, 0].mean():>9.2f}%{a[:, 0].min():>8.2f}%{a[:, 0].max():>8.2f}%"
-              f"{a[:, 1].mean():>10.3f}{a[:, 1].min():>10.3f}{a[:, 2].mean():>9.2f}%")
+        s = summarise(acc[name])
+        print(f"{name:<18}{s['ann_mean']:>9.2f}%{s['ann_min']:>8.2f}%{s['ann_max']:>8.2f}%"
+              f"{s['sharpe_mean']:>10.3f}{s['sharpe_min']:>10.3f}{s['dd_mean']:>9.2f}%")
 
-    base = np.array(acc[args.baseline])
+    base = acc[args.baseline]
     print(f"\n相对基准【{args.baseline}】的逐相位差（年化 pp / 夏普）：")
     print(f"{'方案':<18}{'年化均值':>10}{'最差':>9}{'最好':>9}{'负相位':>9}{'配对t':>8}{'夏普均值':>10}")
     print("-" * 92)
     for name in names:
         if name == args.baseline:
             continue
-        a = np.array(acc[name])
-        d = a[:, 0] - base[:, 0]
-        ds = a[:, 1] - base[:, 1]
-        # 配对 t：同一相位下两方案相减，消掉「哪个相位本身好坏」这个共同项。
-        # 注意 15 个相位是重叠样本、不算独立，t 值只用来区分「系统性差异」
-        # 和「方向随机的噪声」，不当成严格显著性检验。
-        sd = float(np.std(d, ddof=1)) if len(d) > 1 else 0.0
-        t = float(np.mean(d) / (sd / np.sqrt(len(d)))) if sd > 1e-12 else float("nan")
-        print(f"{name:<18}{d.mean():>+9.2f}pp{d.min():>+8.2f}pp{d.max():>+8.2f}pp"
-              f"{int((d < -0.01).sum()):>6}/{args.phases}{t:>8.2f}{ds.mean():>+10.3f}")
+        s = summarise(acc[name], base)
+        print(f"{name:<18}{s['d_ann_mean']:>+9.2f}pp{s['d_ann_min']:>+8.2f}pp"
+              f"{s['d_ann_max']:>+8.2f}pp"
+              f"{s['neg_phases']:>6}/{args.phases}{fmt_t(s['t']):>9}"
+              f"{s['d_sharpe_mean']:>+10.3f}")
 
-    spread = np.array(acc[args.baseline])[:, 0]
-    print(f"\n⚠️ 基准自身的相位离散度：{spread.max() - spread.min():.2f}pp 年化"
-          f"（{spread.min():.2f}% ~ {spread.max():.2f}%）")
+    spread = [float(r["metrics"]["ann_return"]) * 100 for r in base]
+    print(f"\n⚠️ 基准自身的相位离散度：{max(spread) - min(spread):.2f}pp 年化"
+          f"（{min(spread):.2f}% ~ {max(spread):.2f}%）")
     print("   任何「A 比 B 好 X pp」的结论，若 X 小于这个离散度，都必须用相位均值说话。")
+    if abs((max(spread) - min(spread)) - PHASE_SPREAD_PP) > 1.0:
+        print(f"   （注意：本次离散度与 11-04 记录的 {PHASE_SPREAD_PP:.1f}pp 差超过 1pp，"
+              "面板或口径可能变了，先查清再引用结论。）")
     return 0
 
 

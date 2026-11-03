@@ -1691,12 +1691,17 @@ def test_backtest_scripts_must_pass_production_slack():
     2026-11-03 踩过的坑：`ExecConfig.hold_rank_slack` 默认 **1.0**，而生产是 **3.0**。
     一个漏传就让「波动率目标有效」的结论翻转成「无效」—— 同一批数据、同一个策略。
     这类口径漂移在代码里看不出来（不报错、不告警），只能靠断言守着。
+
+    ``rebalance_days`` 同理：它和 ``hold_rank_slack`` 都**不在可进化参数空间里**，
+    却决定策略身份。脚本里只要提到周期，就必须有一个方案等于生产周期，
+    否则「15 日周期」的结论就来自一个别的周期。
     """
     import re
     from config.settings import AppConfig
 
     prod = float(AppConfig().trading_loop.hold_rank_slack)
     assert prod == 3.0, "生产 slack 变了就必须重新验证所有 slack 敏感结论"
+    prod_rb = int(AppConfig().trading_loop.rebalance_days)
 
     for name in ("validate_risk_overlay.py", "exec_ab.py", "exec_phase.py"):
         p = ROOT / "scripts" / name
@@ -1707,3 +1712,8 @@ def test_backtest_scripts_must_pass_production_slack():
         assert hits, f"{name} 没显式传 hold_rank_slack，会用 ExecConfig 默认 1.0"
         assert any(abs(float(h) - prod) < 1e-9 for h in hits), (
             f"{name} 里没有任何方案用生产值 {prod}")
+        rb_hits = re.findall(r"rebalance_days\s*=\s*([0-9]+)", src)
+        if rb_hits:
+            assert any(int(h) == prod_rb for h in rb_hits), (
+                f"{name} 提到 rebalance_days 但没有一个等于生产值 {prod_rb} ⇒ "
+                "结论来自别的周期")

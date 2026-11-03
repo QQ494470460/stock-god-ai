@@ -201,3 +201,72 @@ def test_dataclass_defaults_do_not_reintroduce_procyclical_rules():
     assert c.auto_resume_risk_fraction == 1.0
     assert c.auto_resume_throttle_days == 0.0
     assert c.auto_resume_throttle_sec == 0
+
+
+# ---------------------------------------------------------------------------
+# 七、策略形状参数（已用相位平均验过，动它等于让全部历史结论作废）
+# ---------------------------------------------------------------------------
+
+def test_strategy_shape_params_are_phase_vetted(loop):
+    """这七个值不是「调出来的」，是**扫过相位**之后唯一站得住的形状。
+
+    证据（1140 天 × 200 只，生产口径）：
+      · ``rebalance_days`` 5→15：5 天周期在 50bp 下结构必亏（每期边际 ~0.5%，
+        一次往返成本 ~1.1%）；15 天是「三档成本 + 相位平均」唯一同时为正的格子。
+      · ``hold_rank_slack`` 3.0：老仓只要还在保留线内就不换出，是降换手的第一杠杆。
+        与 ``rebalance_days`` 是同一件事的两个旋钮（周期管节奏、滞后管名次边界）。
+      · ``tilt_strength`` 0.0：倾斜 = 在波动最大的票上押最重，与风险平价反向；
+        实证 0 最优（1.341），任何 >0 单调劣化（1.043~1.238，回撤 −25.5%→−33.4%）。
+      · ``cash_reserve_pct`` 0.10：0% 在 10bp 下确实多 2.65pp（配对 t 3.73），
+        但 50bp 衰减到 1.53pp 且回撤更深 ⇒ 保留。
+      · ``max_positions`` 8 / ``band_pct`` 0.15 / ``weighting``：真 OOS 面板
+        RankIC .061、IC_IR 12.26、胜率 61.5% 那一组。
+
+    ⚠️ 这些值是**联合**成立的：改 ``max_positions`` 必须重算
+    ``max_sector_pct``（见 ``test_sector_cap_leaves_room_for_at_least_two_names``），
+    改 ``rebalance_days`` 必须重跑 ``scripts/exec_phase.py``。
+    """
+    assert int(loop.rebalance_days) == 15
+    assert float(loop.hold_rank_slack) == 3.0
+    assert int(loop.max_positions) == 8
+    assert float(loop.cash_reserve_pct) == 0.10
+    assert float(loop.band_pct) == 0.15
+    assert loop.weighting == "risk_parity"
+    assert float(loop.weight_cap) == 0.30
+    assert float(loop.tilt_strength) == 0.0
+
+
+def test_ab_baseline_c15_still_equals_the_production_caliber(loop):
+    """``scripts/exec_ab.py`` 里那个叫 ``c15`` 的方案必须**就是**生产口径。
+
+    所有「A 比 B 好 X pp」的历史结论都是相对 ``c15`` 记录的。生产一旦改了
+    周期/排名滞后/持仓数，"c15" 这个名字还在、数字却代表另一个策略 ——
+    此时引用旧结论就是引用别人家的回测。这条断言让那件事立刻响。
+    """
+    from scripts.exec_ab import BASE, SCENARIOS
+
+    c15 = dict(BASE)
+    c15.update(SCENARIOS["c15"])
+    assert int(c15["rebalance_days"]) == int(loop.rebalance_days)
+    assert float(c15["hold_rank_slack"]) == float(loop.hold_rank_slack)
+    assert int(c15["top_n"]) == int(loop.max_positions)
+    assert float(c15["cash_reserve_pct"]) == float(loop.cash_reserve_pct)
+    assert float(c15["band_pct"]) == float(loop.band_pct)
+    assert float(c15["weight_cap"]) == float(loop.weight_cap)
+    assert c15["weighting"] == loop.weighting
+    # 基准必须等于「个股层退出全关」的生产姿态
+    assert c15["stop_mode"] == "none"
+
+
+def test_phase_script_prod_base_matches_the_production_caliber(loop):
+    """``exec_phase.py`` 的 ``PROD_BASE`` 是硬写死的口径兜底。
+
+    它刻意不复用 ``SCENARIOS``：万一某个方案忘记覆盖，仍能保证「15 日 + slack3」。
+    代价是它自己会漂 —— 所以单独钉一遍。
+    """
+    from scripts.exec_phase import PROD_BASE
+
+    assert int(PROD_BASE["rebalance_days"]) == int(loop.rebalance_days)
+    assert float(PROD_BASE["hold_rank_slack"]) == float(loop.hold_rank_slack)
+    assert PROD_BASE["stop_mode"] == "none"
+
