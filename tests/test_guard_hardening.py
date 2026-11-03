@@ -349,21 +349,29 @@ def test_risk_budget_uses_static_stop_when_atr_off(tmp_path):
 # ----------------------------------------------------------------------
 # 5. 行业映射缺失时集中度检查不能被整段跳过
 # ----------------------------------------------------------------------
-def test_unknown_sector_is_bucketed_not_skipped(tmp_path):
-    """映射查不到的标的必须归入同一个「未知行业」桶继续受约束。
+def test_unknown_sector_is_skipped_not_bucketed(tmp_path):
+    """映射查不到时**跳过**集中度检查（2026-11-03 翻转，附翻转依据）。
 
-    回归背景（2026-10-26 实测）：``sector = industry_map.get(code, "")`` 之后
-    ``if sector:`` —— 查不到就整段放行（fail-open）。当时 industry_map 2616 条
-    只覆盖部分市场：当日 4 只选股里 603688 缺、2 只持仓里 300037 也缺，
-    这些买入完全不受集中度约束，而「不知道它是什么行业」本该按最保守假设处理。
+    历史：2026-10-26 曾把缺失映射归入同一个「未知行业」桶继续受约束，理由是
+    「不知道它是什么行业，就该按最保守假设处理」。这个推理错在一处：
+    **「未知」不是一个行业**，这些票彼此之间没有相关性，把它们当成同一行业
+    互相挤占额度，等于用「数据缺失」去惩罚「分散化」。
+
+    实测代价（2026-11-02）：计划 8 只、只成交 5 只，688702 / 002409 / 688037
+    三笔买入全被拒，原因都是「未知行业(映射缺失) 集中度已达上限 30%」；
+    计划权重合计 90%、实际持仓只有 55% —— 少掉 35pp 敞口。而执行级回测里
+    从来没有这条约束，所以「实盘跑不过回测」有一部分就是这么来的：
+    不是选股差，是**仓位建不满**。
+
+    现在的口径：缺失就跳过；覆盖率问题靠 scripts/build_industry_map.py 补，
+    不再把数据缺失转译成交易损失。
     """
     g = _guard(tmp_path, max_sector_pct=0.30)
     acct = _account(1_000_000.0)
-    positions = {"600000": _pos(40_000, price=10.0)}      # 未知行业已占 40%
+    positions = {"600000": _pos(40_000, price=10.0)}      # 「未知」已占 40%
 
-    why = g._check_portfolio_limits("300111", OrderSide.BUY, acct, positions)
-    assert why, "映射缺失时集中度检查被跳过了（fail-open）"
-    assert "未知行业" in why
+    assert g._check_portfolio_limits("300111", OrderSide.BUY, acct, positions) == "", \
+        "映射缺失必须跳过集中度检查（旧的「未知桶」行为已证伪）"
 
 
 def test_unknown_sector_below_cap_still_passes(tmp_path):

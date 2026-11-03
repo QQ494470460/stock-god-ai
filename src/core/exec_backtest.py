@@ -65,6 +65,15 @@ class ExecConfig:
     # 换手 0.0%）。要小仓位就必须改用 rel 口径，否则「风控生效」等于「系统停摆」。
     band_mode: str = "abs"
 
+    # ④ 行业集中度上限（占**总资产**比例）：实盘 ``guard.max_sector_pct=0.30`` 的等价物。
+    #    这是又一个「实盘有、回测没有」的约束 —— 8 只票各 12.5%，只要 3 只同行业
+    #    就撞线，实盘会直接拒绝第 3 笔买入（钱留现金，不摊给别人）。
+    #    回测里没有这条线 ⇒ 历史结论默认「想买多少买多少」，比实盘宽松。
+    #    0 = 关闭（默认，保持历史口径）；industry_map 缺失时也自动不生效（fail-open，
+    #    与实盘「映射缺失归入未知行业桶」同源，但回测不猜）。
+    max_sector_pct: float = 0.0
+    industry_map: Optional[Dict[str, str]] = None
+
     # ---- 成本（A 股保守值）----
     commission: float = 0.0003
     min_commission: float = 5.0
@@ -623,6 +632,34 @@ def run_exec_backtest(
                         cap = min(cap, cfg.risk_budget_pct / (width / 100.0))
                     caps[code] = cap
                 tw = {code: caps[code] for code in picks}
+
+                # 行业集中度上限：按「已确认的权重占比」顺序占用行业额度，
+                # 超线的票权重直接归零 —— 钱留现金，不摊给其他票（与实盘
+                # 「拒绝下单」而非「改买别的」一致）。
+                # 只拦新买入：已持仓且超限的票不会被强制卖出（实盘也如此）。
+                # ⚠️ 行业映射缺失的票**不占额度也不受限**（fail-open）。理由：
+                #    面板 200 只里只有 137 只有映射（68.5%），若让 63 只共用一个
+                #    「未知」桶，测出来的是「映射不全的代价」而不是「行业约束的代价」。
+                #    实盘里缺失票确实会被归桶并受限，但那是数据质量问题，应当靠
+                #    补全映射解决，不该混进策略结论。
+                if cfg.max_sector_pct > 0 and cfg.industry_map:
+                    _sec_cap = float(cfg.max_sector_pct)
+                    _scale = float(invest) / eq if eq > 0 else 0.0
+                    _used: Dict[str, float] = {}
+                    _kept: Dict[str, float] = {}
+                    for _c in sorted(picks, key=lambda x: -tw.get(x, 0.0)):
+                        _sec = cfg.industry_map.get(_c)
+                        _add = tw.get(_c, 0.0) * _scale
+                        if _sec is None:                      # 无映射 → 豁免
+                            _kept[_c] = tw.get(_c, 0.0)
+                            continue
+                        _sec = str(_sec)
+                        if _used.get(_sec, 0.0) + _add > _sec_cap + 1e-9:
+                            _kept[_c] = 0.0
+                        else:
+                            _kept[_c] = tw.get(_c, 0.0)
+                            _used[_sec] = _used.get(_sec, 0.0) + _add
+                    tw = _kept
 
                 # 当前权重
                 cur = {}

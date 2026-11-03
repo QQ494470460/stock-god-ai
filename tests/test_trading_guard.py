@@ -1166,3 +1166,57 @@ def test_guard_config_from_yaml_parses_sizing_and_sector(tmp_path):
     assert cfg.sizing_method == "volatility_target"
     assert cfg.max_sector_pct == pytest.approx(0.3)
     assert cfg.volatility_target_pct == pytest.approx(0.15)
+
+
+# ======================================================================
+# 行业集中度：映射缺失必须 fail-open（2026-11-03 修）
+# ======================================================================
+
+def _pos(code: str, mv: float) -> Position:
+    return Position(code=code, name=code, quantity=10000, available=10000,
+                    avg_cost=10.0, current_price=mv / 10000.0,
+                    market_value=mv, pnl=0.0, pnl_pct=0.0)
+
+
+def _acct(total: float) -> AccountInfo:
+    return AccountInfo(account_id="PAPER", total_asset=total, available_cash=total * 0.5,
+                       frozen_cash=0.0, market_value=total * 0.5, total_pnl=0.0,
+                       today_pnl=0.0)
+
+
+def _sup_with_map(tmp_path, imap, **cfg_kw):
+    cfg = GuardConfig(state_file=str(tmp_path / "s.json"),
+                      journal_file=str(tmp_path / "j.jsonl"), **cfg_kw)
+    return RiskSupervisor(FakeBroker(), cfg, paper_account=FakePaper(), industry_map=imap)
+
+
+def test_missing_industry_map_does_not_block_buy(tmp_path):
+    """映射缺失的票必须放行，不能被当成「未知行业」挤占额度。
+
+    2026-11-02 的真实代价：计划 8 只只成交 5 只，688702 / 002409 / 688037
+    三笔买入全被拒，原因都是「未知行业(映射缺失) 集中度已达上限 30%」。
+    计划权重 90%、实际持仓 55%，少掉的 35pp 敞口直接对应收益损失。
+
+    根因是逻辑错误：「未知」不是一个行业，这些票彼此**没有相关性**，
+    把它们当成同一行业互相挤占额度，等于用数据缺失去惩罚分散化。
+    """
+    sup = _sup_with_map(tmp_path, {"600000": "银行Ⅱ", "600001": "银行Ⅱ"},
+                        max_sector_pct=0.30)
+    positions = {"600000": _pos("600000", 290_000.0)}     # 银行已占 29%
+    acct = _acct(1_000_000.0)
+
+    # 无映射的票 → 放行（哪怕「未知桶」早就超过 30%）
+    assert sup._check_portfolio_limits("688702", OrderSide.BUY, acct, positions, 50_000.0) == ""
+    # 有映射且同行业 → 仍然要拦（约束本身不能失效）
+    why = sup._check_portfolio_limits("600001", OrderSide.BUY, acct, positions, 50_000.0)
+    assert "集中度" in why, f"同行业超限必须拦，实际: {why!r}"
+
+
+def test_sector_cap_still_bites_when_map_is_present(tmp_path):
+    """守卫的另一半：映射齐全时，行业超限必须真的拦住（别把修复做成放行一切）。"""
+    sup = _sup_with_map(tmp_path, {"A": "半导体", "B": "半导体"},
+                        max_sector_pct=0.30)
+    positions = {"A": _pos("A", 250_000.0)}
+    why = sup._check_portfolio_limits("B", OrderSide.BUY, _acct(1_000_000.0),
+                                      positions, 60_000.0)
+    assert "半导体" in why and "集中度" in why

@@ -246,3 +246,64 @@ def test_daily_halt_cooldown_extends_freeze():
                                                  daily_halt_pct=3.0,
                                                  daily_halt_cooldown_days=3)).metrics
     assert cooled["halt_days_pct"] > base["halt_days_pct"]
+
+
+# ======================================================================
+# 行业集中度上限（ExecConfig.max_sector_pct）—— 第 13 处「实盘有回测没有」
+# ======================================================================
+
+def _two_same_sector(n: int = 30):
+    """两只**同行业**、都在缓慢上涨的票。用来观察行业额度被谁吃满。"""
+    idx = pd.bdate_range("2026-01-05", periods=n)
+    a = np.array([10.0 * (1.01 ** k) for k in range(n)])
+    b = np.array([20.0 * (1.01 ** k) for k in range(n)])
+    sc = pd.DataFrame({"A": 1.0, "B": 0.9}, index=idx)
+    mk = lambda arr, code: pd.DataFrame({code: arr}, index=idx)  # noqa: E731
+    ohlc = {
+        "open": pd.concat([mk(a, "A"), mk(b, "B")], axis=1),
+        "close": pd.concat([mk(a, "A"), mk(b, "B")], axis=1),
+        "high": pd.concat([mk(a * 1.005, "A"), mk(b * 1.005, "B")], axis=1),
+        "low": pd.concat([mk(a * 0.995, "A"), mk(b * 0.995, "B")], axis=1),
+        "volume": pd.concat([mk(np.full(n, 1e6), "A"), mk(np.full(n, 1e6), "B")], axis=1),
+    }
+    return sc, ohlc
+
+
+_SECTOR = {"A": "银行Ⅱ", "B": "银行Ⅱ"}
+
+
+def test_max_sector_off_is_bit_identical():
+    """默认 0 = 关闭：必须与不传该参数逐位相同（新增闸门不能偷改历史结论）。"""
+    scores, ohlc = _two_same_sector()
+    cfg_kw = dict(top_n=2, rebalance_days=5, weight_cap=0.30)
+    a = run_exec_backtest(scores, ohlc, _cfg(**cfg_kw))
+    b = run_exec_backtest(scores, ohlc, _cfg(max_sector_pct=0.0, industry_map=_SECTOR, **cfg_kw))
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)
+
+
+def test_max_sector_cap_blocks_third_name_in_same_sector():
+    """行业额度被吃满后，后面的票权重归零（钱留现金），不是摊给别的票。
+
+    两只票各 30%（weight_cap）× 0.9 可投 = 27% 行业敞口：
+      · 上限 30% → 第二只 27+27=54% 超线 ⇒ 只买得进 1 只
+      · 上限 60% → 两只都买 ⇒ 吃满两只的涨幅，期末权益必然更高
+    这直接复现了实盘「计划要 4 只同行业、实际只成交 2 只」的偏差。
+    """
+    scores, ohlc = _two_same_sector()
+    cfg_kw = dict(top_n=2, rebalance_days=5, weight_cap=0.30, cash_reserve_pct=0.10)
+    tight = run_exec_backtest(scores, ohlc,
+                              _cfg(max_sector_pct=0.30, industry_map=_SECTOR, **cfg_kw))
+    loose = run_exec_backtest(scores, ohlc,
+                              _cfg(max_sector_pct=0.60, industry_map=_SECTOR, **cfg_kw))
+    end_tight = float(tight.equity.dropna().iloc[-1])
+    end_loose = float(loose.equity.dropna().iloc[-1])
+    assert end_loose > end_tight, "宽上限必须能买到更多、从而吃到更多涨幅"
+
+
+def test_max_sector_without_map_is_noop():
+    """没有行业映射时 fail-open：不猜行业、不误拦（否则映射缺失会变成静默减仓）。"""
+    scores, ohlc = _two_same_sector()
+    cfg_kw = dict(top_n=2, rebalance_days=5, weight_cap=0.30)
+    a = run_exec_backtest(scores, ohlc, _cfg(**cfg_kw))
+    b = run_exec_backtest(scores, ohlc, _cfg(max_sector_pct=0.30, industry_map=None, **cfg_kw))
+    assert np.allclose(a.equity.values, b.equity.values, equal_nan=True)

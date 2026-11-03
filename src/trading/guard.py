@@ -1843,24 +1843,34 @@ class RiskSupervisor:
                     and code not in {p.code for p in active}):
                 return f"持仓只数已达上限 {self.config.max_positions}"
             # 行业集中度
-            # 未知行业归入**同一个**「未知」桶，而不是跳过检查。
-            # 旧实现 ``sector = industry_map.get(code, "")`` 后 ``if sector:``
-            # —— 映射缺失就直接放行（fail-open）。实测 2026-10-26：
-            # industry_map 2616 条只覆盖部分市场，当日 4 只选股里 603688 缺、
-            # 2 只持仓里 300037 也缺 ⇒ 这两笔买入完全不受行业集中度约束，
-            # 而「我不知道它是什么行业」恰恰应该按最保守的假设处理。
-            sector = self.industry_map.get(code, "") or UNKNOWN_SECTOR
-            if sector == UNKNOWN_SECTOR:
+            # ⚠️ 2026-11-03 改回「映射缺失就跳过集中度检查」。
+            #
+            # 2026-10-26 曾改成「归入同一个未知桶」，理由是「不知道它是什么
+            # 行业，恰恰应该按最保守的假设处理」。这个推理是错的：
+            # **「未知」不是一个行业，这些票彼此之间没有相关性**。把它们当成
+            # 同一个行业互相挤占额度，等于用「数据缺失」去惩罚「分散化」。
+            #
+            # 实测代价（2026-11-02 计划 8 只，只成交 5 只）：
+            #   688702 / 002409 / 688037 三笔买入全部被拒，原因都是
+            #   「未知行业(映射缺失) 集中度已达上限 30%」；
+            #   计划权重合计 90%，实际持仓只有 55% —— 少了 35pp 敞口。
+            #   执行级回测里从来没有这条约束，所以「实盘跑不过回测」有一部分
+            #   就是这么来的：不是选股差，是**仓位建不满**。
+            #
+            # 正解是数据问题用数据解决（补全 industry_map），而不是把缺失值
+            # 当成一个伪行业去限额。这里保留告警，便于发现映射覆盖率下降。
+            sector = self.industry_map.get(code, "")
+            if not sector:
                 self._warn_missing_sector([code])
+                return ""          # 缺失 → 不参与行业集中度（其余检查已在上方完成）
             sector_val = sum(
                 p.market_value for p in active
-                if (self.industry_map.get(p.code, "") or UNKNOWN_SECTOR) == sector
+                if self.industry_map.get(p.code, "") == sector
             )
             # 估算新增：delta_value = 本次委托金额（预检时=0，复核时=实际下单额）
             cap = account.total_asset * self.config.max_sector_pct
             if sector_val + max(0.0, float(delta_value or 0.0)) >= cap:
-                label = "未知行业(映射缺失)" if sector == UNKNOWN_SECTOR else f"行业 {sector}"
-                return f"{label} 集中度已达上限 {self.config.max_sector_pct*100:.0f}%"
+                return f"行业 {sector} 集中度已达上限 {self.config.max_sector_pct*100:.0f}%"
         return ""
 
     def _warn_missing_sector(self, codes: List[str]) -> None:
@@ -1877,8 +1887,9 @@ class RiskSupervisor:
             return
         bucket.update(fresh)
         logger.warning(
-            f"⚠️ 行业映射缺失 {len(fresh)} 只（{', '.join(fresh[:8])}）→ 已归入"
-            f"「未知行业」桶参与集中度检查。补全请跑 scripts/build_industry_map.py"
+            f"⚠️ 行业映射缺失 {len(fresh)} 只（{', '.join(fresh[:8])}）→ 本次**跳过**"
+            f"行业集中度检查（未知票之间没有相关性，不能当同一行业限额）。"
+            f"补全请跑 scripts/build_industry_map.py"
         )
 
     def _portfolio_var_scale(self, account, positions) -> Tuple[float, dict]:
