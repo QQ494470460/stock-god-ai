@@ -181,6 +181,34 @@ def test_sector_cap_leaves_room_for_at_least_two_names(g, loop):
     assert float(g["max_sector_pct"]) >= 2 * per_name - 1e-9
 
 
+def test_sector_cap_never_regresses_to_the_damaging_levels(g):
+    """行业上限不得回到 30% / 40% —— 那不是保守，是单调有害。
+
+    1140 天 × 200 只 × 15 个调仓相位（相对「无上限」的逐相位配对差）：
+
+        上限     年化均值    Δ vs 无上限   配对t    回撤均值
+        无上限   21.93%      —            —       -26.84%
+        70%      21.91%      -0.03pp      -0.82   -26.84%
+        50%      21.48%      -0.45pp      -2.14   -26.84%   ← 当前
+        40%      21.25%      -0.68pp      -1.36   -26.77%
+        30%      20.25%      -1.68pp      -2.83   -26.67%   ← 旧值
+
+    **收得越紧收益越单调变差，而回撤几乎不动（26.84%→26.67%，仅 0.17pp）。**
+    也就是说这条线买到的不是回撤保护，只是买入了排名更低的票。
+
+    ⚠️ 所以保留 50% 的理由**不是**「它能降回撤」（实测降不了），而是模型风险：
+    回测只能覆盖发生过的事件，防不了没发生的行业级冲击。若有人想放到 70%
+    （实测是免费的，-0.03pp），可以，但必须按「政策选择」而不是「回测结论」来讲。
+    ⚠️ 另有一层盲区：面板 63/200、11-04 计划 4/8 只（占仓位 43%）没有行业映射，
+    引擎与实盘都 fail-open ⇒ 这条线对近一半仓位是瞎的。补全 industry_map
+    之前，任何关于它「够不够紧」的讨论都不完整。
+    """
+    assert float(g["max_sector_pct"]) >= 0.50 - 1e-9, (
+        f"max_sector_pct 被降到 {g['max_sector_pct']}：30% / 40% 在 15 个相位上"
+        "单调有害（-1.68pp / -0.68pp）且不降回撤")
+
+
+
 def test_weight_cap_is_consistent_with_position_count(loop):
     """单票上限不能低于等权权重，否则组合天生建不满。"""
     per_name = (1.0 - float(loop.cash_reserve_pct)) / int(loop.max_positions)
