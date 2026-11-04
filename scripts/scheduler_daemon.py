@@ -33,6 +33,7 @@ import argparse
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -67,9 +68,11 @@ from loguru import logger  # noqa: E402
 
 _HEARTBEAT_INTERVAL = 30.0     # 心跳写入间隔（秒）
 _REACQUIRE_INTERVAL = 300.0    # 没抢到调度器锁时的重试间隔（秒）
+_CATCHUP_INTERVAL = 600.0      # 「错过的作业」补跑检查间隔（秒）
 _TICK = 5.0                    # 主循环步长（秒）
 
 _stop = False
+_catchup_busy = False
 
 
 def _on_signal(signum, _frame):  # pragma: no cover - 信号路径
@@ -135,6 +138,48 @@ def _cfg_enabled() -> bool:
         return False
 
 
+def _kick_catch_up() -> None:
+    """后台补跑「错过的收盘后作业」。
+
+    为什么这件事必须由常驻进程做，而不是交给 APScheduler：它的 jobstore 在
+    内存里，**进程死掉/机器休眠的那段时间它根本不知道存在过**，恢复后只从
+    「现在」往后排下一次 —— 错过的窗口永久丢失。``misfire_grace_time`` 也救不了，
+    它只覆盖「进程活着、触发晚了」的窄窗口。
+
+    2026-11-04 就是这么丢的：常驻 loop 傍晚崩溃（调度器与它同进程），
+    18:30/18:45/19:00 三个作业全没触发，第二天整天没有交易计划，
+    而界面、心跳、日志一切正常。
+
+    放后台线程：补跑一次要好几分钟，阻塞主循环会让心跳断档、
+    看门狗误判「调度进程死了」。
+    """
+    global _catchup_busy
+    if _catchup_busy:
+        return
+    _catchup_busy = True
+
+    def _run() -> None:
+        global _catchup_busy
+        try:
+            from src.scheduler.auto_scheduler import catch_up_missed
+            res = catch_up_missed()
+            if res:
+                logger.warning(
+                    "⏰ 已补跑错过的作业：" +
+                    "、".join(f"{r['job']}({r.get('status')})" for r in res)
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"补跑检查异常（已忽略）: {e}")
+        finally:
+            _catchup_busy = False
+
+    try:
+        threading.Thread(target=_run, name="catch-up", daemon=True).start()
+    except Exception as e:  # noqa: BLE001
+        _catchup_busy = False
+        logger.debug(f"补跑线程启动失败（已忽略）: {e}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="收盘后自动化作业常驻进程")
     ap.add_argument("--once", action="store_true",
@@ -171,6 +216,7 @@ def main() -> int:
     holding = False
     last_try = 0.0
     last_hb = 0.0
+    last_catchup = 0.0
     watchdog = LoopWatchdog(interval=60.0)
     logger.info(f"🕒 常驻调度进程启动（pid={os.getpid()}）")
 
@@ -212,6 +258,13 @@ def main() -> int:
                     logger.warning(f"🩺 闭环看门狗：{res.get('detail')}")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"闭环看门狗异常（已忽略）: {e}")
+
+            # 错过的作业补跑。**与 holding 无关**：正因为它没抢到调度器锁，
+            # 才更要盯 —— 锁持有者（常驻 loop）可能已经死了，作业跟着一起丢。
+            if last_catchup == 0.0 or now - last_catchup >= _CATCHUP_INTERVAL:
+                last_catchup = now
+                if _cfg_enabled() and not args.once:
+                    _kick_catch_up()
 
             if args.once:
                 break

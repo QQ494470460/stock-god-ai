@@ -1164,6 +1164,67 @@ def test_backfilled_today_plan_is_not_rebuilt_on_every_tick(monkeypatch):
     assert box["n"] == 1, "补建后的当天计划被判定为无效，导致每个 tick 都重建"
 
 
+def _with_picks(plan, picks_date: str, lag: int):
+    plan.picks_date = picks_date
+    plan.picks_lag_days = lag
+    return plan
+
+
+def _warnings_of(fn):
+    from loguru import logger as _lg
+    msgs: list[str] = []
+    hid = _lg.add(lambda m: msgs.append(str(m)), level="WARNING")
+    try:
+        fn()
+    finally:
+        _lg.remove(hid)
+    return [m for m in msgs if "选股结果" in m]
+
+
+def test_stale_picks_on_a_disk_loaded_plan_are_reported(monkeypatch):
+    """**从磁盘读回来的**旧计划也必须喊出来。
+
+    这类计划最可疑：它可能在几天前就用旧票建好了（11-06 那批就是 11-03 的
+    picks 生成的，与 11-04 那份目标逐位相同），当天加载时毫无征兆。
+    ``build_trade_plan`` 的告警只在**生成时**触发，覆盖不到这条路径。
+    """
+    import src.trading.loop as loopmod
+
+    today_s = loopmod._today().strftime("%Y-%m-%d")
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = _with_picks(_plan_for(today_s), "2026-11-03", 3)
+
+    hits = _warnings_of(lambda: loop._ensure_plan(TickReport()))
+    assert len(hits) == 1, hits
+    assert "滞后 3 个交易日" in hits[0]
+
+
+def test_stale_picks_warning_fires_once_per_plan(monkeypatch):
+    """``_ensure_plan`` 每 tick 都跑 —— 不去重会把日志刷成一片。"""
+    import src.trading.loop as loopmod
+
+    today_s = loopmod._today().strftime("%Y-%m-%d")
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = _with_picks(_plan_for(today_s), "2026-11-03", 3)
+
+    def _three_ticks():
+        for _ in range(3):
+            loop._ensure_plan(TickReport())
+
+    assert len(_warnings_of(_three_ticks)) == 1
+
+
+def test_fresh_picks_do_not_warn(monkeypatch):
+    """滞后 1 是设计值（D-1 收盘选股 → D 日计划），不许报警。"""
+    import src.trading.loop as loopmod
+
+    today_s = loopmod._today().strftime("%Y-%m-%d")
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=False))
+    loop.plan = _with_picks(_plan_for(today_s), "2026-11-04", 1)
+
+    assert _warnings_of(lambda: loop._ensure_plan(TickReport())) == []
+
+
 def test_plan_is_built_when_nothing_usable_exists(monkeypatch):
     """确实没有任何可用计划时才重建 —— 这条保证上面那些「不重建」不是永真。"""
     import src.trading.trade_plan as tp

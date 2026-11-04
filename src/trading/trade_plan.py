@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -114,6 +115,13 @@ class TradePlan:
     # 「今天没进前 8」被换掉。没有它，实盘只能按「跌出目标组合即清仓」，
     # 换手率是回测最优配置的 1.7 倍（50bp 成本下年化差 6.4pp）。
     raw_rank: Dict[str, int] = field(default_factory=dict)
+    # 这份计划吃的是哪一天的选股报告，以及它相对 plan_date 滞后了几个**交易日**。
+    # 存在的理由：``load_latest_picks()`` 会安静地拿「最近一份」报告，
+    # 选股作业漏跑时它就变成几天前的旧票，而计划本身看起来完全正常。
+    # 落在计划文件里，UI / 审计工具才能把「这批票是旧的」摆到屏幕上。
+    # 旧计划文件没有这两个字段 → from_dict 回落到 ""/0（= 未知，不误报）。
+    picks_date: str = ""
+    picks_lag_days: int = 0
 
     # ---------- 便捷视图 ----------
     @property
@@ -148,6 +156,8 @@ class TradePlan:
                 for k, v in (d.get("raw_rank") or {}).items()
                 if str(k).strip()
             },
+            picks_date=str(d.get("picks_date", "") or ""),
+            picks_lag_days=int(d.get("picks_lag_days", 0) or 0),
         )
 
     # ---------- 有效性 ----------
@@ -185,6 +195,10 @@ class TradePlan:
             f"  目标 {len(self.targets)} 只 · 现金保留 {self.cash_reserve_pct*100:.0f}% · "
             f"仓位上限 {self.max_positions} 只",
         ]
+        if self.picks_date:
+            lag = f"，滞后 {self.picks_lag_days} 个交易日" if self.picks_lag_days else ""
+            flag = "  ⚠️ 选股结果陈旧" if self.picks_lag_days >= 2 else ""
+            lines.append(f"  选股报告 {self.picks_date}{lag}{flag}")
         for i, t in enumerate(self.targets, 1):
             lines.append(
                 f"  {i:>2}. {t.code} {t.name}  评分 {t.score:>5.1f}  "
@@ -493,6 +507,7 @@ def build_trade_plan(
     weight_cap: Optional[float] = None,
     risk_stats: Optional[dict] = None,
     tilt_strength: float = 0.0,
+    picks_date: Optional[str] = None,
     write: bool = True,
     plan_dir: Optional[Path] = None,
 ) -> TradePlan:
@@ -502,17 +517,38 @@ def build_trade_plan(
     weight_cap 建议传风控 guard 的 max_single_position_pct（默认 0.30），
     使计划与风控口径一致。
 
+    ``picks_date``：调用方**自己知道**这批 picks 是哪天的报告时显式传入
+    （例如 ``job_daily_pick`` 刚跑出报告就建计划）。显式传 picks 时 meta 为空，
+    不传这个就永远记不到 ``picks_date``，下游的新鲜度审计会一直是「未知」——
+    而夜间那次正常生成恰恰是唯一每天都走的路径。
+
     市场状态自适应：当 ``regime`` 命中 ``REGIME_POSITION_OVERRIDES`` 且调用方
     未显式传入 ``max_positions`` / ``cash_reserve_pct`` 时，自动套用该状态的
     防御性组合参数（熊市→少而精+多现金，牛市→略放开）。显式传参优先。
     """
     # 1. 拿 picks
+    meta: Dict[str, Any] = {}
     if picks is None:
         picks, meta = load_latest_picks()
         pool = pool or meta.get("pool", "")
         min_score = min_score or float(meta.get("min_score", 0) or 0)
         regime = regime or str(meta.get("regime") or "")
         source = source or meta.get("source", "daily_pick")
+
+    # 1b. 新鲜度裁决。**只在这一处**算 plan_date：下面构造 TradePlan 也用它。
+    #     两处各调一次 resolve_target_date() 会在跨午夜时得到两个不同的日期，
+    #     而「计划的有效日」和「新鲜度的基准日」必须是同一天。
+    _plan_date_str = plan_date or resolve_target_date()
+    fresh = picks_staleness(
+        {"report_date": picks_date} if picks_date else meta, _plan_date_str
+    )
+    if fresh.get("stale"):
+        # 这是「安静地不做事」里最贵的一种：选股作业漏跑 → 计划换了批几天前的
+        # 旧票，而计划文件、界面、审计看板全都显示正常。
+        # 实跑证据（2026-11-05）：11-04 傍晚 loop 崩溃 → 18:45 选股作业没触发 →
+        # 11-05 补建计划时吃到 11-03 的 picks，8 只里 4 只缺行业映射、合计 43% 权重，
+        # 与 11-04 那份目标**逐位相同**，没有任何一处报错。
+        logger.warning(f"⚠️ 交易计划用的是旧选股结果：{fresh['reason']}")
 
     rows = _normalize_picks(picks)
 
@@ -558,7 +594,7 @@ def build_trade_plan(
                     risk_stats=risk_stats, tilt_strength=tilt_strength)
 
     plan = TradePlan(
-        plan_date=plan_date or resolve_target_date(),
+        plan_date=_plan_date_str,
         created_at=datetime.now().isoformat(timespec="seconds"),
         source=source,
         pool=pool,
@@ -569,6 +605,8 @@ def build_trade_plan(
         max_positions=max_positions,
         weighting=weighting,
         raw_rank=raw_rank,
+        picks_date=str(fresh.get("report_date") or ""),
+        picks_lag_days=int(fresh.get("lag_days") or 0),
     )
 
     if write:
@@ -645,29 +683,122 @@ def load_latest_plan(plan_dir: Optional[Path] = None) -> Optional[TradePlan]:
     return None
 
 
+_PICKS_NAME_RE = re.compile(r"daily_picks_(\d{4})(\d{2})(\d{2})(?:_(\d{4}))?\.json$")
+
+
+def _report_date_of(path: Path) -> str:
+    """从 ``daily_picks_YYYYMMDD_HHMM.json`` 取出报告日期（``YYYY-MM-DD``）。
+
+    刻意用**文件名**而不是 ``generated_at`` 或 mtime：文件名是生成端写死的
+    业务日期，而 mtime 会被拷贝/同步改写，``generated_at`` 在部分历史报告里
+    缺失。取不到就返回空串（调用方据此判定「未知」，不猜）。
+    """
+    m = _PICKS_NAME_RE.search(Path(path).name)
+    if not m:
+        return ""
+    y, mo, d = m.group(1), m.group(2), m.group(3)
+    try:
+        return date(int(y), int(mo), int(d)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def picks_staleness(meta: dict, plan_date: Optional[str] = None) -> dict:
+    """评估这批 picks 相对计划日陈旧到什么程度（按**交易日**，不是日历日）。
+
+    时点约定（与 ``is_valid_for`` 同一套）：D-1 收盘后跑选股 → 生成 D 日的计划。
+    所以 ``报告日 = D-1、计划日 = D`` 时滞后 **1 个交易日**，这是正常值。
+    滞后 ≥2 说明中间至少有一个交易日没跑成选股作业，计划吃的仍是旧票 ——
+    而计划文件本身看起来毫无异常，这是「安静地不做事」最典型的形态。
+
+    Returns::
+
+        {"report_date": "2026-11-03", "plan_date": "2026-11-06",
+         "lag_days": 3, "stale": True,
+         "skipped_reports": 0, "reason": "选股报告 2026-11-03 距今 3 个交易日…"}
+
+    ``stale`` 只在**能证明**滞后 ≥2 时为 True；拿不到报告日期时保持 False
+    并把原因写进 ``reason``——宁可少报，也不要每次重建计划都叫一次。
+    """
+    rep = str((meta or {}).get("report_date") or "")
+    pd_ = str(plan_date or "")
+    out = {
+        "report_date": rep, "plan_date": pd_, "lag_days": 0,
+        "stale": False, "skipped_reports": int((meta or {}).get("skipped_reports", 0) or 0),
+        "reason": "",
+    }
+    if not rep:
+        out["reason"] = "选股报告日期未知（无报告或文件名不合规），无法判断陈旧度"
+        return out
+    if not pd_:
+        pd_ = resolve_target_date()
+        out["plan_date"] = pd_
+    try:
+        r_d = datetime.strptime(rep, "%Y-%m-%d").date()
+        p_d = datetime.strptime(pd_, "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        out["reason"] = f"日期解析失败（report={rep!r}, plan={pd_!r}）"
+        return out
+
+    try:
+        from src.trading.calendar import trading_days_between
+        lag = int(trading_days_between(r_d, p_d))
+    except Exception:  # noqa: BLE001
+        # 日历不可用时退化成自然日差（会偏大，只会更容易告警，不会漏报）
+        lag = max(0, (p_d - r_d).days)
+    out["lag_days"] = lag
+
+    if lag >= 2:
+        out["stale"] = True
+        out["reason"] = (
+            f"选股报告 {rep} 距今 {lag} 个交易日（正常应为 1）—— "
+            "中间有交易日的选股作业没跑成，计划用的是旧票"
+        )
+        if out["skipped_reports"]:
+            out["reason"] += (
+                f"；另有 {out['skipped_reports']} 份更晚的报告是空的（选股失败），已被跳过"
+            )
+    return out
+
+
 def load_latest_picks(report_dir: Optional[Path] = None) -> tuple[List[dict], dict]:
-    """读取最近一份每日推荐报告的 picks（离线兜底数据源）。"""
+    """读取最近一份**有 picks 的**每日推荐报告（离线兜底数据源）。
+
+    ⚠️ 两个容易忽略的行为，都在 meta 里显式交代，别让下游蒙在鼓里：
+
+    1. **会跳过空报告**。最新那份报告若是选股失败（``picks=[]``），这里会
+       继续往前找 —— 于是「今天选不出来」被悄悄替换成「用前天的票」。
+       ``meta["skipped_reports"]`` 记录跳过了几份，供告警使用。
+    2. **不做新鲜度判断**。取哪份是「最近有内容的」，是否陈旧由调用方用
+       :func:`picks_staleness` 裁决（``build_trade_plan`` 已经这么做了）。
+    """
     from config.settings import config as app_config
     d = Path(report_dir) if report_dir else Path(app_config.scheduler.report_dir)
     if not d.exists():
         return [], {}
     files = sorted(d.glob("daily_picks_*.json"))
+    skipped = 0
     for f in reversed(files):
         try:
             rep = json.loads(f.read_text(encoding="utf-8"))
-            picks = rep.get("picks") or []
-            meta = {
-                "pool": rep.get("pool", ""),
-                "min_score": rep.get("min_score", 0),
-                "regime": rep.get("regime") or "",
-                "source": "daily_pick",
-                "generated_at": rep.get("generated_at", ""),
-            }
-            if picks:
-                return picks, meta
         except Exception:  # noqa: BLE001
+            skipped += 1          # 解析失败也算「这份没内容」
             continue
-    return [], {}
+        picks = rep.get("picks") or []
+        if not picks:
+            skipped += 1
+            continue
+        return picks, {
+            "pool": rep.get("pool", ""),
+            "min_score": rep.get("min_score", 0),
+            "regime": rep.get("regime") or "",
+            "source": "daily_pick",
+            "generated_at": rep.get("generated_at", ""),
+            "report_date": _report_date_of(f),
+            "report_file": f.name,
+            "skipped_reports": skipped,
+        }
+    return [], {"skipped_reports": skipped}
 
 
 def plan_diff(plan: TradePlan, held_codes: Sequence[str]) -> Dict[str, List[str]]:

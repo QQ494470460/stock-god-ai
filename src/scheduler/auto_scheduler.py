@@ -29,9 +29,9 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -197,6 +197,11 @@ def _job_daily_pick_impl(dry_run: bool = False) -> Dict:
                     weighting=tc.weighting,
                     weight_cap=cap,
                     tilt_strength=tc.tilt_strength,
+                    # 显式传 picks 时没有 meta，不传这一项计划里就永远没有
+                    # picks_date，新鲜度审计会一直显示「未知」。而夜间这次
+                    # 生成**恰恰是唯一每天都走的路径**。
+                    picks_date=(str(report.get("generated_at") or "")[:10]
+                                or datetime.now().strftime("%Y-%m-%d")),
                     write=not dry_run,
                 )
                 info["plan_date"] = plan.plan_date
@@ -294,6 +299,214 @@ def _skipped(job: str, ttl: float) -> Dict:
             "at": datetime.now().isoformat(timespec="seconds")}
 
 
+# ----------------------------------------------------------------------------
+# 作业记账 + 「错过的窗口」补跑
+# ----------------------------------------------------------------------------
+# 为什么需要这一层
+# ----------------
+# APScheduler 用的是**内存 jobstore**：进程死掉 / 机器休眠期间的时间窗，它
+# 根本不知道发生过，恢复后只从「现在」往后算下一次 —— 错过的就永久错过。
+# 而 ``misfire_grace_time`` 救不了：它只覆盖「进程活着、但触发晚了」的窄窗口，
+# 进程不在的那段压根不会进 APScheduler 的视野。
+#
+# 2026-11-04 实测：常驻 loop 傍晚崩溃（调度器与它同进程），18:30 数据更新 /
+# 18:45 选股 / 19:00 进化三个作业全没触发，第二天**整个交易日没有交易计划**，
+# 而界面、心跳、日志一切正常 —— 这是「安静地不做事」最贵的形态。
+#
+# 这里只做一件事：每个作业跑完记一笔，再对比「按 cron 本该最近一次触发的时间」，
+# 该跑没跑就补跑一次。刻意**只补 data_update / daily_pick** —— 它们决定
+# 「明天有没有计划」；而 evolution 会写参数状态，绝不该被自动补跑。
+
+JOB_RUNS_PATH: Path = Path(DATA_DIR) / "job_runs.json"
+
+# 补跑范围：只补决定「明天有没有计划」的两个。**顺序即执行顺序** ——
+# 行情没更新就去选股，等于用旧数据选今天的票。
+CATCH_UP_JOBS: tuple = ("data_update", "daily_pick")
+
+# 超过这么久就不再补。隔了一整天还去补跑一个「收盘后」作业，得到的计划属于
+# 后天，对今天毫无意义，只会白占 CPU —— 那时该由 TradingLoop._ensure_plan 兜底。
+CATCH_UP_MAX_LAG_SEC: int = 12 * 3600
+
+# 反推 cron 触发时刻的回溯上限。只给枚举一个起点，
+# 真正的时效判断由 CATCH_UP_MAX_LAG_SEC 负责。
+_CATCH_UP_LOOKBACK_DAYS: int = 7
+
+
+def _job_runs_load() -> Dict[str, dict]:
+    """读作业记账。任何异常都当空账 —— 记账坏了不该阻断作业本身。"""
+    try:
+        data = json.loads(Path(JOB_RUNS_PATH).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _job_runs_mark(job_id: str, at: Optional[datetime] = None) -> None:
+    """记一笔「``job_id`` 在 at 跑完了」。原子替换落盘，避免读到半截 JSON。"""
+    at = at or datetime.now()
+    try:
+        data = _job_runs_load()
+        data[job_id] = {"at": at.isoformat(timespec="seconds")}
+        p = Path(JOB_RUNS_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"作业记账写入失败（已忽略）: {e}")
+
+
+def _parse_iso(s) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(s))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tracked(job_id: str):
+    """给作业加记账：跑完（且不是「被别人占着而跳过」）就记下时间。
+
+    为什么必须记在**作业函数里**而不是注册处：``run_all_once`` 和补跑本身都
+    直接调作业函数，绕开了 APScheduler 的注册包装。记在函数里才覆盖全部路径。
+    """
+
+    def deco(fn):
+        def wrapper(*a, **k):
+            res = fn(*a, **k)
+            try:
+                # 「被别的进程占着」说明它正在跑，由那个进程自己记账；
+                # 这里记了等于把「跳过」当成「跑过」，会让真正的漏跑被掩盖。
+                if not (isinstance(res, dict) and res.get("status") == "skipped"):
+                    _job_runs_mark(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return res
+
+        wrapper.__name__ = getattr(fn, "__name__", f"job_{job_id}")
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    return deco
+
+
+def last_fire_time(cron: str, now: Optional[datetime] = None) -> Optional[datetime]:
+    """cron 在 ``now``（含）之前**最近一次应当触发**的本地时间。
+
+    刻意借 APScheduler 自己的 ``CronTrigger`` 反推，而不是另写一个 cron 解析器 ——
+    两套解析器迟早分叉，那时「补跑判断」和「真实调度」说的就不是同一件事了。
+    """
+    trig = _make_trigger(cron)
+    if trig is None:
+        return None
+    naive_now = now or datetime.now()
+    aware_now = naive_now if naive_now.tzinfo else naive_now.astimezone()
+    cursor = aware_now - timedelta(days=_CATCH_UP_LOOKBACK_DAYS)
+    prev = None
+    for _ in range(4000):          # 上限只为防脏 cron 死循环
+        nxt = trig.get_next_fire_time(prev, cursor)
+        if nxt is None or nxt > aware_now:
+            break
+        prev, cursor = nxt, nxt
+    return prev.astimezone().replace(tzinfo=None) if prev is not None else None
+
+
+_CRON_ATTR = {"data_update": "data_update_cron", "daily_pick": "daily_pick_cron"}
+
+
+def _catch_up_crons() -> Dict[str, str]:
+    s = app_config.scheduler
+    return {j: str(getattr(s, _CRON_ATTR[j], "") or "") for j in CATCH_UP_JOBS}
+
+
+def _market_window(now: Optional[datetime] = None) -> bool:
+    """现在是否处于「别来抢 CPU」的时段（交易日 09:00–15:30）。
+
+    用整个**盘中时段**而不只是连续竞价：补跑一次要扫全池、占满 CPU 好几分钟，
+    09:20 把机器打满和 09:35 打满对开盘那几笔单的伤害是一样的。
+    """
+    now = now or datetime.now()
+    try:
+        from src.trading.calendar import is_trading_day
+
+        if not is_trading_day(now):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return (9, 0) <= (now.hour, now.minute) <= (15, 30)
+
+
+def missed_jobs(now: Optional[datetime] = None,
+                respect_trading_hours: bool = True) -> List[dict]:
+    """哪些作业「本该跑、但没跑」。**纯判断，不执行任何作业。**
+
+    ``respect_trading_hours``：盘中不补跑。补跑要扫全池、占满 CPU，跟盘中闭环
+    抢资源；而且盘中的计划已由 ``TradingLoop._ensure_plan`` 兜底补建。
+    判断用的是**传入的 now**，不是真实时钟 —— 否则这个函数在测试里是薛定谔的。
+    """
+    now = now or datetime.now()
+    if respect_trading_hours and _market_window(now):
+        logger.info("盘中不补跑收盘后作业（避免与闭环抢 CPU），收盘后再补")
+        return []
+
+    runs = _job_runs_load()
+    out: List[dict] = []
+    for jid, cron in _catch_up_crons().items():
+        if not cron:
+            continue
+        fire = last_fire_time(cron, now)
+        if fire is None:
+            continue
+        lag = (now - fire).total_seconds()
+        if lag < 0 or lag > CATCH_UP_MAX_LAG_SEC:
+            continue
+        rec = runs.get(jid) or {}
+        at = _parse_iso(rec.get("at"))
+        if at is None:
+            # 没有记账 = 无法判断是否真漏（也可能只是刚部署、从没记过账）。
+            # 宁可少补，也不要每次启动都白跑一遍全池选股。
+            logger.info(f"作业 {jid} 无记账记录，跳过补跑（无法判断是否真的漏了）")
+            continue
+        if at >= fire:
+            continue
+        out.append({"job": jid, "missed_at": fire.isoformat(timespec="seconds"),
+                    "lag_sec": int(lag), "last_run": rec.get("at")})
+    return out
+
+
+def catch_up_missed(now: Optional[datetime] = None, dry_run: bool = False,
+                    runner=None) -> List[dict]:
+    """把错过的作业补跑一遍（顺序见 ``CATCH_UP_JOBS``）。返回每次补跑的结果。
+
+    ``runner``：``runner(job_id) -> dict``，供测试注入；默认按名字取 ``job_<id>``。
+    ``dry_run``：只报告会补哪些，不真跑。
+    """
+    todo = missed_jobs(now)
+    if not todo:
+        return []
+    results: List[dict] = []
+    for item in todo:
+        jid = item["job"]
+        logger.warning(
+            f"⏰ 补跑错过的作业 {jid}：本该在 {item['missed_at']} 触发，"
+            f"已晚 {item['lag_sec'] // 60} 分钟（上次成功 {item['last_run']}）"
+        )
+        if dry_run:
+            results.append({**item, "status": "would_run"})
+            continue
+        try:
+            fn = runner(jid) if runner is not None else globals().get(f"job_{jid}")
+            if fn is None:
+                results.append({**item, "status": "no_runner"})
+                continue
+            res = fn()
+            results.append({**item, "status": (res or {}).get("status", "ok"),
+                            "result": res})
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"补跑 {jid} 失败: {e}\n{traceback.format_exc()}")
+            results.append({**item, "status": "error", "error": str(e)})
+    return results
+
+
 def _job_industry_map_impl() -> Dict:
     """机会主义地补齐「代码 → 所属行业」。
 
@@ -335,6 +548,7 @@ def _job_industry_map_impl() -> Dict:
     return info
 
 
+@_tracked("industry_map")
 def job_industry_map() -> Dict:
     """行业映射补齐（带跨进程租约，每小时一次）。"""
     with _job_lease("industry_map", ttl_sec=1800) as ok:
@@ -343,6 +557,7 @@ def job_industry_map() -> Dict:
         return _job_industry_map_impl()
 
 
+@_tracked("data_update")
 def job_data_update() -> Dict:
     """数据更新（带跨进程租约）。"""
     with _job_lease("data_update", ttl_sec=1800) as ok:
@@ -351,6 +566,7 @@ def job_data_update() -> Dict:
         return _job_data_update_impl()
 
 
+@_tracked("daily_pick")
 def job_daily_pick(dry_run: bool = False) -> Dict:
     """每日推荐 + 交易计划（带跨进程租约）。dry_run 不写报告。"""
     with _job_lease("daily_pick", ttl_sec=3600) as ok:
@@ -359,6 +575,7 @@ def job_daily_pick(dry_run: bool = False) -> Dict:
         return _job_daily_pick_impl(dry_run=dry_run)
 
 
+@_tracked("evolution")
 def job_evolution() -> Dict:
     """回测验证 + 自我进化（带跨进程租约）。"""
     with _job_lease("evolution", ttl_sec=3600) as ok:
@@ -367,6 +584,7 @@ def job_evolution() -> Dict:
         return _job_evolution_impl()
 
 
+@_tracked("rolling_ic")
 def job_rolling_ic(days: int = 5, dry_run: bool = False) -> Dict:
     """每日 RankIC 回填（带跨进程租约）。
 
@@ -391,6 +609,7 @@ def _job_rolling_ic_impl(days: int = 5, dry_run: bool = False) -> Dict:
     return {"job": "rolling_ic", **res, "at": datetime.now().isoformat(timespec="seconds")}
 
 
+@_tracked("drift_retrain")
 def job_drift_retrain() -> Dict:
     """T4 漂移触发重训（**默认关闭**，受 ``scheduler.drift_retrain_enabled`` 控制）。
 

@@ -349,6 +349,9 @@ class TradingLoop:
 
         # 计划与状态
         self.plan = None
+        # 已经喊过「这批票是旧的」的计划日期。告警只在计划**换了一份**时喊一次：
+        # _ensure_plan 每 tick 都跑，不设这个就会把日志刷成一片。
+        self._stale_picks_warned: set = set()
         self._state: LoopState = LoopState.STOPPED
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
@@ -714,7 +717,44 @@ class TradingLoop:
             logger.error(f"交易计划生成失败: {e}")
             return None
 
+    def _warn_if_picks_stale(self) -> None:
+        """计划吃的选股结果太旧就喊一声（同一份计划只喊一次）。
+
+        ``build_trade_plan`` 在**生成时**已经喊过，但从磁盘读回来的旧计划没人管 ——
+        而这类计划恰恰最可疑：它可能在几天前就用旧票建好了
+        （2026-11-05 挖到的那批 `trade_plan_20261106.json` 就是 11-03 的 picks
+        生成的，与 11-04 那份目标逐位相同），当天加载时毫无征兆。
+
+        滞后 0/1 是正常的（D-1 收盘选股 → D 日计划），>=2 才说明中间漏了作业。
+        按 ``plan_date:lag`` 去重：`_ensure_plan` 每 tick 都跑，不去重会刷屏。
+        """
+        plan = self.plan
+        if plan is None:
+            return
+        lag = int(getattr(plan, "picks_lag_days", 0) or 0)
+        if lag < 2:
+            return
+        key = f"{plan.plan_date}:{lag}"
+        if key in self._stale_picks_warned:
+            return
+        self._stale_picks_warned.add(key)
+        logger.warning(
+            f"⚠️ 计划 {plan.plan_date} 吃的是 "
+            f"{getattr(plan, 'picks_date', '') or '未知日期'} 的选股结果，"
+            f"滞后 {lag} 个交易日（正常应为 1）—— 这期间有选股作业没跑成。"
+            "目标组合可能已不代表今天的市场。"
+        )
+
     def _ensure_plan(self, report: TickReport):
+        """确保手上有一份**属于今天**的交易计划（实现见 ``_ensure_plan_impl``）。
+
+        这层薄包装只为了一件事：不管内部从哪条分支提前 return，
+        都要对**最终选定的那份计划**做一次陈旧度检查。
+        """
+        self._ensure_plan_impl(report)
+        self._warn_if_picks_stale()
+
+    def _ensure_plan_impl(self, report: TickReport):
         """确保手上有一份**属于今天**的交易计划。
 
         时点约定（很容易搞错，故写在这里）：计划是**收盘后为下一个交易日**

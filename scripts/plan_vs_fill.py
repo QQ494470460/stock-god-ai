@@ -196,12 +196,20 @@ def audit(date: str | None = None, data_dir: Path | None = None,
 
     unmapped_share, unmapped_codes = unmapped_weight(plan_w, ddir)
 
+    # 这份计划吃的是哪天的选股结果 —— 与「建满度」并列，因为「用旧票建满仓」
+    # 和「用好票没建满」都是实盘跑不过回测的独立原因，且都不报错。
+    # 滞后 >=2 个交易日 = 中间有选股作业没跑成（计划文件本身看不出来）。
+    picks_lag = int(plan.get("picks_lag_days") or 0)
+
     return {
         "at": now.isoformat(timespec="seconds"),
         "plan_date": key,
         "pending": pending,
         "plan_source": plan.get("source") or "",
         "plan_regime": plan.get("regime") or "",
+        "picks_date": plan.get("picks_date") or "",
+        "picks_lag_days": picks_lag,
+        "picks_stale": picks_lag >= 2,
         "n_planned": len(targets),
         "weight_plan_total": round(plan_sum, 4),
         "weight_filled_total": round(filled_sum, 4),
@@ -221,6 +229,12 @@ def render(rep: dict) -> str:
     lines = []
     lines.append(f"计划日期 {rep['plan_date']}（{rep['plan_source']}，regime={rep['plan_regime']}）")
     lines.append(f"权益 ¥{rep['equity']:,.0f}   现金占比 {rep['cash_pct']:.1%}")
+    if rep.get("picks_stale"):
+        lines.append(f"🗞 选股结果陈旧：报告 {rep.get('picks_date') or '?'} 距今 "
+                     f"{rep.get('picks_lag_days')} 个交易日（正常应为 1）"
+                     f" —— 计划吃的是旧票，先查当日选股作业有没有跑成")
+    elif rep.get("picks_date"):
+        lines.append(f"🗞 选股报告 {rep['picks_date']}（滞后 {rep.get('picks_lag_days') or 0} 个交易日）")
     share = rep.get("unmapped_weight_pct") or 0.0
     if share > 0:
         flag = "⚠️ 集中度上限对该部分免检" if share >= 0.30 else "（集中度上限对其免检）"

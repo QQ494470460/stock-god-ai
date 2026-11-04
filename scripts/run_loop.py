@@ -458,6 +458,27 @@ def _run() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ 无头调度自动拉起失败（已忽略，闭环继续）: {e}", file=sys.stderr)
 
+        # 补跑「错过的收盘后作业」。本进程通常是在崩溃/休眠之后被看门狗拉起来的，
+        # 而 APScheduler 的内存 jobstore 不会知道那段停机时间里该触发什么 ——
+        # 不补的话，第二天会没有交易计划，而界面上一切正常。
+        # 放后台线程：补跑要几分钟，不能挡住闭环第一次 tick。
+        try:
+            import threading
+            from src.scheduler.auto_scheduler import catch_up_missed
+
+            def _catch_up() -> None:
+                try:
+                    res = catch_up_missed()
+                    if res:
+                        print("⏰ 已补跑错过的作业：" +
+                              "、".join(f"{r['job']}({r.get('status')})" for r in res))
+                except Exception as e:  # noqa: BLE001
+                    print(f"补跑检查异常（已忽略）: {e}", file=sys.stderr)
+
+            threading.Thread(target=_catch_up, name="catch-up", daemon=True).start()
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 补跑检查未启动（已忽略）: {e}", file=sys.stderr)
+
     intentional_stop = False
     try:
         if args.preview:
