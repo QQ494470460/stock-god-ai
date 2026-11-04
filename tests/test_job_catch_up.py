@@ -286,3 +286,37 @@ def test_corrupt_state_file_is_treated_as_empty(_state):
 def test_missing_state_file_is_not_an_error(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "JOB_RUNS_PATH", tmp_path / "nope" / "job_runs.json")
     assert A._job_runs_load() == {}
+
+
+# ---------------------------------------------------------------------------
+# 首次建立基准
+# ---------------------------------------------------------------------------
+
+def test_first_run_bootstraps_instead_of_replaying_history(_state):
+    """新部署的机器从没记过账 —— 补跑一次不许把历史上所有窗口都补一遍。
+
+    否则部署当天就会白跑一遍全池选股（几分钟 CPU），而那天本来没漏任何东西。
+    """
+    assert not _state.exists()
+    res = A.catch_up_missed(_at(THU, 19, 30), runner=lambda j: pytest.fail("不该跑"))
+    assert res == []
+    assert _state.exists()
+    assert set(A._job_runs_load()) >= {"data_update", "daily_pick"}
+
+
+def test_bootstrap_never_touches_an_existing_record(_state):
+    """已有记账时绝不动它 —— 否则每次启动都等于「宣布所有作业刚跑过」，
+    真正的漏跑就被抹掉了，而那正是这个机制要防的事。
+    """
+    _mark("daily_pick", _at(THU - timedelta(days=1), 18, 45))
+    before = A._job_runs_load()["daily_pick"]["at"]
+
+    assert A._job_runs_bootstrap(_at(THU, 19, 30)) is False
+    assert A._job_runs_load()["daily_pick"]["at"] == before
+
+
+def test_bootstrap_does_not_suppress_a_real_miss(_state):
+    """基准建立**之后**再漏的，照样要补。"""
+    A._job_runs_bootstrap(_at(THU - timedelta(days=1), 20, 0))
+    got = {m["job"] for m in _missed(_at(THU, 19, 30))}
+    assert got == {"data_update", "daily_pick"}

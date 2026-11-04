@@ -412,6 +412,44 @@ def last_fire_time(cron: str, now: Optional[datetime] = None) -> Optional[dateti
 
 _CRON_ATTR = {"data_update": "data_update_cron", "daily_pick": "daily_pick_cron"}
 
+# 所有带记账的作业（与 @_tracked 的 id 一一对应）。只用于首次建立基准。
+_ALL_TRACKED = ("data_update", "daily_pick", "evolution",
+                "rolling_ic", "industry_map", "drift_retrain")
+
+
+def _job_runs_bootstrap(now: Optional[datetime] = None) -> bool:
+    """首次记账：``job_runs.json`` 还不存在时，把**现在**当作基准。
+
+    不做这一步的话，新部署的机器永远「无记账记录」→ 永远不补跑，
+    等于机制从没生效过；而如果反过来把历史全当漏跑，部署当天就会白跑一遍
+    全池选股。
+
+    只在文件**不存在**时动手。已有文件绝不动 —— 否则每次启动都等于
+    「宣布所有作业刚跑过」，会把真正的漏跑抹掉，那正是这个机制要防的事。
+    """
+    p = Path(JOB_RUNS_PATH)
+    try:
+        if p.exists():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    at = now or datetime.now()
+    stamp = at.isoformat(timespec="seconds")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({jid: {"at": stamp, "baseline": True} for jid in _ALL_TRACKED},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, p)
+        logger.info(f"🕒 作业记账首次建立（基准时间 {stamp}）：从此刻起算，不补历史窗口")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"作业记账初始化失败（已忽略）: {e}")
+        return False
+
 
 def _catch_up_crons() -> Dict[str, str]:
     s = app_config.scheduler
@@ -480,6 +518,8 @@ def catch_up_missed(now: Optional[datetime] = None, dry_run: bool = False,
     ``runner``：``runner(job_id) -> dict``，供测试注入；默认按名字取 ``job_<id>``。
     ``dry_run``：只报告会补哪些，不真跑。
     """
+    if _job_runs_bootstrap(now):
+        return []                  # 刚建立基准，没有「错过」可言
     todo = missed_jobs(now)
     if not todo:
         return []
