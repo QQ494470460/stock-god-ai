@@ -401,6 +401,50 @@ def get_name(code: str) -> str:
 # Popen 对象不可序列化，且模块全局在同会话的多次 rerun 之间是保留的。
 _TRAIN_PROC: dict = {}
 
+# 训练运行记录（落盘）。
+# 为什么必须落盘：训练是**数小时级**的作业，浏览器标签空闲/切后台后 Streamlit
+# 会回收会话，st.session_state 全部丢失。原先完成提示只写在 st.session_state +
+# 一句话 st.success，会话一死就没人再渲染它 —— 用户回来只看到页面重置后的
+# 训练按钮，自然认为「跑完了也不提示」。落盘后重连即可续接、且只提示一次。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_TRAIN_RUN_FILE = _PROJECT_ROOT / "data" / "train_run.json"
+
+
+def _train_run_load() -> dict:
+    try:
+        return json.loads(_TRAIN_RUN_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - 记录缺失/损坏都不该影响页面
+        return {}
+
+
+def _train_run_save(patch: dict) -> None:
+    """合并写入（不覆盖未提及的字段）。"""
+    cur = _train_run_load()
+    cur.update(patch)
+    try:
+        _TRAIN_RUN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _TRAIN_RUN_FILE.write_text(
+            json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"训练运行记录写入失败: {e}")
+
+
+def _pid_alive(pid) -> bool:
+    """进程是否还活着。
+
+    替代原先的 `wmic process where ...`：wmic 在 Windows 11 已被移除，
+    调用必然失败 → `_psproc` 恒为 None → 状态栏**永远**显示「进程已退出」，
+    而训练其实还在跑。这就是「以为训练结束了、其实没有」的直接来源。
+    """
+    try:
+        import psutil
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except Exception:  # noqa: BLE001 - psutil 缺失时退回「未知 = 当作活着」，宁可不误报
+        return True
+
 
 # ========== 模型自动热重载（与页面无关） ==========
 # 背景：后台训练脚本写的是 models/xgboost_model.pkl，但原先只有「⚙️ 设置」页里
@@ -5188,28 +5232,46 @@ if page == "⚙️ 设置":
     
     # 3 个按钮此前是 3 段结构完全相同的复制粘贴，只差 3 个字符串。
     # 改成数据驱动：加/改一个档位只需动这里一行。
+    #
+    # ⚠️ 时长标注必须是**实测外推值**。旧标签写「2分钟 / 15分钟 / 40分钟」，而三档
+    # 实测分别是 36~56 分钟 / 从未跑完过 / 从未跑过 —— 差了 25~77 倍。
+    # 使用者按「15 分钟」的预期等十几小时，必然认为训练卡死，于是反复重开。
+    #
+    # 推导（2026-11-04 实测，全核）：
+    #   小跑 148538 样本 × 110 特征、mean 75 棵树 → 14.6s/trial（--xgb-threads -1）
+    #   折到 zz500 全池 803603 样本、n_estimators 上限 1500（TPE 均值 775 棵）：
+    #   14.6 × (803603/148538) × (775/75) ≈ 815s ≈ 13.5 分钟 / trial
+    #   → 50 trials ≈ 11.3h + 最终全量训练与 5 折验证 ≈ 1.4h ≈ 12 小时
+    # 改 trials / 股票池 / max-estimators 时必须一起重算这三行。
     _TRAIN_PRESETS = {
         "optuna": ("TPE 智能引导 · SHAP 特征筛选 Top 60 · SMOTE 过采样", [
-            ("⚡ Optuna 快速·试验 (2分钟)", "optuna_fast", True,
-             "Optuna 50 trials · SHAP Top 60 · 3折CV · 3轮重训 · hs300/100只 · "
-             "仅试验：不部署，结果另存 *_optuna_*，绝不覆盖生产模型"),
-            ("🧠 Optuna 标准·部署 (15分钟)", "optuna_mid", False,
-             "Optuna 150 trials · SHAP Top 60 · 5折CV · 3轮重训 · zz500 全池 · "
-             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）"),
-            ("🔬 Optuna 深度·部署 (40分钟)", "optuna_deep", False,
+            ("⚡ Optuna 快速·试验 (实测≈40分钟)", "optuna_fast", True,
+             "Optuna 20 trials · SHAP Top 60 · 3折CV · 2轮重训 · hs300/100只 · "
+             "仅试验：不部署，结果另存 *_optuna_*，绝不覆盖生产模型。"
+             "历史实测 36~56 分钟（单线程），改全核后约 40 分钟"),
+            ("🧠 Optuna 标准·部署 (实测≈12小时)", "optuna_mid", False,
+             "Optuna 50 trials · SHAP Top 60 · 5折CV · 3轮重训 · zz500 全池(≥400只) · "
+             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）。"
+             "本档是「过夜作业」：单 trial 约 13 分钟，50 个 trial 就是十来个小时。"
+             "⚠️ 建议 15:10 收盘后再点 —— 搜索期会用满所有 CPU 核，"
+             "盘中启动可能与常驻交易闭环抢资源"),
+            ("🔬 Optuna 深度·部署 (实测≈3天)", "optuna_deep", False,
              "Optuna 300 trials · SHAP Top 70 · 5折CV · 5轮重训 · zz500 全池 · "
-             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）"),
+             "完成后覆盖生产模型（覆盖前自动备份 .bak_*）。"
+             "⚠️ 真的是三天，不是 40 分钟；点之前先确认这三天机器不关机不休眠"),
         ]),
     }
 
     def _render_train_presets(method: str) -> None:
         caption, presets = _TRAIN_PRESETS[method]
         st.caption(caption)
+        _busy = bool(st.session_state.get("train_running"))
         cols = st.columns(len(presets))
         for col, (label, mode, primary, help_text) in zip(cols, presets):
             with col:
                 if st.button(label, type="primary" if primary else "secondary",
                              use_container_width=True, key=f"train_{mode}_btn",
+                             disabled=_busy,
                              help=help_text):
                     st.session_state.train_queued = True
                     st.session_state.train_mode = mode
@@ -5220,11 +5282,65 @@ if page == "⚙️ 设置":
                     # 启动新训练时把所有终态标志一起复位。
                     st.session_state.train_reloaded = False
                     st.session_state.train_done = False
+                    st.session_state.train_celebrated = False
                     _TRAIN_PROC.pop("proc", None)
                     st.session_state.train_log_wait = 0
                     st.session_state.pop("train_result", None)
+        if _busy:
+            st.caption("🔒 训练进行中，按钮已锁定 —— 避免两个训练进程同时覆盖模型")
+
+    from src.ui import train_monitor as tm
+
+    # ===== 跨会话续接 =====
+    # 训练是数小时级作业。浏览器标签空闲/切后台后 Streamlit 会回收会话，
+    # session_state 清空 → 原先唯一的那句 st.success("🎉 训练完成") 再也不会被渲染。
+    # 用户回来只看到重置后的训练按钮，于是「跑完了也不提示」，还会再点一次。
+    # 这里从 data/train_run.json 把运行接回来：还在跑就继续轮询，已结束就补一次提示。
+    def _resume_train_run() -> None:
+        run = _train_run_load()
+        log = str(run.get("log") or "")
+        if not log or not Path(log).exists():
+            return
+        text = tm.read_log_tail(log)
+        state = tm.detect_state(text)
+        label = run.get("label") or "训练"
+        alive = _pid_alive(run["pid"]) if run.get("pid") else False
+        if state == "running" and alive:
+            st.session_state.train_log = log
+            st.session_state.train_mode_label = label
+            st.session_state.train_running = True
+            return
+        if run.get("notified"):
+            return
+        # 已结束（跑完 / 失败 / 进程被掐）：只提示一次
+        _train_run_save({"notified": True})
+        st.session_state.train_log = log
+        st.session_state.train_done = True
+        if state == "complete":
+            try:
+                predictor.reload()
+                clear_predictor_cache()
+            except Exception as _re:  # noqa: BLE001
+                logger.debug(f"续接时热加载失败: {_re}")
+            st.session_state.train_result = ("ok", label, "")
+            return
+        if state == "failed":
+            err = "训练脚本报了 ===TRAINING_FAILED===，详见下方日志尾部"
+        else:
+            err = ("训练进程已消失，但日志里既没有完成标记也没有失败标记 —— "
+                   "多见于关机/休眠，或进程被强杀。日志与产物保留供排查。")
+        i = text.rfind("Traceback")
+        if i > 0:
+            err = text[i:i + 800]
+        st.session_state.train_result = ("fail", label, err)
+
+    if (not st.session_state.get("train_running")
+            and not st.session_state.get("train_done")
+            and not st.session_state.get("train_queued")):
+        _resume_train_run()
 
     _render_train_presets("optuna")
+
     
     if st.session_state.get("train_queued") and not st.session_state.get("train_running"):
         st.session_state.train_running = True
@@ -5248,18 +5364,28 @@ if page == "⚙️ 设置":
         # 快速档 = 纯试验：加 --no-deploy，绝不覆盖生产模型。
         # 事故记录（2026-10-12 23:36）：快速档曾以 hs300/100只/SHAP Top60 静默部署，
         # OOS RankIC 仅 0.046（生产 zz500 模型 0.0747），且未留下任何 metrics 记录。
+        # --xgb-threads -1：搜索期 XGBoost 用满所有核。脚本历史上在 _suggest_params
+        # 里写死 n_jobs=1（为 optuna 并行预留），但 optuna 恒为 n_jobs=1 —— 于是
+        # 整轮搜索只用了一个核。12 核机实测单 trial 61.5s → 26.4s。
         if mode == "optuna_deep":
             cmd = [py, str(script), "--n-trials", "300", "--cv-folds", "5", "--retrain-rounds", "5",
-                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost", "--shap-top", "70"]
+                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost",
+                   "--shap-top", "70", "--xgb-threads", "-1"]
             mode_label = "Optuna 深度"
         elif mode == "optuna_mid":
-            cmd = [py, str(script), "--n-trials", "150", "--cv-folds", "5", "--retrain-rounds", "3",
-                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost"]
+            # 150 trials × zz500 全池（80 万样本）实测单 trial 十几分钟量级，
+            # 总耗时 50 小时以上 —— 旧标签却写「15 分钟」。降到 50 trials。
+            cmd = [py, str(script), "--n-trials", "50", "--cv-folds", "5", "--retrain-rounds", "3",
+                   "--pool", "zz500", "--max-stocks", "0", "--parallel", "--model", "xgboost",
+                   "--xgb-threads", "-1"]
             mode_label = "Optuna 标准"
         else:  # optuna_fast
+            # 去掉 --max-samples 30000：它只在旧口径 gather_data 生效，
+            # 在 RankIC 口径下静默无效（按行降采样会打散横截面），留着等于骗人。
             cmd = [py, str(script), "--n-trials", "20", "--cv-folds", "3", "--retrain-rounds", "2",
                    "--pool", "hs300", "--max-stocks", "100", "--parallel", "--model", "xgboost",
-                   "--max-samples", "30000", "--max-estimators", "400", "--shap-top", "60", "--no-deploy"]
+                   "--max-estimators", "400", "--shap-top", "60", "--no-deploy",
+                   "--xgb-threads", "-1"]
             mode_label = "Optuna 快速"
 
         # 记住档位名称：终态提示在后续 rerun 里也要用，而那时启动块不会执行
@@ -5282,12 +5408,19 @@ if page == "⚙️ 设置":
             # 存下子进程对象：轮询时可用 poll() 判断进程是否已退出，
             # 兜住「原生崩溃（无 Python traceback）」这类既不 finished 也不 failed 的情况
             _TRAIN_PROC["proc"] = _proc
+            # 落盘运行记录：会话被回收后靠它续接，并在真正跑完时补上提示
+            _train_run_save({
+                "log": str(log_file), "label": mode_label, "mode": mode,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "pid": _proc.pid, "notified": False,
+            })
             st.success(f"✅ {mode_label}训练已在后台启动! 日志: `{Path(log_file).name}`")
         except Exception as e:  # noqa: BLE001 - 启动失败必须退出轮询，不能卡死
             st.session_state.train_running = False
             st.session_state.train_queued = False
             st.session_state.train_done = True
             st.session_state.train_result = ("fail", mode_label, f"训练进程启动失败: {e}")
+            _train_run_save({"notified": True, "log": str(log_file)})
             st.error(f"❌ 训练进程启动失败: {e}")
     
     # train_done 是独立的终态标志：一旦进入（完成/失败/异常终止）就不再轮询，
@@ -5297,58 +5430,56 @@ if page == "⚙️ 设置":
         log_path = Path(train_log_file) if train_log_file else None
 
         # ========= 1. 进程状态栏（始终可见）=========
-        _psproc = None
-        if os.name == "nt":
-            import subprocess as _sp
-            try:
-                r = _sp.run(["wmic", "process", "where", "name='python.exe'", "get", "ProcessId,CommandLine", "/format:csv"],
-                          capture_output=True, text=True, timeout=5)
-                for line in r.stdout.splitlines():
-                    if "train_optuna" in line:
-                        parts = line.strip().split(",")
-                        _psproc = {"pid": parts[-1] if len(parts) > 1 else "?", "cmd": "train_optuna"}
-                        break
-            except Exception as e:
-                # wmic 在部分 Windows 11 上已被移除，失败属预期
-                logger.debug(f"进程检测不可用: {e}")
+        # ⚠️ 不再用 `wmic process where ...`：wmic 在 Windows 11 已被移除，调用必失败，
+        # 于是 _psproc 恒为 None，状态栏永远落到「进程已退出」分支 —— 训练明明还在跑，
+        # 界面却一直说它退出了。改用 Popen 句柄（最权威）+ psutil 查 pid 兜底。
+        _proc = _TRAIN_PROC.get("proc")
+        _run = _train_run_load()
+        _pid = _proc.pid if _proc is not None else _run.get("pid")
+        try:
+            _alive = (_proc.poll() is None) if _proc is not None else _pid_alive(_pid)
+        except Exception:  # noqa: BLE001
+            _alive = _pid_alive(_pid)
 
-        if _psproc:
-            log_size = f"{log_path.stat().st_size//1024}KB" if log_path and log_path.exists() else "-"
-            st.success(f"🟢 训练进程运行中 | PID: {_psproc['pid']} | {_psproc['cmd']} | 日志: {log_size}")
-        elif log_path and log_path.exists():
-            mtime = time.time() - log_path.stat().st_mtime
-            if mtime < 120:
-                st.info(f"🟡 进程已退出 | 日志最后更新 {mtime:.0f}s 前 — 检查下方结果")
-            else:
-                st.warning(f"🔴 日志已 {mtime:.0f}s 未更新 — 训练可能异常终止")
+        _log_age = None
+        _log_kb = "-"
+        if log_path and log_path.exists():
+            _st = log_path.stat()
+            _log_age = time.time() - _st.st_mtime
+            _log_kb = f"{_st.st_size // 1024}KB"
+
+        # 先算一次进度：stall 阈值要按「当前阶段 / 实测单 trial 耗时」来定
+        _prog_pre = tm.parse_progress(tm.read_log_tail(train_log_file) if train_log_file else "")
+
+        if _alive:
+            _desc = f"🟢 训练进程运行中 | PID: {_pid} | 日志 {_log_kb}"
+            if _log_age is not None:
+                _desc += f" | 最后更新 {_log_age:.0f}s 前"
+            st.success(_desc)
+        elif _log_age is None:
+            st.warning("🔴 未检测到日志文件")
+        elif _log_age < tm.stall_limit_sec(_prog_pre):
+            st.info(f"🟡 未找到训练进程（可能由其它终端/会话启动）| 日志 {_log_age:.0f}s 前仍在更新")
         else:
-            st.warning("🔴 未检测到进程或日志文件")
+            st.warning(f"🔴 进程已不在，且日志已 {tm.fmt_duration(_log_age)} 未更新 — 很可能被强杀或关机")
 
         # ========= 2. 日志内容分析 =========
         if log_path and log_path.exists():
             try:
-                log_lines = Path(train_log_file).read_text(encoding="utf-8", errors="replace").splitlines()
-                full_text = "\n".join(log_lines)
-
-                finished = "===TRAINING_COMPLETE===" in full_text
-                crashed = "Traceback (most recent call last):" in full_text[-3000:]
+                # 只读尾部：tqdm 的 \r 刷新会让日志迅速膨胀（单轮可达数 MB），
+                # 而阶段标记与完成标记总在尾部，读尾部不丢信息。
+                full_text = tm.read_log_tail(train_log_file)
+                log_lines = full_text.splitlines()
+                state = tm.detect_state(full_text)
+                finished = state == "complete"
 
                 # 兜底判定：子进程已退出，但日志里既没有完成标记也没有失败标记，
                 # 说明是异常终止。历史日志 logs/train_ui_20261006_234556.log 显示
                 # akshare 依赖的 py_mini_racer.dll 硬崩时是原生栈回溯、没有 Python
                 # traceback —— 既不 finished 也不 failed，会永久 4 秒轮询。
-                aborted = False
-                _proc = _TRAIN_PROC.get("proc")
-                if _proc is not None:
-                    try:
-                        aborted = _proc.poll() is not None
-                    except Exception as _pe:  # noqa: BLE001
-                        logger.debug(f"训练子进程状态检测失败: {_pe}")
-                        aborted = False
-
-                failed = ("===TRAINING_FAILED===" in full_text
-                          or crashed
-                          or (aborted and not finished))
+                # 判「进程退出」只认 _alive，绝不用「日志多久没更新」——
+                # 单个 trial 就要好几分钟，旧实现写死 120s，正常训练会被误杀。
+                failed = (state == "failed") or (not _alive and state == "running")
 
                 # ===== 完成 =====
                 if finished:
@@ -5362,12 +5493,10 @@ if page == "⚙️ 设置":
                     st.session_state.train_queued = False
                     st.session_state.train_done = True
                     st.session_state.train_result = ("ok", mode_label, "")
-                    st.balloons()
-                    st.success("🎉 训练完成！模型已热加载。")
-                    final_f1 = [l for l in log_lines if "F1 =" in l or "F1(macro)" in l]
-                    if final_f1:
-                        st.code("\n".join(final_f1[-6:]), language=None)
-                    # 终态：只刷新一次让 UI 更新，之后不再进入轮询
+                    # 标记已提示：刷新页面/换会话后由 _resume_train_run 判重，不再重复弹
+                    _train_run_save({"notified": True})
+                    # 提示统一由下方「终态结果提示」渲染 —— 那里的 st.balloons() 不会被
+                    # 紧接着的 st.rerun() 丢掉（本行 rerun 会清空本轮已发出的元素）。
                     st.rerun()
 
                 # ===== 失败 / 异常终止 =====
@@ -5376,54 +5505,46 @@ if page == "⚙️ 设置":
                     err_start = full_text.rfind("Traceback")
                     if err_start > 0:
                         err_detail = full_text[err_start:err_start+800]
+                    elif state == "failed":
+                        err_detail = "训练脚本报了 ===TRAINING_FAILED===，详见日志尾部"
                     else:
-                        err_detail = ("训练异常终止（无 Python traceback，"
-                                      "可能是原生崩溃，如 py_mini_racer.dll）")
+                        err_detail = ("训练进程已退出，但日志里没有完成标记也没有失败标记 —— "
+                                      "可能是原生崩溃（如 py_mini_racer.dll）或被强杀/关机。")
                     st.session_state.train_running = False
                     st.session_state.train_queued = False
                     st.session_state.train_done = True
                     st.session_state.train_result = ("fail", mode_label, err_detail)
+                    _train_run_save({"notified": True})
                     st.rerun()
 
                 else:
                     # ===== 正在训练 =====
-                    is_optuna = "Optuna" in full_text or "optuna" in full_text.lower()
+                    # 阶段与百分比全部交给 train_monitor 解析脚本每 trial 主动打印的
+                    # 结构化日志行。旧实现用全文 `in` 匹配，一旦出现过 "Optuna TPE"
+                    # 就再也退不出该分支，Optuna 结束后的最终训练阶段被显示成
+                    # 「超参搜索 10%」—— 进度条从 60% 倒退回 10% 并永久卡住。
+                    prog = tm.parse_progress(full_text)
+                    st.progress(min(max(prog.pct, 0.0), 1.0),
+                                text=f"{prog.title} — {prog.detail}")
 
-                    # 阶段检测
-                    phase = "⏳ 准备中…"
-                    pct = 0
-                    if "gather_data" in full_text[-3000:] or "\n📊 收集训练数据" in full_text:
-                        phase = "📊 收集数据"
-                        pct = 0.05
-                    elif is_optuna and ("Optuna TPE" in full_text or "trial" in full_text[-3000:].lower()):
-                        m = re.search(r'(\d+)/(\d+)\s*\[', full_text[-3000:])
-                        if m:
-                            done, total = int(m.group(1)), int(m.group(2))
-                            phase = f"🔍 Optuna搜索 {done}/{total} trials"
-                            pct = 0.1 + 0.5 * done / max(total, 1)
-                        else:
-                            phase = "🔍 Optuna超参搜索"
-                            pct = 0.1
-                    elif "超参数搜索" in full_text or "CV " in full_text[-3000:]:
-                        cv_done = full_text.count("END ")
-                        phase = f"🔍 超参搜索 ({cv_done} fold)" if cv_done else "🔍 超参搜索"
-                        pct = 0.2
-                    elif is_optuna and "SHAP" in full_text:
-                        phase = "🧩 SHAP特征筛选"
-                        pct = 0.6
-                    elif "重训练" in full_text:
-                        rd = full_text.count("Round ") // 2
-                        phase = f"🔄 重训练 ({rd} 轮)" if rd else "🔄 重训练"
-                        pct = 0.7 + min(rd / 10, 0.28)
-
-                    st.progress(pct, text=phase)
+                    # 三根指标：光给一根不动的进度条等于没给信息，
+                    # 「还要多久」才是使用者真正想要的。
+                    _c1, _c2, _c3 = st.columns(3)
+                    _c1.metric("⏳ 预计剩余", tm.fmt_duration(prog.eta_sec))
+                    _c2.metric("🔁 单 trial 耗时",
+                               tm.fmt_duration(prog.per_trial_sec)
+                               if prog.per_trial_sec else "—")
+                    _c3.metric("🏆 当前最佳 RankIC",
+                               f"{prog.best:+.4f}" if prog.best is not None else "—")
 
                     # ===== 实时日志（可展开折叠面板）=====
                     with st.expander(f"📋 实时日志 — 最新 {len(log_lines)} 行", expanded=True):
                         tail = log_lines[-25:] if len(log_lines) > 25 else log_lines
                         st.code("\n".join(tail), language=None)
 
-                    time.sleep(4)
+                    # 轮询间隔：单个 trial 就要数分钟，2~4 秒一轮纯属空转（每轮都要
+                    # 重读日志 + 重绘整页）。按阶段放宽到 5~10 秒，反应依旧够快。
+                    time.sleep(10 if prog.in_search or prog.stage == "final" else 4)
                     st.rerun()
 
             except Exception:
@@ -5453,6 +5574,15 @@ if page == "⚙️ 设置":
         _detail = _res[2] if len(_res) > 2 else ""
         if _res[0] == "ok":
             st.success(f"🎉 {_label}训练已完成，模型已热加载。")
+            # 只庆祝一次：跨会话续接时这一句就是「补上的那次提示」，
+            # 但刷新第二次不该再撒一遍花。
+            if not st.session_state.get("train_celebrated"):
+                st.session_state.train_celebrated = True
+                st.balloons()
+            _logp = st.session_state.get("train_log") or _train_run_load().get("log", "")
+            if _logp and Path(_logp).exists():
+                st.caption(f"📄 日志：`{Path(_logp).name}` · "
+                           f"结果 JSON：`models/optuna_search_result.json`")
         else:
             st.error(f"❌ {_label}训练已结束，但失败或异常终止。")
             if _detail:

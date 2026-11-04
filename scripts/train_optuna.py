@@ -38,6 +38,7 @@ from config.settings import config as app_config, MODEL_DIR, LOG_DIR
 from src.data.fetcher import fetcher
 from src.features.engine import feature_engine
 from src.models.labeling import (
+    MIN_STOCKS_PER_DAY,
     forward_excess_return,
     make_rank_labels,
     mean_rank_ic,
@@ -207,8 +208,15 @@ def parse_args():
     p.add_argument("--shap-top", type=int, default=60, help="SHAP 筛选后保留的特征数")
     p.add_argument("--no-shap", action="store_true", help="跳过 SHAP 特征筛选")
     p.add_argument("--optuna-timeout", type=int, default=0, help="Optuna 整体超时(秒)，0=不限")
-    p.add_argument("--max-samples", type=int, default=0, help="训练样本上限（0=不限，快速建议30000）")
+    p.add_argument("--max-samples", type=int, default=0,
+                   help="训练样本上限（0=不限）。★仅对旧口径 --objective f1 生效；"
+                        "RankIC 口径（默认）不支持按行降采样，传了会告警并被忽略")
     p.add_argument("--max-estimators", type=int, default=1500, help="n_estimators 上限（快速建议400）")
+    p.add_argument("--xgb-threads", type=int, default=-1,
+                   help="搜索期 XGBoost 线程数。-1=用满所有核（默认）；1=历史的单线程口径。"
+                        "Optuna 自身恒为 n_jobs=1，所以取 1 等于整轮只用一个核 —— "
+                        "在 12 核机上实测单 trial 61.5s vs 26.4s（2.3 倍差）。"
+                        "本参数只影响搜索期，最终部署模型固定 n_jobs=-1")
     p.add_argument("--no-deploy", action="store_true",
                    help="不覆盖生产产物（xgboost_model.pkl/scaler.pkl/label_encoder.pkl），"
                         "结果另存为 *_optuna_*.pkl。默认会覆盖（但覆盖前自动备份）")
@@ -679,8 +687,13 @@ def _fit_rankic(Xtr, ytr, params):
     return model, scaler
 
 
-def _suggest_params(trial, max_estimators):
-    """RankIC 目标的搜索空间（去掉 scale_pos_weight：多分类无意义）。"""
+def _suggest_params(trial, max_estimators, n_threads: int = 1):
+    """RankIC 目标的搜索空间（去掉 scale_pos_weight：多分类无意义）。
+
+    ``n_threads`` 只影响单 trial 的墙钟耗时，不影响搜索空间、样本或目标函数。
+    历史上写死 ``n_jobs=1``（为 optuna 并行预留），但 optuna 恒为
+    ``n_jobs=1`` —— 于是整轮搜索只用了一个核。见 --xgb-threads 的说明。
+    """
     return {
         "n_estimators": trial.suggest_int("n_estimators", 50, max_estimators),
         "max_depth": trial.suggest_int("max_depth", 3, 10),
@@ -692,15 +705,15 @@ def _suggest_params(trial, max_estimators):
         "reg_alpha": trial.suggest_float("reg_alpha", 1e-6, 3.0, log=True),
         "reg_lambda": trial.suggest_float("reg_lambda", 1e-6, 5.0, log=True),
         "random_state": 42,
-        "n_jobs": 1,
+        "n_jobs": int(n_threads),
         "verbosity": 0,
         "eval_metric": "mlogloss",
     }
 
 
-def rankic_objective(trial, X, y, meta, fwd, args, max_estimators):
+def rankic_objective(trial, X, y, meta, fwd, args, max_estimators, n_threads: int = 1):
     """一个 trial = 一次时序切分上的样本外 RankIC（越大越好）。"""
-    params = _suggest_params(trial, max_estimators)
+    params = _suggest_params(trial, max_estimators, n_threads)
     dates = meta["__date__"]
     uniq = np.sort(pd.unique(dates.values))
     if len(uniq) < 60:
@@ -731,7 +744,10 @@ def rankic_search(X, y, meta, fwd, args):
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
     )
     max_est = getattr(args, "max_estimators", 1500)
-    obj = lambda t: rankic_objective(t, X, y, meta, fwd, args, max_est)
+    n_threads = int(getattr(args, "xgb_threads", -1) or -1)
+    logger.info(f"  搜索期线程: {n_threads if n_threads > 0 else '全部核心'} "
+                f"（n_estimators 上限 {max_est}）")
+    obj = lambda t: rankic_objective(t, X, y, meta, fwd, args, max_est, n_threads)
     timeout = args.optuna_timeout if args.optuna_timeout > 0 else None
     cb = _TrialProgress(args.n_trials, "xgboost", metric="RankIC")
     study.optimize(obj, n_trials=args.n_trials, timeout=timeout,
@@ -846,6 +862,27 @@ def rankic_final(X, y, meta, fwd, args, best_params, deploy=True):
 
 
 def _run_rankic(args, t_start, deploy):
+    # --max-samples 只在旧口径 gather_data 里生效；RankIC 口径按 (date, code) 建面板，
+    # 按行随机降采样会把横截面打散（某些交易日只剩几只票），逐日 RankIC 直接失真。
+    # 与其静默忽略（快速档历史上一直传 --max-samples 30000，实际毫无作用，
+    # 这正是「参数在但没用」那类最难查的坑），不如显式告警。
+    if int(getattr(args, "max_samples", 0) or 0) > 0:
+        logger.warning(
+            f"⚠️ --max-samples {args.max_samples} 对 RankIC 口径无效，已忽略："
+            "按行随机降采样会打散横截面，使逐日 RankIC 失真。"
+            "要缩短训练请改 --n-trials / --max-estimators / --max-stocks。")
+
+    # 股票池小于「每日截面下限」时，make_rank_labels 会把每个交易日的标签整行作废，
+    # 最终必然 0 样本 —— 而报错只是「无训练数据」，完全看不出是 --max-stocks 太小。
+    # 这里提前失败，省掉一分多钟的取数。
+    _ms = int(getattr(args, "max_stocks", 0) or 0)
+    if 0 < _ms < MIN_STOCKS_PER_DAY:
+        logger.error(
+            f"--max-stocks {_ms} 低于每日截面下限 {MIN_STOCKS_PER_DAY}："
+            "截面分位标签（5 档）需要每天至少这么多只票才成立，"
+            f"否则每个交易日的标签都被整行作废、最终 0 样本。请用 >= {MIN_STOCKS_PER_DAY}。")
+        logger.error("===TRAINING_FAILED=== (原因: --max-stocks 低于截面最小股票数)")
+        return
     logger.info("\n📊 收集面板数据（保留 date/code，供截面 RankIC）…")
     got = gather_panel(args)
     if got is None or len(got[0]) == 0:
@@ -871,7 +908,14 @@ def _run_rankic(args, t_start, deploy):
         "deployed": fin["deployed"],
         "model_path": fin["model_path"],
     }
-    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+    # ⚠️ --no-deploy 的试验跑不许覆盖 optuna_search_result.json。
+    # 那份 JSON 记录的是「**当前已部署模型**是用哪组超参搜出来的」，而
+    # --no-deploy 的语义是「不碰生产产物」（模型/ scaler / features 都已另存
+    # *_optuna_*）。若这里照旧写 RESULT_FILE，一次 2 个 trial 的冒烟跑就会把
+    # 生产模型的搜索记录替换成试验记录 —— 而 production_metrics.json 只在
+    # deploy=True 时更新，两份记录直接互相矛盾。2026-11-04 实际踩到过。
+    result_file = RESULT_FILE if deploy else (MODEL_DIR / "optuna_search_result_trial.json")
+    with open(result_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
 
     elapsed = time.time() - t_start
@@ -892,7 +936,7 @@ def _run_rankic(args, t_start, deploy):
     logger.info(f"   产物: {fin['model_path']}"
                 + ("（已覆盖生产产物，旧件已备份 .bak_*）" if fin["deployed"]
                    else "（未覆盖生产产物）"))
-    logger.info(f"   结果 JSON: {RESULT_FILE}")
+    logger.info(f"   结果 JSON: {result_file}")
     logger.info("===TRAINING_COMPLETE===")
     logger.info("=" * 70)
 
@@ -989,7 +1033,9 @@ def _run(args):
                            for k, v in all_results.items()},
         "final_scores": final_scores,
     }
-    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+    # 与 RankIC 口径同理：--no-deploy 的试验跑不覆盖生产模型的搜索记录
+    result_file = RESULT_FILE if deploy else (MODEL_DIR / "optuna_search_result_trial.json")
+    with open(result_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
 
     elapsed = time.time() - t_start
@@ -1018,7 +1064,7 @@ def _run(args):
         "本脚本的旧管线在取数阶段丢弃了 date/code，算不出截面 RankIC；"
         "要一个可信的选股指标请用 scripts/train_production_v2.py（自带 walk-forward RankIC 验证）。"
     )
-    logger.info(f"   结果 JSON: {RESULT_FILE}")
+    logger.info(f"   结果 JSON: {result_file}")
     logger.info("===TRAINING_COMPLETE===")
     logger.info("=" * 70)
 
