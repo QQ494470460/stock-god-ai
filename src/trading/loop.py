@@ -688,7 +688,13 @@ class TradingLoop:
     # ------------------------------------------------------------------
     # 计划
     # ------------------------------------------------------------------
-    def _build_plan(self):
+    def _build_plan(self, target_date: str | None = None):
+        """生成交易计划。
+
+        ``target_date`` 为 None 时走默认语义（= 今天之后的**下一个交易日**，
+        由 ``resolve_target_date`` 决定）；显式传入则强制指定 ``plan_date``。
+        后者是「补建今天的计划」所必需的 —— 默认语义**永远补不出今天**。
+        """
         from src.trading.trade_plan import build_trade_plan
         cap = float(getattr(self.guard.config, "max_single_position_pct",
                             self.config.weight_cap) or self.config.weight_cap)
@@ -700,6 +706,7 @@ class TradingLoop:
                 weighting=self.config.weighting,
                 weight_cap=min(cap, self.config.weight_cap),
                 tilt_strength=self.config.tilt_strength,
+                plan_date=target_date,
                 write=True,
             )
             return plan
@@ -757,9 +764,26 @@ class TradingLoop:
             report.plan_built = False
             return
 
-        # ② 手上这份是「下一个交易日」的待生效计划 → 保留，别重建
-        #    （重建的结果与它同日，只是把同一个文件又写了一遍）
+        # ② 手上这份是「下一个交易日」的待生效计划，而磁盘上**没有今天的**
+        #    → 说明昨天收盘后那次作业没跑成功（正常情况这里应该已在 ① 命中）。
+        #    以前这里直接 return，代价是**整个交易日空转**：
+        #    `_build_plan()` 默认只生成「下一个交易日」，永远补不出「今天的」，
+        #    于是闭环抱着明天那份计划，今天一单不发，界面还显示得好好的。
+        #    实跑证据（2026-11-05 01:04）：调度器与 loop 同进程，11-04 晚 loop
+        #    崩溃重启 → 18:30 数据更新 / 18:45 选股 / 19:00 进化三个作业全没触发
+        #    → trade_plan_20261105.json 从未生成。loop 重启后 _build_plan() 按
+        #    resolve_target_date(11-05)=11-06 生成了「11-06 的计划」，且用的是
+        #    11-03 的旧 picks（目标与 11-04 那份逐位相同）—— 今天(11-05)无计划。
+        #    现在改为补建**今天**那一份；建成后 is_valid_for(今天) 成立，
+        #    下一 tick 走不到这里，不会重复写盘。
         if self.plan is not None and (self.plan.plan_date or "") > today_s:
+            logger.warning(
+                f"⚠️ 今天({today_s})没有交易计划，手上是 {self.plan.plan_date} 的待生效计划 —— "
+                "多半是昨日收盘后的选股作业未成功。正在补建今天的计划。")
+            backfilled = self._build_plan(target_date=today_s)
+            if backfilled is not None:
+                self.plan = backfilled
+                report.plan_built = True
             return
 
         # ③ 真的没有任何可用计划 → 按选股结果生成一份

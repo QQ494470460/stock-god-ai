@@ -1048,13 +1048,14 @@ def _plan_for(day, targets=(("600519", 90, 0.30),)):
     )
 
 
-def _counting_build(loop, monkeypatch):
-    """把 ``_build_plan`` 换成计数器，用来断言「有没有重建」。"""
-    box = {"n": 0}
+def _counting_build(loop, monkeypatch, result=None):
+    """把 ``_build_plan`` 换成计数器，用来断言「有没有重建」以及「重建的是哪一天」。"""
+    box = {"n": 0, "targets": []}
 
-    def _fake():
+    def _fake(target_date=None):
         box["n"] += 1
-        return None
+        box["targets"].append(target_date)
+        return result
 
     monkeypatch.setattr(loop, "_build_plan", _fake)
     return box
@@ -1103,30 +1104,64 @@ def test_expired_in_memory_plan_is_reloaded_from_disk_before_rebuild(monkeypatch
     assert loop.plan.plan_date == today_s
 
 
-def test_pending_plan_for_next_session_is_kept_not_rebuilt(monkeypatch):
-    """今天是 D、手上是「为下一个交易日准备」的计划 → 保留。
+def test_pending_plan_for_next_session_triggers_a_backfill_for_today(monkeypatch):
+    """手上只有「下一交易日」的计划、磁盘上没有今天的 → 必须**补建今天的**。
 
-    计划本来就是收盘后为下一交易日生成的，``plan_date`` 必然大于今天。
-    旧代码把这种「待生效」当成「已过期」，于是每个 tick 都重建 + 重复写盘
-    （实跑日志：每周期都打印「交易计划已生成：2026-10-15」）。
+    以前这条断言的是「保留待生效计划、不重建」（``plan_built is False``），
+    理由是「重建结果与它同日，只是把同一个文件又写一遍」。但那只对
+    ``_build_plan()`` 的默认语义成立 —— 它生成的是**下一个交易日**，所以
+    「不重建」等于让今天整天没有计划。而这条分支**只在今天确实没有计划时**
+    才会走到（正常情况第 ① 步就按日期命中并返回了）。
+
+    实跑证据（2026-11-05 01:04）：调度器与 loop 同进程，11-04 晚 loop 崩溃重启，
+    18:30/18:45/19:00 三个作业全没触发 → ``trade_plan_20261105.json`` 从未生成。
+    loop 重启后 ``_build_plan()`` 按 ``resolve_target_date(11-05)=11-06`` 生成了
+    11-06 的计划（用的还是 11-03 的旧 picks），今天(11-05)整天空转。
+
+    现在改为补建今天那一份 —— 关键是**必须显式传 target_date=今天**，
+    靠默认语义永远补不出来。
     """
     import src.trading.trade_plan as tp
     import src.trading.loop as loopmod
 
     today = loopmod._today()
+    today_s = today.strftime("%Y-%m-%d")
     pending_day = (today + timedelta(days=1)).strftime("%Y-%m-%d")
 
     loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
     loop.plan = _plan_for(pending_day)
     _fake_disk(monkeypatch, tp)          # 磁盘上什么都没有
 
-    box = _counting_build(loop, monkeypatch)
+    box = _counting_build(loop, monkeypatch, result=_plan_for(today_s))
     rep = TickReport()
     loop._ensure_plan(rep)
 
-    assert box["n"] == 0, "待生效计划被误判为过期并重建了"
-    assert rep.plan_built is False
-    assert loop.plan.plan_date == pending_day
+    assert box["n"] == 1, "今天没有计划却不补建 —— 这个交易日会一单不发"
+    assert box["targets"] == [today_s], \
+        f"补建时必须显式指定目标日=今天，实际传了 {box['targets']}"
+    assert rep.plan_built is True
+    assert loop.plan.plan_date == today_s
+
+
+def test_backfilled_today_plan_is_not_rebuilt_on_every_tick(monkeypatch):
+    """补建之后今天这份就是有效的，下一 tick 不许再重建（否则每 30 秒写一次盘）。"""
+    import src.trading.trade_plan as tp
+    import src.trading.loop as loopmod
+
+    today_s = loopmod._today().strftime("%Y-%m-%d")
+    pending_day = (loopmod._today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    loop = mk_loop(cfg=LoopConfig(auto_build_plan=True))
+    loop.plan = _plan_for(pending_day)
+    _fake_disk(monkeypatch, tp)
+
+    box = _counting_build(loop, monkeypatch, result=_plan_for(today_s))
+    loop._ensure_plan(TickReport())
+    assert box["n"] == 1
+
+    # 第二次 tick：手上已是今天的计划 → 直接返回
+    loop._ensure_plan(TickReport())
+    assert box["n"] == 1, "补建后的当天计划被判定为无效，导致每个 tick 都重建"
 
 
 def test_plan_is_built_when_nothing_usable_exists(monkeypatch):
@@ -1139,7 +1174,7 @@ def test_plan_is_built_when_nothing_usable_exists(monkeypatch):
     _fake_disk(monkeypatch, tp)          # 磁盘上什么都没有
 
     built = _plan_for(loopmod._today().strftime("%Y-%m-%d"))
-    monkeypatch.setattr(loop, "_build_plan", lambda: built)
+    monkeypatch.setattr(loop, "_build_plan", lambda target_date=None: built)
 
     rep = TickReport()
     loop._ensure_plan(rep)
