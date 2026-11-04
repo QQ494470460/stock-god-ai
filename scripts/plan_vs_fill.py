@@ -142,7 +142,18 @@ def audit(date: str | None = None, data_dir: Path | None = None,
     """now 可注入 —— 否则「凌晨不算缺口」这条判定在测试里无法确定性复现。"""
     now = now or datetime.now()
     ddir = Path(data_dir) if data_dir else DATA
-    key, plan = resolve_plan(date, ddir / "trade_plans")
+    if date:
+        key, plan = resolve_plan(date, ddir / "trade_plans")
+    else:
+        # 默认审计**今天**那份，而不是文件名最大的那份。
+        # 计划是收盘后为下一交易日生成的，所以磁盘上「最大」的那份往往属于明天；
+        # 拿它做建满度审计只会得到「尚未开始执行」，把今天真实的缺口藏起来。
+        # 2026-11-05 实测：11-06 那份是 11-05 01:04 用 **11-03 的旧 picks** 生成的，
+        # 报「48.2% 无行业映射」，而今天 11-05 那份是 0% —— 第一屏就把诊断带偏了。
+        # 与「重读计划必须 load_trade_plan(今天)、勿用 load_latest_plan()」同源。
+        key, plan = resolve_plan(now.strftime("%Y%m%d"), ddir / "trade_plans")
+        if not plan:                    # 今天没有计划 → 退回最新一份（报表会如实写日期）
+            key, plan = resolve_plan(None, ddir / "trade_plans")
     snap = account_snapshot(ddir)
     total = snap["total"]
     targets = plan.get("targets") or []
