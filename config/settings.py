@@ -444,7 +444,7 @@ class TradingLoopConfig:
     # 默认 False ⇒ 与旧行为逐位相同（`_run_rebalance` 手里只有一份「昨天」的
     # 口径：写不写周期标记只看有没有被 `max_orders_per_tick` 截断）。
     # 打开前先看 `scripts/plan_vs_fill.py` 的「仓位建满度」，确认是真未建满。
-    rebalance_retry_enabled: bool = False
+    rebalance_retry_enabled: bool = True    # 2026-11-06 经用户确认打开：根治「未建满锁死 15 天」
     rebalance_retry_max_days: int = 2          # 整轮周期最多顺延几个交易日
     rebalance_retry_min_fill_ratio: float = 0.85   # 成交金额/计划金额 低于此值判「未建满」
     # 组合回撤 → 连续渐进降仓（非清仓）。**关闭**（2026-10-31）。

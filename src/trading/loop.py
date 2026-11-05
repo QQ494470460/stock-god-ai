@@ -182,11 +182,11 @@ class LoopConfig:
     # N=8 时最多 16 笔。原来 10 会在满仓换手时把排在后面的买单截掉，
     # 而周期标记已写死 ⇒ 剩下的票要等一整个周期（15 个交易日），账户长期半仓。
     max_orders_per_tick: int = 30
-    # 调仓日「未建满」顺延重试（**默认关闭** ⇒ 与旧行为逐位相同）。
-    # 生产权威值在 config/settings.py:TradingLoopConfig 的同名字段（细则与背景
-    # 见那边的长注释）。要点：一天最多重试一次、整轮最多顺延
-    # `rebalance_retry_max_days` 个交易日，用尽即收尾，绝不退化成逐 tick 重试。
-    rebalance_retry_enabled: bool = False
+    # 调仓日「未建满」顺延重试（**2026-11-06 经用户确认打开**，默认关闭的同名
+    # 字段在 config/settings.py:TradingLoopConfig 是生产权威值）。要点：一天最多
+    # 重试一次、整轮最多顺延 `rebalance_retry_max_days` 个交易日，用尽即收尾，
+    # 绝不退化成逐 tick 重试。
+    rebalance_retry_enabled: bool = True
     rebalance_retry_max_days: int = 2
     rebalance_retry_min_fill_ratio: float = 0.85
     settle_hour: int = 15                # 收盘结算时刻

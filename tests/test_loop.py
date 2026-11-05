@@ -564,7 +564,7 @@ def test_untruncated_rebalance_marks_period_done(force_trading_time, tmp_path):
     paper = FakePaper(total=1_000_000.0)
     b = FakeBroker(total=1_000_000.0, cash=1_000_000.0)
     cfg = LoopConfig(auto_build_plan=False, dry_run=False, rebalance_days=15,
-                     max_orders_per_tick=30,
+                     max_orders_per_tick=30, rebalance_retry_enabled=False,
                      heartbeat_file=str(tmp_path / "hb.json"))
     loop = mk_loop(broker=b, paper=paper, cfg=cfg)
     loop.plan = _four_target_plan()
@@ -676,7 +676,8 @@ def test_settle_report_aggregates_intraday_counts(force_trading_time, tmp_path, 
     # rebalance_days=1 → 每个 tick 都发起调仓。本用例要验的是**日内累计计数**，
     # 与「按周期调仓」无关；生产默认 15 天会让第 2、3 个 tick 直接跳过调仓。
     loop = mk_loop(broker=b, paper=paper,
-                   cfg=LoopConfig(auto_build_plan=False, notify=False, rebalance_days=1))
+                   cfg=LoopConfig(auto_build_plan=False, notify=False, rebalance_days=1,
+                                  rebalance_retry_enabled=False))
     # 目标评分 40 < 风控下限 55 → 每次调仓都会被 guard 拦截（盘中持续发生）
     loop.plan = mk_plan([("600519", 40, 0.30)])
 

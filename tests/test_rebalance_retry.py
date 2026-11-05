@@ -174,11 +174,17 @@ CODES = [f"60000{i}" for i in range(8)]
 # ① 默认关闭 = 与旧行为逐位相同
 # ======================================================================
 
-def test_config_defaults_are_off_and_documented():
+def test_config_defaults_are_opted_in_and_documented():
     cfg = LoopConfig()
-    assert cfg.rebalance_retry_enabled is False, "默认必须关闭，否则下次自然重启就改了实盘行为"
+    assert cfg.rebalance_retry_enabled is True, "2026-11-06 用户确认打开：根治「未建满锁死 15 天」"
     assert cfg.rebalance_retry_max_days == 2
     assert cfg.rebalance_retry_min_fill_ratio == 0.85
+
+
+def test_off_path_still_matches_legacy_behavior():
+    """开关显式关闭时，行为与引入该特性前逐位相同（字节级回归保护）。"""
+    cfg = LoopConfig(rebalance_retry_enabled=False)
+    assert cfg.rebalance_retry_enabled is False
 
 
 def test_production_config_exposes_the_knobs():
@@ -219,7 +225,7 @@ def test_from_app_config_carries_the_knobs(monkeypatch):
 def test_disabled_still_marks_cycle_when_orders_blocked(tmp_path, clock, _stub_intents):
     """**核心回归**：开关关闭时，5/8 成交也要照旧写周期标记 —— 一个字节都不许变。"""
     clock(MON)
-    loop = _mk_loop(tmp_path, LoopConfig(), fill=set(CODES[:5]))
+    loop = _mk_loop(tmp_path, LoopConfig(rebalance_retry_enabled=False), fill=set(CODES[:5]))
     rep = _run(loop, [_intent(c) for c in CODES], _stub_intents)
 
     assert _state(loop) == {"last": MON, "anchor": "", "defer_date": ""}
@@ -228,7 +234,7 @@ def test_disabled_still_marks_cycle_when_orders_blocked(tmp_path, clock, _stub_i
 
 def test_disabled_no_defer_even_when_nothing_filled(tmp_path, clock, _stub_intents):
     clock(MON)
-    loop = _mk_loop(tmp_path, LoopConfig(), fill=set())
+    loop = _mk_loop(tmp_path, LoopConfig(rebalance_retry_enabled=False), fill=set())
     _run(loop, [_intent(c) for c in CODES], _stub_intents)
     assert _state(loop)["last"] == MON
     assert _state(loop)["anchor"] == ""
