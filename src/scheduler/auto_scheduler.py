@@ -202,6 +202,10 @@ def _job_daily_pick_impl(dry_run: bool = False) -> Dict:
                     # 生成**恰恰是唯一每天都走的路径**。
                     picks_date=(str(report.get("generated_at") or "")[:10]
                                 or datetime.now().strftime("%Y-%m-%d")),
+                    # 完整榜单同理：显式传 picks 就绕开了 load_latest_picks 里的
+                    # meta.ranking，排名表会退化成「只有今天这 8 只」——
+                    # 而保留线是 max_positions×slack（24 名），老持仓一律被清。
+                    ranking=report.get("ranking") or None,
                     write=not dry_run,
                 )
                 info["plan_date"] = plan.plan_date

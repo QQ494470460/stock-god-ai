@@ -212,6 +212,37 @@ def _apply_score_threshold(
     return pd.concat([passed, fill]) if len(passed) else fill
 
 
+def _ranking_of(df: Optional[pd.DataFrame]) -> list:
+    """把「按评分降序的完整榜单」压成 ``[{代码, 名称, 评分}]``。
+
+    交易计划的 ``raw_rank`` 吃这个，用来判断「老持仓还在不在保留线内」。
+    刻意**不**含 picks 的门槛筛选：门槛决定「今天买什么」，排名决定「老仓留不留」。
+    混为一谈的代价见 ``generate_daily_picks`` 里的注释。
+    """
+    if df is None or len(df) == 0:
+        return []
+    ccol = "代码" if "代码" in df.columns else ("code" if "code" in df.columns else None)
+    if ccol is None:
+        return []
+    ncol = "名称" if "名称" in df.columns else ("name" if "name" in df.columns else None)
+    scol = "评分" if "评分" in df.columns else ("score" if "score" in df.columns else None)
+    out = []
+    for r in df.to_dict(orient="records"):
+        code = str(r.get(ccol) or "").strip()
+        if not code:
+            continue
+        item: Dict[str, Any] = {"代码": code}
+        if ncol:
+            item["名称"] = str(r.get(ncol) or "")
+        if scol:
+            try:
+                item["评分"] = round(float(r.get(scol) or 0), 2)
+            except Exception:  # noqa: BLE001
+                item["评分"] = 0.0
+        out.append(item)
+    return out
+
+
 def generate_daily_picks(
     pool: Optional[str] = None,
     max_picks: Optional[int] = None,
@@ -259,6 +290,7 @@ def generate_daily_picks(
         "n_scanned": 0,
         "n_passed": 0,
         "picks": [],
+        "ranking": [],
         "status": "ok",
         "error": None,
     }
@@ -285,11 +317,24 @@ def generate_daily_picks(
 
         # 宽取榜单（先不做绝对门槛），再由 _apply_score_threshold 做
         # 「过关优先 + 排名补足」—— 只取到 max_picks 会让补位无从下手。
+        #
+        # ⚠️ 宽度还必须覆盖**排名滞后**的保留窗口：交易计划的 ``raw_rank``
+        # 就是从这张榜单来的，而持仓保留线是 ``max_positions × hold_rank_slack``
+        # （生产 8×3=24）。只取 max_picks=40 时看着够，但只要 max_positions 上调、
+        # 或 slack 调到 6，榜单就比保留线还窄 —— 那时「排名在保留线内」这件事
+        # 根本无法判断，slack 静默退化成 1.0（等于每个调仓日清掉所有老持仓）。
+        # 2026-11-05 实测：报告只有 9 只通过门槛，计划 raw_rank 就只有 9 条，
+        # 而保留线是 24 ⇒ 5 只老持仓全部被判「跌出目标组合，清仓」。
         _target_n = int(getattr(app_config.trading_loop, "max_positions", 8) or 8)
-        _wide_n = max(int(max_picks), _target_n)
+        _slack = float(getattr(app_config.trading_loop, "hold_rank_slack", 1.0) or 1.0)
+        _wide_n = max(int(max_picks), _target_n, int(round(_target_n * max(_slack, 1.0))))
         df_wide = pred.get_top_recommendations(
             stock_data, stock_names, top_n=_wide_n, min_score=0.0
         )
+        # 完整榜单落进报告：交易计划的排名表用它，而不是用「筛过门槛的 picks」。
+        # 两者不是一回事 —— picks 是**今天要买什么**，ranking 是**模型怎么看全市场**，
+        # 「老持仓该不该留」问的是后者。
+        report["ranking"] = _ranking_of(df_wide)
         df = _apply_score_threshold(df_wide, float(min_score), _target_n, report)
 
         # 参考价：把推荐时点的最新收盘价带进 picks，供交易计划 / 执行侧做

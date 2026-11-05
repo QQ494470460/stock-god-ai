@@ -508,6 +508,7 @@ def build_trade_plan(
     risk_stats: Optional[dict] = None,
     tilt_strength: float = 0.0,
     picks_date: Optional[str] = None,
+    ranking: Optional[Sequence] = None,
     write: bool = True,
     plan_dir: Optional[Path] = None,
 ) -> TradePlan:
@@ -525,6 +526,11 @@ def build_trade_plan(
     市场状态自适应：当 ``regime`` 命中 ``REGIME_POSITION_OVERRIDES`` 且调用方
     未显式传入 ``max_positions`` / ``cash_reserve_pct`` 时，自动套用该状态的
     防御性组合参数（熊市→少而精+多现金，牛市→略放开）。显式传参优先。
+
+    ``ranking``：按评分降序的**完整榜单**（``[{代码, 名称, 评分}, ...]``，至少覆盖
+    ``max_positions × hold_rank_slack`` 名）。它回答「模型怎么看全市场」，
+    而 ``picks`` 只回答「今天买什么」—— 老持仓该不该留问的是前者。
+    不传则退回用 picks 的顺序，那会让排名滞后（slack）在有门槛筛选时静默失效。
     """
     # 1. 拿 picks
     meta: Dict[str, Any] = {}
@@ -534,6 +540,8 @@ def build_trade_plan(
         min_score = min_score or float(meta.get("min_score", 0) or 0)
         regime = regime or str(meta.get("regime") or "")
         source = source or meta.get("source", "daily_pick")
+        if ranking is None:
+            ranking = meta.get("ranking") or None
 
     # 1b. 新鲜度裁决。**只在这一处**算 plan_date：下面构造 TradePlan 也用它。
     #     两处各调一次 resolve_target_date() 会在跨午夜时得到两个不同的日期，
@@ -574,11 +582,49 @@ def build_trade_plan(
     # 2. 目标只数收口（计划本身不得超限）
     # ⚠️ 排名表必须在截断**之前**生成：截断后只剩 top_n 只，「排名滞后」
     # 需要的 9~(top_n×slack) 名信息就永久丢失了，届时 slack 只能退化成 1.0。
-    raw_rank: Dict[str, int] = {
-        str(r["code"]): i for i, r in enumerate(rows) if r.get("code")
-    }
+    #
+    # ⚠️ 而且**优先用调用方给的完整榜单**（``ranking``）。只用 picks 建排名表
+    # 是个隐蔽的坑：picks 是「今天买什么」（过了 min_score 门槛），不是「模型
+    # 怎么看全市场」。门槛把 425 只筛到 9 只时，排名表就只有 9 条，而保留线是
+    # ``max_positions × slack`` = 8×3 = 24 —— 老持仓根本不在表里，一律被判
+    # 「跌出目标组合，清仓」。等于 slack 静默退化成 1.0，而代码注释里那套
+    # 「50bp 夏普 0.95 vs 0.68」的好处一分没拿到。2026-11-05 实盘实测即如此。
+    raw_rank: Dict[str, int] = {}
+    for i, item in enumerate(ranking or []):
+        code = str((item.get("代码") or item.get("code") or "")
+                   if isinstance(item, dict) else item or "").strip()
+        if code and code not in raw_rank:
+            raw_rank[code] = i
+    if not raw_rank:
+        raw_rank = {str(r["code"]): i for i, r in enumerate(rows) if r.get("code")}
+    else:
+        # 兜底：榜单里可能缺了 picks 中的票（两段数据来源不同），补在末尾，
+        # 保证任何目标票都有名次 —— 缺名次会让它自己的持仓判断也失效。
+        for r in rows:
+            c = str(r["code"])
+            if c and c not in raw_rank:
+                raw_rank[c] = len(raw_rank)
     limit = max_positions if top_n is None else min(top_n, max_positions)
     rows = rows[: max(0, limit)]
+
+    # 2b. 覆盖度自检：排名表够不到保留线，slack 就静默退化成 1.0
+    #     （= 每个调仓日把所有不在今日 picks 里的老持仓清掉）。
+    #     这个失效**完全无声**：raw_rank 非空、计划正常、成交正常，只是换手翻倍。
+    try:
+        from config.settings import config as _cfg
+
+        _slack = float(getattr(_cfg.trading_loop, "hold_rank_slack", 1.0) or 1.0)
+    except Exception:  # noqa: BLE001
+        _slack = 1.0
+    if _slack > 1.0:
+        _need = int(round(max(int(max_positions or 0), 1) * _slack))
+        if len(raw_rank) < _need:
+            logger.warning(
+                f"⚠️ 排名表仅 {len(raw_rank)} 条，够不到保留线 top {_need}"
+                f"（{max_positions} 只 × {_slack:g}）—— 排名滞后退化为"
+                "「跌出目标组合即清仓」。多半是选股报告没带完整榜单"
+                "（旧报告的 ranking 字段为空），重跑一次选股即可。"
+            )
 
     targets = [
         PlanTarget(code=r["code"], name=r["name"], score=r["score"],
@@ -797,6 +843,10 @@ def load_latest_picks(report_dir: Optional[Path] = None) -> tuple[List[dict], di
             "report_date": _report_date_of(f),
             "report_file": f.name,
             "skipped_reports": skipped,
+            # 完整榜单（按评分降序）。交易计划的排名表用它判断「老持仓还在不在
+            # 保留线内」；没有它就只能用 picks 的顺序，而 picks 被门槛筛过，
+            # 覆盖不到保留线 —— 排名滞后会静默失效。旧报告没有这个字段。
+            "ranking": rep.get("ranking") or [],
         }
     return [], {"skipped_reports": skipped}
 
