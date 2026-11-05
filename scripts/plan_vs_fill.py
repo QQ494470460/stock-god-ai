@@ -225,6 +225,37 @@ def audit(date: str | None = None, data_dir: Path | None = None,
     }
 
 
+def retry_hint(rep: dict) -> str:
+    """「未建满会不会被补上」—— 只有这里能把「缺口」和「还有没有下一次机会」连起来。
+
+    ⚠️ 缺口的**大小**与缺口的**后果**是两件事：11-02 那次建满度 65%，看起来只是
+    「少买三只」，实际后果是「剩下 41% 现金要等 15 个交易日」。审计工具如果只报
+    百分比，读的人根本不知道这轮调仓已经结束了。
+    """
+    if rep.get("pending"):
+        return ""
+    try:
+        from config.settings import app_config
+
+        tl = getattr(app_config, "trading_loop", None)
+        enabled = bool(getattr(tl, "rebalance_retry_enabled", False))
+        min_ratio = float(getattr(tl, "rebalance_retry_min_fill_ratio", 0.85) or 0.85)
+        max_days = int(getattr(tl, "rebalance_retry_max_days", 2) or 0)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not (0.0 < min_ratio <= 1.0):
+        min_ratio = 1.0
+    ratio = float(rep.get("fill_ratio") or 0.0)
+    if ratio >= min_ratio:
+        return ""
+    if enabled:
+        return (f"↩️ 建满度 {ratio:.0%} < 顺延阈值 {min_ratio:.0%}：顺延重试**已开启**，"
+                f"若被拦的量还能补，loop 会在下一个交易日重试（最多 {max_days} 个交易日）")
+    return (f"↩️ 建满度 {ratio:.0%} < 顺延阈值 {min_ratio:.0%}：顺延重试**未开启**"
+            f"（rebalance_retry_enabled=false）—— 这轮调仓到此为止，缺口要等满 "
+            f"rebalance_days 个交易日才有下一次机会。11-02 就是这种形态。")
+
+
 def render(rep: dict) -> str:
     lines = []
     lines.append(f"计划日期 {rep['plan_date']}（{rep['plan_source']}，regime={rep['plan_regime']}）")
@@ -250,6 +281,9 @@ def render(rep: dict) -> str:
                      + ("   ✅ 健康" if rep["healthy"] else "   ⚠️ 偏空"))
         if rep["n_missing"] or rep["n_partially_filled"]:
             lines.append(f"未建满：完全没买 {rep['n_missing']} 只 / 只买到一部分 {rep['n_partially_filled']} 只")
+        hint = retry_hint(rep)
+        if hint:
+            lines.append(hint)
     lines.append("")
     lines.append(f"{'代码':<8}{'名称':<10}{'计划':>7}{'实际':>7}{'差额':>7}  状态 / 拦截原因")
     for r in rep["positions"]:

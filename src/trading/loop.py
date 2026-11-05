@@ -182,6 +182,13 @@ class LoopConfig:
     # N=8 时最多 16 笔。原来 10 会在满仓换手时把排在后面的买单截掉，
     # 而周期标记已写死 ⇒ 剩下的票要等一整个周期（15 个交易日），账户长期半仓。
     max_orders_per_tick: int = 30
+    # 调仓日「未建满」顺延重试（**默认关闭** ⇒ 与旧行为逐位相同）。
+    # 生产权威值在 config/settings.py:TradingLoopConfig 的同名字段（细则与背景
+    # 见那边的长注释）。要点：一天最多重试一次、整轮最多顺延
+    # `rebalance_retry_max_days` 个交易日，用尽即收尾，绝不退化成逐 tick 重试。
+    rebalance_retry_enabled: bool = False
+    rebalance_retry_max_days: int = 2
+    rebalance_retry_min_fill_ratio: float = 0.85
     settle_hour: int = 15                # 收盘结算时刻
     settle_minute: int = 5
     notify: bool = True                  # 是否推送事件/日报
@@ -390,6 +397,13 @@ class TradingLoop:
         # 必须落盘：闭环本来就设计成会自愈重启，纯内存状态一重启就「立刻再调一次仓」，
         # 换手与成本会翻倍 —— 而换手正是 50bp 成本下的死因。
         self._last_rebalance_date: str = ""
+        # 顺延重试的两个状态（见 config.settings.rebalance_retry_*）：
+        # `_rebalance_defer_from` = 本轮周期**第一次尝试**的交易日（顺延锚点，
+        #   收尾时用它回填周期标记，从而不把 15 天的节奏往后推）；
+        # `_rebalance_defer_date` = 最近一次判「未建满」的日期（实现「一天只重试一次」）。
+        # 必须落盘：与 `_last_rebalance_date` 同理会自愈重启。
+        self._rebalance_defer_from: str = ""
+        self._rebalance_defer_date: str = ""
         self._load_runtime()
         # 纸账户本金基线（initial_cash）的上一 tick 记忆：用于检测「重置」这类
         # 非交易性基线变更并自动对齐风控净值基线，避免误熔断。
@@ -499,6 +513,8 @@ class TradingLoop:
             }
             self._settled_dates = set(d for d in (data.get("settled_dates") or []) if d)
             self._last_rebalance_date = str(data.get("last_rebalance_date") or "")
+            self._rebalance_defer_from = str(data.get("rebalance_defer_from") or "")
+            self._rebalance_defer_date = str(data.get("rebalance_defer_date") or "")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"闭环运行态读盘失败（已忽略，按内存默认值）: {e}")
 
@@ -511,6 +527,8 @@ class TradingLoop:
                     "day_start_equity": self._day_start_equity,
                     "settled_dates": sorted(self._settled_dates),
                     "last_rebalance_date": self._last_rebalance_date,
+                    "rebalance_defer_from": self._rebalance_defer_from,
+                    "rebalance_defer_date": self._rebalance_defer_date,
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -979,6 +997,69 @@ class TradingLoop:
             logger.debug(f"调仓周期判定失败，按「到期」处理: {e}")
             return True
 
+    # ------------------------------------------------------------------
+    # 调仓日「未建满」顺延重试（opt-in，默认关闭）
+    # ------------------------------------------------------------------
+    def _retry_enabled(self) -> bool:
+        return bool(getattr(self.config, "rebalance_retry_enabled", False))
+
+    def _retry_max_days(self) -> int:
+        try:
+            return max(int(getattr(self.config, "rebalance_retry_max_days", 0) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _retry_min_ratio(self) -> float:
+        try:
+            r = float(getattr(self.config, "rebalance_retry_min_fill_ratio", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+        # 越界一律按「不重试」处理：>1 会让每次调仓都顺延，<=0 等于永远满意。
+        return r if 0.0 < r <= 1.0 else 1.0
+
+    def _defer_days_used(self, today: str) -> int:
+        """从顺延锚点算起，已经过去几个**交易日**（0 = 今天就是首次尝试日）。"""
+        anchor = (self._rebalance_defer_from or "").strip()
+        if not anchor:
+            return 0
+        try:
+            from datetime import date as _date
+
+            from src.trading.calendar import trading_days_between
+
+            return int(trading_days_between(_date.fromisoformat(anchor),
+                                            _date.fromisoformat(today)))
+        except Exception as e:  # noqa: BLE001
+            # 日历不可用时**不重试**（宁可维持旧行为，也不要在算不清预算时反复下单）
+            logger.debug(f"顺延天数计算失败，本轮不顺延: {e}")
+            return 10 ** 6
+
+    def _clear_defer(self) -> None:
+        self._rebalance_defer_from = ""
+        self._rebalance_defer_date = ""
+
+    def _close_cycle(self, today: str) -> None:
+        """收尾本轮调仓周期：周期标记回填到**锚点**（第一次尝试日）。
+
+        为什么不是 `today`：回测里调仓是严格的「每 N 个交易日一次」，顺延只是
+        把**执行**补上，不该把**节奏**往后推 —— 否则每顺延一次，下一次调仓就
+        整体平移，几次之后与回测口径差出一个周期。
+        """
+        anchor = (self._rebalance_defer_from or "").strip()
+        if anchor:
+            try:
+                from datetime import date as _date
+
+                _date.fromisoformat(anchor)
+            except Exception:  # noqa: BLE001
+                # 锚点坏掉时**绝不能**把它写进周期标记：`_rebalance_due` 解析失败
+                # 会 fail-open 返回「到期」⇒ 每个 tick 都调仓，比不顺延糟得多。
+                logger.warning(f"顺延锚点 {anchor!r} 不是合法日期，周期标记回退到今天")
+                anchor = ""
+        self._last_rebalance_date = anchor or today
+        self._clear_defer()
+        self._save_runtime()
+
     def _build_exec_scheduler(self):
         """构建执行调度器（T2）。仅当 execution.smart_routing 开启时返回实例，
         否则返回 None（闭环走原「单 tick 一次性下单」路径，行为完全不变）。
@@ -1038,6 +1119,29 @@ class TradingLoop:
             report.note = (f"距上次调仓不足 {getattr(self.config, 'rebalance_days', 0)} "
                            f"个交易日（上次 {self._last_rebalance_date}），本次只跑止损/结算")
             return
+        _retry = self._retry_enabled()
+        _today = datetime.now().strftime("%Y-%m-%d")
+        if _retry:
+            # ① 顺延预算用尽 ⇒ 就地收尾。放在下单之前：结构性拦截（集中度/资金）
+            #    不会因为再试一次而消失，继续下单只是把同样的日志再刷一遍。
+            _used = self._defer_days_used(_today)
+            if _used > self._retry_max_days():
+                logger.warning(
+                    f"⚠️ 调仓顺延预算用尽（锚点 {self._rebalance_defer_from}，"
+                    f"已顺延 {_used} 个交易日 > 上限 {self._retry_max_days()}）⇒ "
+                    f"本轮收尾，周期标记回填到锚点。未建满的部分要等下一个周期，"
+                    f"请查 data/trading_journal.jsonl 里被拦的原因。")
+                self._close_cycle(_today)
+                report.note = "调仓顺延预算用尽，本轮收尾"
+                return
+            # ② 一天只重试一次。放开的后果：结构性拦截会让每个 tick 都重下一遍，
+            #    换手被悄悄改成「逐 tick」，15 天周期的成本优势直接作废。
+            if self._rebalance_defer_date == _today:
+                report.note = (
+                    f"本轮调仓已顺延（锚点 {self._rebalance_defer_from}，"
+                    f"已用 {_used}/{self._retry_max_days()} 个交易日），"
+                    f"下个交易日再试")
+                return
         from src.trading.rebalance import compute_rebalance_orders
 
         risk_scale = self._portfolio_risk_scale(account)
@@ -1058,7 +1162,9 @@ class TradingLoop:
         # 因此不受 max_orders_per_tick 截断；入队后即记周期标记，避免重复入队。
         if self._exec_scheduler is not None and intents:
             n_q = self._exec_scheduler.enqueue(intents, datetime.now().date())
-            self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
+            # 与下面同口径：顺延期间记账用锚点（不推节奏）
+            self._last_rebalance_date = (
+                (self._rebalance_defer_from or _today) if _retry else _today)
             self._save_runtime()
             report.note = (
                 f"⚙️ 执行调度已接管 {n_q} 笔调仓意图，"
@@ -1073,11 +1179,14 @@ class TradingLoop:
         #           ② 万一仍被截断，**不写周期标记**，下个 tick 接着做。
         _limit = int(getattr(self.config, "max_orders_per_tick", 0) or 0)
         _truncated = bool(_limit > 0 and len(intents) > _limit)
+        # 周期标记先写再下单（崩溃安全：宁可「记成已调过」也不要重复下单）。
+        # 值取「顺延锚点」而非今天：顺延只补执行，不推节奏（见 _close_cycle）。
+        _mark_value = ((self._rebalance_defer_from or _today) if _retry else _today)
         if not _truncated:
             # 空转（带内/资金不足）也要记账：调仓是按**周期**驱动的，不是
             # 「想调就调」。只在有成交时记账，会让空转的调仓日每 tick 重算，
             # 直到某天碰巧成交 —— 等于把周期悄悄改回逐 tick。
-            self._last_rebalance_date = datetime.now().strftime("%Y-%m-%d")
+            self._last_rebalance_date = _mark_value
             self._save_runtime()
         else:
             logger.warning(
@@ -1086,10 +1195,18 @@ class TradingLoop:
                 f"（记了的话剩下的委托要等 "
                 f"{getattr(self.config, 'rebalance_days', '?')} 个交易日）")
         if not intents:
+            if _retry and (self._rebalance_defer_from or self._rebalance_defer_date):
+                # 顺延后的重试日跑出「零意图」= 已经对齐目标，顺延结束。
+                self._clear_defer()
+                self._save_runtime()
             return
 
         score_map = {t.code: t.score for t in self.plan.targets}
+        _planned = 0.0
+        _filled = 0.0
         for it in (intents[:_limit] if _limit > 0 else intents):
+            _amt = abs(float(it.quantity or 0) * float(it.price or 0))
+            _planned += _amt
             ok, msg, order, detail = self._place(
                 code=it.code, name=it.name, side=it.side,
                 quantity=it.quantity, price=it.price, reason=it.reason,
@@ -1100,8 +1217,37 @@ class TradingLoop:
             report.actions.append(detail or {})
             if ok:
                 report.n_executed += 1
+                # 用「实际成交量×成交价」而不是意愿量：guard 可能下调数量
+                _dq = float((detail or {}).get("quantity") or 0)
+                _dp = float((detail or {}).get("price") or 0)
+                _filled += abs(_dq * _dp) if (_dq > 0 and _dp > 0) else _amt
             else:
                 report.n_blocked += 1
+        # 顺延判定：只看「本轮委托有多少真成交了」。被截断的那条路径已经用
+        # 「不写周期标记」实现了 tick 级续做，两条机制不叠加（否则同一批委托
+        # 会被两套重试逻辑各推一次）。
+        if _retry and not _truncated:
+            _ratio = (_filled / _planned) if _planned > 0 else 1.0
+            if _ratio < self._retry_min_ratio():
+                anchor = self._rebalance_defer_from or _today
+                self._rebalance_defer_from = anchor
+                self._rebalance_defer_date = _today
+                self._last_rebalance_date = ""      # 撤回：本轮不算「调过」
+                self._save_runtime()
+                logger.warning(
+                    f"⚠️ 本轮调仓未建满：成交 ¥{_filled:,.0f} / 计划 ¥{_planned:,.0f}"
+                    f"（{_ratio:.0%} < {self._retry_min_ratio():.0%}），"
+                    f"{report.n_blocked} 笔被拦 ⇒ **不记周期标记**，顺延到下一个交易日"
+                    f"重试（锚点 {anchor}，已用 {self._defer_days_used(_today)}"
+                    f"/{self._retry_max_days()} 个交易日）。"
+                    f"若拦截原因结构性不变，预算用尽后会自动收尾。")
+                report.note = (
+                    f"调仓未建满（{_ratio:.0%}），已顺延到下一交易日"
+                    f"（{self._defer_days_used(_today)}/{self._retry_max_days()}）")
+                return
+            if self._rebalance_defer_from or self._rebalance_defer_date:
+                self._clear_defer()
+                self._save_runtime()
 
     def _drain_exec_scheduler(self, now, report: TickReport):
         """T2：每个交易 tick 让调度器吐出「此刻该发」的切片，并经 guard 下单。"""
