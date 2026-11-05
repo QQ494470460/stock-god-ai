@@ -148,6 +148,27 @@ def _job_data_update_impl() -> Dict:
         info["status"] = "error"
         info["error"] = str(e)
         logger.error(f"数据更新失败: {e}\n{traceback.format_exc()}")
+    # 顺手体检：只读 parquet footer，5577 个文件约 6 秒，干净时**不输出任何东西**。
+    # 为什么会缺这一步（2026-11-05）：data/ 里有 2 个缓存读不出来，而且当时的读
+    # 缓存是裸读 —— 异常穿透、走不到「重新拉取」，那两只票静默缺历史。
+    # 结论：*发现* 损坏必须常态化，不能靠谁偶然翻日志。
+    # 这里只报告不修：读路径已经会「改名留证 + 重新拉取」，自动修复反而会掩盖问题。
+    try:
+        from src.data.fetcher import scan_corrupt_caches
+
+        bad = scan_corrupt_caches()
+        if bad:
+            info["corrupt_caches"] = bad[:20]
+            info["n_corrupt_caches"] = len(bad)
+            logger.error(
+                f"⚠️ 行情缓存损坏 {len(bad)} 个（写入被打断的典型形态："
+                f"magic bytes not found in footer）："
+                + "、".join(f"{b['file']}({b['error']})" for b in bad[:5])
+                + f"{' …' if len(bad) > 5 else ''} —— "
+                f"这些票下次被读取时会自动改名留证并重新拉取；"
+                f"要立刻排查可跑 scripts/check_data_quality.py（它也报「读取失败」）。")
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"缓存完整性体检失败（不影响数据更新）: {e}")
     return info
 
 

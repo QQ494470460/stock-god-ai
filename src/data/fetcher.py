@@ -6,6 +6,7 @@
 """
 
 import time
+import os
 import re
 import json
 import threading
@@ -118,6 +119,101 @@ class StockInfo:
     float_cap: float   # 流通市值（亿）
 
 
+# ============================================================
+# parquet 缓存写入：原子 + 损坏可取证
+# ============================================================
+
+def _atomic_to_parquet(df: pd.DataFrame, path) -> None:
+    """先写同目录临时文件，再 ``os.replace`` —— **绝不直接往目标文件写**。
+
+    为什么要原子（2026-11-05）
+    --------------------------
+    实测日志里出现过 ``magic bytes not found in footer``（600126 / 603606）。
+    parquet 的 footer 是最后写的，**写入过程被中断就必然缺 footer** ——
+    这台机器恰恰经常被关机/休眠打断（``launcher.log`` 里 ``1073807364`` 连击）。
+    直接 ``to_parquet(目标路径)`` 等于「先毁掉旧文件，再尝试写新文件」，
+    中断一次就白丢一份历史。
+
+    为什么不是「写完再校验」：校验只能发现坏了，救不回来；原子写从源头不会坏。
+    """
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"缓存目录创建失败（继续尝试写）: {e}")
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)      # 同目录 rename，原子
+    finally:
+        # 异常路径下清掉半截临时文件；成功路径上它已被 replace 掉
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _quarantine(path) -> str:
+    """把读不出来的缓存改名留证，返回新路径（失败返回空串）。
+
+    ⚠️ **绝不能直接覆盖**：缓存读失败后如果照常写入，写进去的只是「本次拉到的
+    区间」（往往 30 天），全量历史就此静默消失 —— 而缓存文件名不含区间，
+    下一次读到的「历史」就只有 30 天，训练样本量悄悄缩水，不报任何错。
+    改名留证还有一个好处：出问题时能确认「到底是不是真损坏、损坏成什么样」。
+    """
+    path = Path(path)
+    if not path.exists():
+        return ""
+    bak = path.with_name(
+        f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    try:
+        os.replace(path, bak)
+        return str(bak)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"损坏缓存改名失败({path.name}): {e}")
+        return ""
+
+
+def scan_corrupt_caches(cache_dir=None, pattern: str = "*.parquet") -> list:
+    """只读 footer 扫一遍缓存完整性，返回坏文件清单（5577 个约 6 秒）。
+
+    为什么值得每天跑（2026-11-05 实测）
+    ----------------------------------
+    ``data/`` 里 5577 个日线缓存中有 **2 个**读不出来
+    （``Parquet magic bytes not found in footer``），两文件的 mtime 分别落在
+    01:13 / 01:21 —— 正是 ``launcher.log`` 里关机/休眠崩溃的时间窗。
+    而当时的读缓存是**裸读**（异常直接穿透，走不到「重新拉取」），
+    于是这两只票就这么在无人知晓的情况下缺着历史，直到有人偶然翻日志。
+
+    只读 metadata：解析 footer 即可判断完整性，不加载数据，所以能进日常作业。
+    """
+    base = Path(cache_dir or DATA_DIR)
+    bad: list = []
+    try:
+        import pyarrow.parquet as pq
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"pyarrow 不可用，跳过缓存完整性扫描: {e}")
+        return bad
+    try:
+        files = sorted(base.glob(pattern))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"缓存目录扫描失败: {e}")
+        return bad
+    for p in files:
+        try:
+            pq.ParquetFile(p).metadata
+        except Exception as e:  # noqa: BLE001
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = -1
+            bad.append({"file": p.name, "size": size,
+                        "error": type(e).__name__})
+    return bad
+
+
 class DataFetcher:
     """数据获取器"""
     
@@ -148,19 +244,35 @@ class DataFetcher:
 
         这里做按日期索引的 upsert：新数据覆盖同日期旧数据，
         其余历史行原样保留。
+
+        ⚠️ 缓存**读不出来**时绝不照常覆盖（2026-11-05 修）：见 ``_quarantine``。
+        旧实现在 ``except`` 里直接 ``to_parquet`` 写回新数据，正是本文档开头
+        警告的那个灾难 —— 文件损坏一次，全量历史就被 30 天覆盖掉，且不报错。
         """
+        if not cache_file.exists():
+            new_df = new_df.sort_values("date")
+            _atomic_to_parquet(new_df, cache_file)
+            return new_df
+
         try:
-            if not cache_file.exists():
-                new_df = new_df.sort_values("date")
-                new_df.to_parquet(cache_file, index=False)
-                return new_df
-
             old = pd.read_parquet(cache_file)
-            if len(old) == 0:
-                new_df = new_df.sort_values("date")
-                new_df.to_parquet(cache_file, index=False)
-                return new_df
+        except Exception as e:  # noqa: BLE001
+            bak = _quarantine(cache_file)
+            logger.error(
+                f"⚠️ 缓存损坏无法读取({cache_file.name}): {e} —— "
+                f"已改名留证 {bak or '（改名失败，将被覆盖）'}，"
+                f"本次只写入新拉到的区间，**该股历史可能变短**，"
+                f"请核查后按需补拉全量。")
+            new_df = new_df.sort_values("date")
+            _atomic_to_parquet(new_df, cache_file)
+            return new_df
 
+        if len(old) == 0:
+            new_df = new_df.sort_values("date")
+            _atomic_to_parquet(new_df, cache_file)
+            return new_df
+
+        try:
             old["date"] = pd.to_datetime(old["date"])
             new_df = new_df.copy()
             new_df["date"] = pd.to_datetime(new_df["date"])
@@ -185,13 +297,19 @@ class DataFetcher:
                     f"{cache_file.name} 合并后行数({len(merged)})少于原缓存({before})，"
                     f"请检查数据源是否异常"
                 )
-            merged.to_parquet(cache_file, index=False)
+            _atomic_to_parquet(merged, cache_file)
             return merged
-        except Exception as e:
-            logger.warning(f"缓存合并失败({cache_file.name}): {e}，直接写入新数据")
-            new_df = new_df.sort_values("date")
-            new_df.to_parquet(cache_file, index=False)
-            return new_df
+        except Exception as e:  # noqa: BLE001
+            # 合并失败 ⇒ **保住旧缓存不写**，本 tick 返回「完整的旧历史」而不是
+            # 「新鲜但只有 30 天的新数据」。缺最新几行是可用性问题，丢历史是数据事故。
+            logger.error(
+                f"缓存合并失败({cache_file.name}): {e} —— **未写盘**，旧缓存（{len(old)} 行）"
+                f"原样保留；本次返回旧历史（可能缺最近几行），请查数据源字段是否变了。")
+            # 连 date 列都没有时 sort 会再抛一次 —— 兜底别再炸，旧缓存已经保住了
+            try:
+                return old.sort_values("date").reset_index(drop=True)
+            except Exception:  # noqa: BLE001
+                return old.reset_index(drop=True)
 
     # ========== 股票列表 ==========
     
@@ -221,7 +339,7 @@ class DataFetcher:
             logger.info("后台刷新股票列表…")
             df = self._fetch_stock_list_remote()
             if len(df) > 1000:  # 明显异常的结果不写入，避免污染缓存
-                df.to_parquet(cache_file, index=False)
+                _atomic_to_parquet(df, cache_file)
                 self._stock_list_cache = df
                 logger.info(f"股票列表后台刷新完成: {len(df)} 只")
         except Exception as e:
@@ -261,7 +379,7 @@ class DataFetcher:
         logger.info("正在获取A股全市场股票列表（首次约需 10-20 秒）...")
         try:
             df = self._fetch_stock_list_remote()
-            df.to_parquet(cache_file, index=False)
+            _atomic_to_parquet(df, cache_file)
             self._stock_list_cache = df
             logger.info(f"获取到 {len(df)} 只A股股票")
             return df
@@ -345,9 +463,22 @@ class DataFetcher:
         cache_file = self.cache_dir / f"daily_{code}_{adjust}.parquet"
         
         # 尝试从缓存加载
+        # ⚠️ 这一步**必须**容错：它是全函数第一处读缓存，且不在下面的重试 try 里。
+        # 实测（2026-11-05）data/ 里有 2/5577 个文件是这个形状：
+        #   ArrowInvalid: Parquet magic bytes not found in footer
+        # 两个文件的 mtime 都落在关机/休眠窗口（01:13 / 01:21），是**写一半被中断**。
+        # 旧代码在这里裸读 ⇒ 异常直接穿透到调用方，而缓存一直是坏的 ⇒
+        # 每次请求都以同样的方式失败，永远走不到「重新拉取」那一步。
         if cache_file.exists():
-            cached = pd.read_parquet(cache_file)
-            if len(cached) > 0:
+            cached = None
+            try:
+                cached = pd.read_parquet(cache_file)
+            except Exception as e:  # noqa: BLE001
+                bak = _quarantine(cache_file)
+                logger.error(
+                    f"⚠️ 日线缓存损坏({cache_file.name}): {type(e).__name__}: "
+                    f"{str(e)[:80]} —— 已改名留证 {bak or '（改名失败）'}，改为重新拉取。")
+            if cached is not None and len(cached) > 0:
                 cached["date"] = pd.to_datetime(cached["date"])
                 cached = cached[(cached["date"] >= start_date) & (cached["date"] <= end_date)]
                 # 检查数据是否过期：
