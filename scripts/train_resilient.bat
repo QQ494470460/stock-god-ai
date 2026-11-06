@@ -1,0 +1,2 @@
+@echo off
+"C:/Users/49447/AppData/Local/Programs/Python/Python312/python.exe" "C:/Users/49447/.qclaw/workspace/stock-god-ai/scripts/train_optuna.py" --objective rankic --no-deploy --study-storage "C:/Users/49447/.qclaw/workspace/stock-god-ai/models/rankic_hpo.db" --study-name rankic_hpo --panel-cache "C:/Users/49447/.qclaw/workspace/stock-god-ai/models/.rankic_panel.pkl" --panel-cache-max-age-h 72 --done-marker "C:/Users/49447/.qclaw/workspace/stock-god-ai/models/.rankic_done.json" --xgb-threads 8 --n-trials 50 --cv-folds 3

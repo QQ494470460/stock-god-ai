@@ -230,6 +230,26 @@ def parse_args():
                         "含 model/scaler/encoder/features 四件套）。该版本经人工批准名单"
                         "（或 ml.active_version 钉子）批准后，可由 predictor 真正切换加载。"
                         "为空则不写版本（保持默认行为，仅覆盖生产产物）")
+    # ---- 续跑/可靠性（默认全关，不改变旧行为；只有显式传参才生效）----
+    p.add_argument("--study-storage", default="",
+                   help="Optuna 学习记录持久化路径（sqlite:///绝对或相对路径.db）。"
+                        "非空时学习可跨进程/跨重启续跑（load_if_exists），已完成 trial 不重算。"
+                        "为空=内存学习（与历史行为完全一致）。需要 sqlalchemy（optuna 后端）。")
+    p.add_argument("--study-name", default="rankic_hpo",
+                   help="sqlite 学习名（--study-storage 非空时生效）。")
+    p.add_argument("--panel-cache", default=str(MODEL_DIR / ".rankic_panel.pkl"),
+                   help="gather_panel 产物缓存路径。命中且未过期则免重新拉取 400+ 只票日线"
+                        "（约 15 分钟且脆弱）。默认 models/.rankic_panel.pkl。")
+    p.add_argument("--panel-cache-max-age-h", type=float, default=24.0,
+                   help="面板缓存最大有效期（小时）。超时则重建。默认 24；"
+                        "跨日续跑建议调大（如 72）以免每日重取数。")
+    p.add_argument("--force-panel-rebuild", action="store_true",
+                   help="忽略面板缓存，强制重新取数。")
+    p.add_argument("--force-retrain", action="store_true",
+                   help="忽略完成标记，强制重跑（含最终训练）。")
+    p.add_argument("--done-marker", default=str(MODEL_DIR / ".rankic_done.json"),
+                   help="训练完成标记。存在且非 --force-retrain 时整个 _run_rankic 直接跳过，"
+                        "保证每日 01:00 重启后续跑不会重做最终训练。")
     return p.parse_args()
 
 
@@ -588,6 +608,27 @@ def gather_panel(args):
       → melt 回长表按 (date, code) 对齐
     标签口径与 train_production_v2.py 完全一致。
     """
+    # ---- 面板缓存：跨重启续跑的关键 ----
+    # 400+ 只票逐日线网络拉取约 15 分钟且脆弱（代理/限流会卡死）。把产物 pickle 落盘，
+    # 命中有效期内的重跑直接加载，避开重新取数；未建满被每日 01:00 重启杀掉也能续。
+    cache_path = getattr(args, "panel_cache", "") or ""
+    max_age_h = float(getattr(args, "panel_cache_max_age_h", 24.0) or 24.0)
+    if cache_path and not getattr(args, "force_panel_rebuild", False):
+        cp = Path(cache_path)
+        if cp.exists():
+            age_h = (time.time() - cp.stat().st_mtime) / 3600.0
+            if age_h <= max_age_h:
+                try:
+                    with open(cp, "rb") as fh:
+                        Xc, yc, metc, fwdc = pickle.load(fh)
+                    logger.info(f"♻️ 命中面板缓存（{age_h:.1f}h 前，{len(Xc)} 样本）"
+                                f"→ 跳过重新取数: {cp}")
+                    return Xc, yc, metc, fwdc
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"面板缓存读取失败，重建: {e}")
+            else:
+                logger.info(f"面板缓存过期（{age_h:.1f}h > {max_age_h:.0f}h），重建")
+
     codes = _pool_codes(args)
     end_date = datetime.now().strftime("%Y%m%d")
 
@@ -651,6 +692,17 @@ def gather_panel(args):
     logger.info(f"面板: {len(X)} 样本 × {X.shape[1]} 特征 | "
                 f"{meta['__date__'].nunique()} 个交易日 | "
                 f"{meta['__code__'].nunique()} 只股票 | 标签={dict(Counter(y.values))}")
+
+    # ---- 落盘面板缓存（原子写，避免写到一半被重启截断）----
+    if cache_path:
+        try:
+            tmp = Path(str(cache_path) + f".tmp_{os.getpid()}")
+            with open(tmp, "wb") as fh:
+                pickle.dump((X, y, meta, fwd), fh)
+            os.replace(tmp, cache_path)
+            logger.info(f"💾 面板缓存已落盘: {cache_path}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"面板缓存写盘失败（不影响训练）: {e}")
     return X, y, meta, fwd
 
 
@@ -738,11 +790,37 @@ def rankic_search(X, y, meta, fwd, args):
     logger.info(f"🔍 XGBOOST Optuna TPE — {args.n_trials} trials   目标: 样本外 RankIC")
     logger.info(f"{'='*60}")
 
-    study = optuna.create_study(
+    storage = getattr(args, "study_storage", "") or ""
+    if storage and not storage.startswith("sqlite://"):
+        storage = f"sqlite:///{Path(storage).resolve().as_posix()}"
+    study_name = getattr(args, "study_name", "rankic_hpo") or "rankic_hpo"
+    create_kwargs = dict(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10),
     )
+    if storage:
+        try:
+            import sqlalchemy  # noqa: F401  optuna sqlite 后端依赖
+        except ImportError:
+            logger.error("⚠️ --study-storage 需要 sqlalchemy（pip install sqlalchemy），"
+                         "回退为内存学习（不可续跑）")
+            storage = ""
+        else:
+            create_kwargs["storage"] = storage
+            create_kwargs["study_name"] = study_name
+            create_kwargs["load_if_exists"] = True
+    study = optuna.create_study(**create_kwargs)
+
+    # 续跑：已完成 trial 不重算，只跑差额（跨进程/重启续跑的核心）
+    existing = len(study.trials)
+    if storage and existing > 0:
+        logger.info(f"♻️ 已存在 {existing} 个 trial（sqlite 续跑），将再跑 "
+                    f"{max(0, args.n_trials - existing)} 个")
+    remaining = max(0, args.n_trials - existing)
+    if remaining == 0:
+        logger.info("✅ 目标 trial 数已达成，跳过搜索")
+
     max_est = getattr(args, "max_estimators", 1500)
     n_threads = int(getattr(args, "xgb_threads", -1) or -1)
     logger.info(f"  搜索期线程: {n_threads if n_threads > 0 else '全部核心'} "
@@ -750,8 +828,9 @@ def rankic_search(X, y, meta, fwd, args):
     obj = lambda t: rankic_objective(t, X, y, meta, fwd, args, max_est, n_threads)
     timeout = args.optuna_timeout if args.optuna_timeout > 0 else None
     cb = _TrialProgress(args.n_trials, "xgboost", metric="RankIC")
-    study.optimize(obj, n_trials=args.n_trials, timeout=timeout,
-                   n_jobs=1, show_progress_bar=True, callbacks=[cb])
+    if remaining > 0:
+        study.optimize(obj, n_trials=remaining, timeout=timeout,
+                       n_jobs=1, show_progress_bar=True, callbacks=[cb])
 
     logger.info(f"\n🏆 最佳: Trial #{study.best_trial.number}  "
                 f"验证集 RankIC = {study.best_value:+.6f}")
@@ -862,6 +941,28 @@ def rankic_final(X, y, meta, fwd, args, best_params, deploy=True):
 
 
 def _run_rankic(args, t_start, deploy):
+    # ---- 完成标记：幂等续跑 ----
+    # 每日 01:00 重启会杀掉训练。最终训练跑完即写标记；后续续跑（sqlite 续 trial）
+    # 看到标记直接跳过，避免重做最终训练 / 覆盖候选产物。
+    done_marker = getattr(args, "done_marker", "") or ""
+    if done_marker and not getattr(args, "force_retrain", False) and Path(done_marker).exists():
+        try:
+            with open(done_marker, "r", encoding="utf-8") as fh:
+                dm = json.load(fh)
+            logger.info(f"✅ 训练已完成（标记 {done_marker}）："
+                        f"oos_rank_ic={dm.get('oos_rank_ic')} model={dm.get('model_path')}。"
+                        f"--force-retrain 可强制重跑。整段跳过。")
+            logger.info("===TRAINING_COMPLETE=== (已完成，跳过)")
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    if getattr(args, "force_retrain", False) and done_marker and Path(done_marker).exists():
+        try:
+            Path(done_marker).unlink()
+            logger.info("🗑️ --force-retrain：已删除旧完成标记")
+        except Exception:  # noqa: BLE001
+            pass
+
     # --max-samples 只在旧口径 gather_data 里生效；RankIC 口径按 (date, code) 建面板，
     # 按行随机降采样会把横截面打散（某些交易日只剩几只票），逐日 RankIC 直接失真。
     # 与其静默忽略（快速档历史上一直传 --max-samples 30000，实际毫无作用，
@@ -893,6 +994,22 @@ def _run_rankic(args, t_start, deploy):
 
     r = rankic_search(X, y, meta, fwd, args)
     fin = rankic_final(X, y, meta, fwd, args, r["best_params"], deploy=deploy)
+
+    # ---- 写完成标记（幂等续跑用）----
+    if done_marker:
+        try:
+            with open(done_marker, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "timestamp": datetime.now().isoformat(),
+                    "objective": "rankic",
+                    "oos_rank_ic": fin["oos_rank_ic"],
+                    "model_path": fin["model_path"],
+                    "deployed": fin["deployed"],
+                    "n_trials": args.n_trials,
+                }, fh, ensure_ascii=False, default=str)
+            logger.info(f"💾 完成标记已写: {done_marker}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"完成标记写盘失败（不影响产物）: {e}")
 
     summary = {
         "timestamp": datetime.now().isoformat(),
