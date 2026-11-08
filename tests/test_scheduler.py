@@ -137,6 +137,18 @@ def patched(monkeypatch, tmp_path):
     import src.core.rolling_ic as _ric
     monkeypatch.setattr(_ric, "IC_LOG", tmp_path / "rolling_ic_log.json")
     monkeypatch.setattr(_ric, "STATUS_FILE", tmp_path / "rolling_ic_status.json")
+    # ★ 进化态：patched 只把 auto_scheduler.evolution / daily_pick.evolution 换成了
+    # 替身，但 job_evolution 链路仍会直接触达**真实** src.models.evolution 模块——
+    # feedback.verify_pending 内 `eng = EvolutionEngine()` 新建真实实例并 save()
+    # 到 EVOLUTION_FILE（= data/evolution_state.json），EvolutionEngine._load 的
+    # 迁移逻辑也会在权重不符时落盘。该路径在隔离态（verify_all_pending 返 []）
+    # 不触发，于是在全量顺序里才会暴露，写脏生产进化态。参照 TRACK_FILE 的做法，
+    # 把真实进化态文件路径也重定向到 tmp：既满足「零污染生产态」，又保留
+    # test_job_evolution_writes_into_tmp 的「写入落在 tmp」反证。
+    import src.models.evolution as _evo_mod
+    _evo_tmp = tmp_path / "evolution_state.json"
+    monkeypatch.setattr(_evo_mod, "EVOLUTION_FILE", _evo_tmp)
+    monkeypatch.setattr(_evo_mod.evolution, "state_file", _evo_tmp)
     # ⚠️ 跨进程锁目录也必须隔离到 tmp。
     # 2026-10-19 真事故（测试侧）：给调度器加了跨进程单实例锁之后，
     # ``is_running()`` 会去探 ``data/.scheduler.lock``。本机常驻 run_loop 正持着
