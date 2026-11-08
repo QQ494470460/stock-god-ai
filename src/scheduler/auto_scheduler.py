@@ -544,6 +544,10 @@ def catch_up_missed(now: Optional[datetime] = None, dry_run: bool = False,
     ``dry_run``：只报告会补哪些，不真跑。
     """
     if _job_runs_bootstrap(now):
+        logger.info(
+            "🕒 作业记账为首次运行建立基准：本进程生命周期内不补历史窗口"
+            "（避免部署当天白跑全池选股）。后续漏跑从此时刻起算。"
+        )
         return []                  # 刚建立基准，没有「错过」可言
     todo = missed_jobs(now)
     if not todo:

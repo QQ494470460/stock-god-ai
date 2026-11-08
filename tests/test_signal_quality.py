@@ -51,6 +51,26 @@ def test_neutralize_does_not_collapse_singleton_industry():
     assert abs(neu["B1"] - 5.0) < 1e-9
 
 
+def test_neutralize_unknown_group_never_shifted_even_when_multiple():
+    """回归：≥2 只未映射股落入 _UNKNOWN_ 伪组时，必须原样保留，不可整体平移。
+
+    这是 2026-11 发现的偏差根因：缺失行业映射的票被合并成伪行业、互相拉平，
+    等于用数据缺失惩罚分散化。_UNKNOWN_ 组无论数量都必须保留原分。
+    """
+    scores = pd.Series({
+        "A1": 90.0, "A2": 10.0,     # 行业甲
+        "C1": 5.0,  "C2": 95.0,     # 无行业映射（→ _UNKNOWN_）
+    })
+    ind_map = {"A1": "甲", "A2": "甲"}   # C1/C2 故意不映射
+    neu = neutralize_cross_section(scores, ind_map)
+    # 未知组必须原样保留（绝不随 A 组水位平移）
+    assert abs(neu["C1"] - 5.0) < 1e-9
+    assert abs(neu["C2"] - 95.0) < 1e-9
+    # 真实行业组仍正常去均值
+    assert abs(neu["A1"] - 90.0) < 1e-9
+    assert abs(neu["A2"] - 10.0) < 1e-9
+
+
 def test_neutralize_keeps_grand_mean_level():
     """中性化不改变整体均值水平（只剔行业水位）。"""
     scores = pd.Series({"A1": 90.0, "A2": 70.0, "B1": 30.0, "B2": 10.0})

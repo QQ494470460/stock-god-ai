@@ -23,3 +23,9 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+      - name: Paper shadow audit (offline gate)
+        # 纸盘影子期验收：纯离线（只依赖本地 paper_trade_history.json /
+        # production_metrics.json），不联网。审计结论为 FAIL（实盘前信号/风控
+        # 验收不达标）时才退出非 0，把 CI 变红；无数据时为 NO_DATA，正常通过。
+        run: python scripts/paper_shadow_audit.py

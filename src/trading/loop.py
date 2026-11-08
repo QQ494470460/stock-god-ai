@@ -1162,12 +1162,22 @@ class TradingLoop:
         # 因此不受 max_orders_per_tick 截断；入队后即记周期标记，避免重复入队。
         if self._exec_scheduler is not None and intents:
             n_q = self._exec_scheduler.enqueue(intents, datetime.now().date())
-            # 与下面同口径：顺延期间记账用锚点（不推节奏）
-            self._last_rebalance_date = (
-                (self._rebalance_defer_from or _today) if _retry else _today)
-            self._save_runtime()
+            # ⚠️ T2 执行调度接管后，下面的「周期记账 + 顺延重试」逻辑整体跳过（return）：
+            # 调度器在盘中按切片逐 tick 发出，日内填不满由调度器自身重发处理，与「按周期
+            # 驱动的顺延重试」严格互斥，两套机制叠加会重复推动同一批委托。
+            # 但若入队本身被截断（n_q < 待入队数），与上方「闸门截断」同义：
+            # **不写周期标记**，下个 tick 继续补入队，否则账户长期半仓、现金闲置。
+            if n_q >= len(intents):
+                # 与下面同口径：顺延期间记账用锚点（不推节奏）
+                self._last_rebalance_date = (
+                    (self._rebalance_defer_from or _today) if _retry else _today)
+                self._save_runtime()
+            else:
+                logger.warning(
+                    f"⚠️ T2 入队被截断：{n_q}/{len(intents)} 笔入队，"
+                    f"不记周期标记，下个 tick 继续补入队（记了会锁账户）")
             report.note = (
-                f"⚙️ 执行调度已接管 {n_q} 笔调仓意图，"
+                f"⚙️ 执行调度已接管 {n_q}/{len(intents)} 笔调仓意图，"
                 f"将于盘中按 {getattr(self.config.execution, 'slice_strategy', 'twap')} 分片发出")
             return
         # ⚠️ 「防雪崩闸门」与「周期记账」的先后顺序很容易搞错，这里钉死：

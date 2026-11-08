@@ -79,23 +79,22 @@ def test_neutralize_removes_group_level_but_keeps_within_group_order():
         assert np.array_equal(a, b, equal_nan=True), f"{d}: 组内序被改变了"
 
 
-def test_unmapped_stocks_are_pooled_into_one_unknown_group():
-    """未映射票被当成**一个行业**整体平移 —— 记录现状，也是待修的隐患。
+def test_unmapped_stocks_keep_original_scores():
+    """未映射票不再被当成**一个行业**整体平移 —— 修复后保留原分。
 
-    ``neutralize_cross_section`` 的文件头写着「无法映射到行业的个股…保留其原分」，
-    但实现里只有该组样本数 < ``min_group`` 时才成立。真实场景里未映射票动辄
-    占 30%+（面板 63/200、2026-11-04 计划里 4/8 只），_UNKNOWN 组远大于 2，
-    于是被当成真实行业做了组内去均值 ⇒ 所有未映射票被同一个常数整体平移。
-    「保留原分」的意图在实现里没有兑现。
+    旧实现的隐患：未映射票被塞进 ``_UNKNOWN_`` 伪组，一旦 ≥2 只就当作真实行业
+    做组内去均值，所有未映射票被同一个常数整体平移，等于用「数据缺失」惩罚
+    分散化。修复（与生产 ``neutralize_cross_section`` 一致）：未知组**无论数量
+    多少都按小组处理、保留原分**，不引入伪信号。
     """
     panel = _panel()
     out = _neutralize_panel(panel, IND)
     unmapped = ["600006", "600007"]
-    shift = (out[unmapped] - panel[unmapped])
-    # 同一天里，两只未映射票被平移的量完全相同（= 总均值 − 未知桶均值）
-    for d in panel.index[:5]:
-        assert shift.loc[d, "600006"] == pytest.approx(shift.loc[d, "600007"], abs=1e-12)
-    assert shift.abs().to_numpy().max() > 0, "预期未映射票确实被平移了"
+    shift = (out[unmapped] - panel[unmapped]).abs()
+    # 修复后：未映射票完全不被平移（保留原分，shift 恒为 0）
+    assert shift.to_numpy().max() == pytest.approx(0.0, abs=1e-12), \
+        "未映射票不应被平移，修复后必须保留原分"
+    # 已映射行业仍按生产口径正常去均值（由本文件其余用例逐位钉死）
     assert _UNKNOWN  # 生产用的桶名，与 exec_backtest 里的常量同源
 
 

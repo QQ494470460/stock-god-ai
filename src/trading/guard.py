@@ -75,9 +75,11 @@ def _running_under_pytest() -> bool:
     return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
 
-# 行业映射缺失时的兜底桶名。所有「在 industry_map 里查不到」的标的都归到这里，
-# 让集中度检查对它们**依然生效**（fail-safe），而不是整段跳过（fail-open）。
-UNKNOWN_SECTOR = "__UNKNOWN__"
+# ⚠️ 行业集中度检查对「industry_map 查不到」的标的采取 **fail-open 跳过**（见
+# _load_industry_map：缺失 / 损坏即返回空表，集中度检查整段不生效），而非
+# fail-safe 兜底桶。这是 2026-11-03 的有意回退：用数据缺失去惩罚分散化比跳过更危险。
+# 历史上曾在此定义 UNKNOWN_SECTOR 伪桶名试图 fail-safe，但从未被引用，且口径与
+# signal_quality._UNKNOWN（单下划线）不一致，故删除。
 
 
 def _load_industry_map() -> Dict[str, str]:
@@ -181,7 +183,7 @@ class GuardConfig:
     auto_resume_throttle_days: float = 0.0
 
     # ---- 持仓约束 ----
-    max_positions: int = 20                  # 最大持仓只数
+    max_positions: int = 8                   # 最大持仓只数（与 trading_loop.max_positions=8 对齐）
     max_single_position_pct: float = 0.30    # 单票最大仓位(占总资产)
     max_sector_pct: float = 0.50             # 单一行业最大集中度(占总资产)
 

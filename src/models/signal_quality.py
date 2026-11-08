@@ -14,6 +14,9 @@
   只把「行业整体水位」从评分里剔除。这样选股不再被「恰好全仓某个行业」带偏。
 - 对只含 1 只股票的行业（或无法映射到行业的个股），不强拉平到总均值
   （否则该股票的信号会被直接抹成总均值），而是保留其原分，仅随整体去均值。
+- ⚠️ 行业映射缺失的个股统一归入 ``_UNKNOWN_`` 伪组，该伪组**无论数量多少都按小组
+  处理、保留原分**；绝不把它当成「一个行业」去做组内去均值（否则 ≥2 只未映射股
+  会被合并平移，等于用数据缺失惩罚分散化）。
 - 无行业映射（map 为空 / 缺失）时直接返回原序列，绝不抛错、不影响排名。
 """
 
@@ -66,10 +69,15 @@ def neutralize_cross_section(
     grp_count = scores.groupby(ind, group_keys=False).transform("count")
 
     resid = scores.copy()
-    big = grp_count >= min_group
+    # ⚠️ 关键：_UNKNOWN_ 伪组**永远**按「小组」处理（保留原分），绝不参与组内去均值。
+    # 否则一旦 ≥2 只未映射股落入同一个伪组，它们会被当成一个「行业」整体平移，
+    # 等于用「数据缺失」去惩罚分散化 —— 这正是排名偏差的沉默来源。
+    # 只有真实行业组且样本数 ≥ min_group 才做组内去均值。
+    is_unknown = ind == _UNKNOWN
+    big = (~is_unknown) & (grp_count >= min_group)
     # 大组：score - 组均值 + 总均值（剔除行业水位，保留组内序与总水平）
     resid[big] = scores[big] - grp_mean[big] + grand
-    # 小组/未映射：仅随整体去均值（= score - grand + grand = score，即原分）
+    # 小组 / 未知组：保留原分（未知组缺失行业信息，强行平移只会引入伪信号）
     resid[~big] = scores[~big]
     return resid
 

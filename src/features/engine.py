@@ -360,25 +360,56 @@ class FeatureEngine:
     # ============ 基本面特征 ============
     
     def _calc_fundamental_features(self, df: pd.DataFrame, financials: Optional[pd.DataFrame]) -> pd.DataFrame:
-        """基本面特征"""
+        """基本面特征。
+
+        ⚠️ 防前视泄漏：财务数据必须按「报告期(date)」对齐到行情日期，对每个行情日
+        取「该日及之前最近一次披露」的财务值（as-of / 前向填充）。绝不允许把最新财报
+        值广播到全部历史行 —— 那会在训练 / 回测里用未来信息预测过去（look-ahead）。
+        """
         result = pd.DataFrame(index=df.index)
-        
+
         if financials is None or len(financials) == 0:
             # 无财务数据时，用0填充（避免全NaN导致样本丢弃）
             for col in self._get_fundamental_cols():
                 result[col] = 0.0
             return result
-        
-        # 将财务数据映射到日期
-        for col in financials.columns:
-            if col not in ["code", "date"]:
-                result[col] = financials[col].iloc[-1] if len(financials) > 0 else 0.0
-        
+
+        try:
+            fin = financials.copy()
+            if "date" in fin.columns:
+                fin["date"] = pd.to_datetime(fin["date"], errors="coerce")
+                fin = fin.dropna(subset=["date"]).sort_values("date").set_index("date")
+                if "date" in df.columns:
+                    df_dates = pd.to_datetime(df["date"], errors="coerce")
+                    # 对每个行情日，取 <= 该日的最近一次财务值（as-of 前向填充）。
+                    aligned = fin.reindex(df_dates, method="ffill")
+                    for col in fin.columns:
+                        if col != "code":
+                            result[col] = aligned[col].values
+                else:
+                    # df 无日期列则无法按报告期对齐：不能泄漏最新值，退化全 0 并告警
+                    logger.warning(
+                        "基本面特征：行情数据缺少 date 列，无法按报告期对齐，"
+                        "退化为 0（避免前视泄漏）")
+                    for col in self._get_fundamental_cols():
+                        result[col] = 0.0
+            else:
+                # 财务数据无 date 列：同样不能泄漏最新值，退化全 0 并告警
+                logger.warning(
+                    "基本面特征：财务数据缺少 date 列，无法按报告期对齐，"
+                    "退化为 0（避免前视泄漏）")
+                for col in self._get_fundamental_cols():
+                    result[col] = 0.0
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"基本面特征对齐失败，退化为 0（避免前视泄漏）: {e}")
+            for col in self._get_fundamental_cols():
+                result[col] = 0.0
+
         # 补充缺失列
         for col in self._get_fundamental_cols():
             if col not in result.columns:
                 result[col] = 0.0
-        
+
         return result.astype(float)
     
     def _get_fundamental_cols(self) -> List[str]:

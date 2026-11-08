@@ -576,6 +576,12 @@ class Predictor:
             aligned = latest_features.reindex(columns=scaler_cols, fill_value=0.0)
             aligned.columns = scaler_cols  # 恢复 feature names
         else:
+            # 退化路径：scaler 未记录 feature_names_in_（通常是老模型 / 旧 pickle，
+            # 当时用 numpy 数组训练）。只能按列位置截断到训练时的特征数，并告警 ——
+            # 若当前特征顺序与训练时不一致，这里会静默错位，属已知隐患。
+            logger.warning(
+                "scaler 缺失 feature_names_in_，退回按列位置截断到 "
+                f"{self.scaler.n_features_in_} 列（特征顺序不符时存在静默错位风险）")
             aligned = latest_features.iloc[:, :self.scaler.n_features_in_]
         
         X = self.scaler.transform(aligned)
@@ -843,7 +849,7 @@ class Predictor:
                 m = {str(c): float(s) for c, s in zip(fused["code"], fused["score"])}
                 changed = 0
                 for p in predictions:
-                    if p.code in m and m[p.code] == m[p.code]:
+                    if p.code in m and pd.notna(m[p.code]):
                         if abs(m[p.code] - p.score) > 1e-9:
                             changed += 1
                         p.score = m[p.code]

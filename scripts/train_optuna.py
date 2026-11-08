@@ -4,6 +4,7 @@ Optuna TPE 超参优化 + SHAP 特征筛选训练脚本
 对比原版 RandomSearch：TPE 用历史 trial 智能引导，收敛快 3-5 倍，F1 预期 +0.08~0.15
 """
 
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -141,6 +142,29 @@ def _pool_codes(args):
     if args.max_stocks and args.max_stocks > 0:
         codes = codes[:args.max_stocks]
     return codes
+
+
+def _fetch_kline_with_retry(code, start_date, end_date, retries=3, backoff=1.0):
+    """带重试地拉取单只日线。
+
+    网络/代理/限流在几百只票里极易偶发瞬断。原来的 gather_{data,panel} 对
+    ``get_daily_kline`` 的异常是「直接 continue 丢弃该票」—— 静默丢样本会系统性
+    偏小、甚至偏倚（同一只票反复失败的就永远不在面板里）。这里最多重试几次，
+    仅在最终仍失败时才放弃（仍记一行告警，便于事后察觉）。
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            df = fetcher.get_daily_kline(code, start_date=start_date, end_date=end_date)
+            if df is not None and len(df) > 0:
+                return df
+            last_err = RuntimeError(f"返回空数据(len={0 if df is None else len(df)})")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        if attempt < retries:
+            time.sleep(backoff * attempt)
+    logger.warning(f"⚠️ 拉取 {code} 日线最终失败（重试 {retries} 次均失败）: {last_err}")
+    return None
 
 
 def _write_production_metrics(args, objective, n_folds, n_features, n_samples,
@@ -281,8 +305,8 @@ def gather_data(args):
             if code in df_map:
                 df = df_map[code]
             else:
-                df = fetcher.get_daily_kline(code, start_date=args.start_date, end_date=end_date)
-            if len(df) < 120:
+                df = _fetch_kline_with_retry(code, args.start_date, end_date)
+            if df is None or len(df) < 120:
                 continue
             f, l = feature_engine.prepare_training_data(df)
             if len(f) > 0:
@@ -416,7 +440,7 @@ def shap_feature_selection(X, y, best_params, model_type, shap_top_n):
         if k >= 1:
             sm = SMOTE(random_state=42, k_neighbors=k)
             X_scaled, y_enc = sm.fit_resample(X_scaled, y_enc)
-    except:
+    except Exception:
         pass
 
     # 用最佳参数训练模型（固定 xgboost）
@@ -492,7 +516,7 @@ def retrain_final(args, X, y, best_params, model_type, rounds, features, result,
         if k >= 1:
             sm = SMOTE(random_state=42, k_neighbors=k)
             X_scaled, y_enc = sm.fit_resample(X_scaled, y_enc)
-    except:
+    except Exception:
         pass
 
     scores, best_model, best_f1 = [], None, -1
@@ -639,8 +663,8 @@ def gather_panel(args):
             logger.info(f"   进度 {i+1}/{len(codes)} — 已收集 {len(frames)} 只"
                         f"  (用时 {time.time()-t0:.0f}s)")
         try:
-            df = fetcher.get_daily_kline(code, start_date=args.start_date, end_date=end_date)
-            if len(df) < 120:
+            df = _fetch_kline_with_retry(code, args.start_date, end_date)
+            if df is None or len(df) < 120:
                 continue
             f = feature_engine.build_features(df)
             if "close" in f.columns:

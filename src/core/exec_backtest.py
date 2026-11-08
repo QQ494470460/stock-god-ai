@@ -348,12 +348,18 @@ def _neutralize_panel(scores: pd.DataFrame,
         return scores
     grp = pd.Series({c: str(industry_map.get(c, _UNKNOWN_INDUSTRY))
                      for c in scores.columns})
+    is_unknown = grp == _UNKNOWN_INDUSTRY
     t = scores.T
     grp_mean = t.groupby(grp).transform("mean").T
     grp_count = t.groupby(grp).transform("count").T
     grand = scores.mean(axis=1)          # 逐日总均值（跳过 NaN，同生产）
     resid = scores.sub(grp_mean).add(grand, axis=0)
-    big = grp_count >= int(min_group)
+    # ⚠️ 与生产 ``neutralize_cross_section`` 完全对齐：
+    # 只有「真实行业且样本数 ≥ min_group」才做组内去均值；
+    # 未知组（_UNKNOWN_）**无论数量多少都按小组处理、保留原分**，
+    # 绝不把它当成「一个行业」整体平移（否则 ≥2 只未映射股被合并平移，
+    # 等于用数据缺失惩罚分散化）。
+    big = (~is_unknown) & (grp_count >= int(min_group))
     return resid.where(big, scores)
 
 
