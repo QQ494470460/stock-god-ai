@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 gen_ptrade_config.py — 把「生产持仓 + 最新计划候选」烘焙成 Ptrade 策略的
-UNIVERSE / SECTOR_MAP 字面量，写回 src/trading/ptrade_strategy.py 的标记区间。
+UNIVERSE / SECTOR_MAP 字面量，写回 src/trading/ptrade_strategy.py。
 
 为什么需要它：
 - Ptrade 是券商机房里的服务端策略引擎，**不能 import 本地 src/，也不能读本地文件**。
@@ -15,22 +15,31 @@ UNIVERSE / SECTOR_MAP 字面量，写回 src/trading/ptrade_strategy.py 的标�
     python scripts/gen_ptrade_config.py --write    # 直接写回 ptrade_strategy.py
 
 来源（全部只读）：
-    data/paper_account.json         当前真实持仓（"当前生产持仓"）
+    data/paper_account.json         当前真实持仓
     data/daily_reports/daily_picks_*.json  (按 mtime 取最新) 计划 picks + ranking 候选
     data/industry_map.json          6 位代码 -> 行业名
+
+写回方式：
+    不依赖任何标记注释块，改用正则精准替换策略文件中的
+    ``UNIVERSE = [ ... ]`` 与 ``SECTOR_MAP = { ... }`` 两个字面量块（均为扁平字面量，
+    内部无嵌套括号），因此策略文件本身保持「纯净、可直接粘贴进 Ptrade 终端」的形态。
 """
 from __future__ import annotations
 
 import glob
 import json
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STRATEGY_PATH = os.path.join(ROOT, "src", "trading", "ptrade_strategy.py")
-MARK_START = "# === PTrade auto-generated config START"
-MARK_END = "# === PTrade auto-generated config END"
 UNKNOWN = "未知"
+
+# 扁平字面量：UNIVERSE 为字符串列表、SECTOR_MAP 为 字符串->字符串 字典，
+# 内部均不含嵌套括号，故可用「到首个收尾括号」的方式整体替换。
+UNIVERSE_RE = re.compile(r"UNIVERSE\s*=\s*\[[^\]]*\]", re.DOTALL)
+SECTOR_RE = re.compile(r"SECTOR_MAP\s*=\s*\{[^}]*\}", re.DOTALL)
 
 
 def to_ptrade_code(code: str) -> str:
@@ -92,8 +101,20 @@ def gather_codes() -> tuple[list[str], str]:
     return uniq, note
 
 
-def build_block(codes: list[str], industry: dict) -> tuple[str, list[str]]:
+def build_universe_block(codes: list[str]) -> str:
+    """生成 `UNIVERSE = [ ... ]` 字面量（不含任何注释）。"""
     universe = [to_ptrade_code(c) for c in codes]
+    lines = ["UNIVERSE = ["]
+    # 每行 4 个，便于审阅
+    for i in range(0, len(universe), 4):
+        chunk = universe[i:i + 4]
+        lines.append("    " + ", ".join(f'"{u}"' for u in chunk) + ",")
+    lines.append("]")
+    return "\n".join(lines)
+
+
+def build_sector_block(codes: list[str], industry: dict) -> tuple[str, list[str]]:
+    """生成 `SECTOR_MAP = { ... }` 字面量（不含任何注释），返回 (块文本, 未映射列表)。"""
     sector_map = {}
     unmapped = []
     for c in codes:
@@ -102,30 +123,18 @@ def build_block(codes: list[str], industry: dict) -> tuple[str, list[str]]:
             s = UNKNOWN
             unmapped.append(c)
         sector_map[c] = s
-
-    lines = []
-    lines.append("# 股票池：由「生产持仓 + 最新计划候选」生成（Ptrade 格式 '600570.SS' / '000001.SZ'）。")
-    lines.append("# 这是截至生成时刻的候选池；计划每日更新，重跑生成器即可刷新。")
-    lines.append("UNIVERSE = [")
-    # 每行 4 个，便于审阅
-    for i in range(0, len(universe), 4):
-        chunk = universe[i:i + 4]
-        lines.append("    " + ", ".join(f'"{u}"' for u in chunk) + ",")
-    lines.append("]")
-    lines.append("")
-    lines.append("# 行业映射：键为 6 位代码（去后缀），值为行业名；缺映射的票归 \"未知\"（集中度对其 fail-open）。")
-    lines.append("SECTOR_MAP = {")
+    lines = ["SECTOR_MAP = {"]
     for c in codes:
         lines.append(f'    "{c}": "{sector_map[c]}",')
     lines.append("}")
     return "\n".join(lines), unmapped
 
 
-def regenerate(text: str, block: str) -> str:
-    """把 MARK_START/END 之间的内容替换为 block。"""
-    s = text.index(MARK_START)
-    e = text.index(MARK_END) + len(MARK_END)
-    return text[:s] + MARK_START + "\n" + block + "\n" + MARK_END + text[e:]
+def regenerate(text: str, uni_block: str, sec_block: str) -> str:
+    """用正则精准替换 UNIVERSE / SECTOR_MAP 两个字面量块。"""
+    new_text = UNIVERSE_RE.sub(uni_block, text)
+    new_text = SECTOR_RE.sub(sec_block, new_text)
+    return new_text
 
 
 def main() -> int:
@@ -139,13 +148,16 @@ def main() -> int:
         print("[gen_ptrade_config] 未找到任何候选代码（无持仓也无计划），退出。", file=sys.stderr)
         return 1
 
-    block, unmapped = build_block(codes, industry)
+    uni_block = build_universe_block(codes)
+    sec_block, unmapped = build_sector_block(codes, industry)
 
     print(f"[gen_ptrade_config] 候选池来源: {note or '(无计划文件)'}")
     print(f"[gen_ptrade_config] UNIVERSE 数量: {len(codes)}")
     print(f"[gen_ptrade_config] 行业未映射(归'{UNKNOWN}'): {len(unmapped)} -> {unmapped}")
     print("-" * 60)
-    print(block)
+    print(uni_block)
+    print("")
+    print(sec_block)
     print("-" * 60)
 
     if not write:
@@ -157,11 +169,14 @@ def main() -> int:
         return 1
 
     text = open(STRATEGY_PATH, "r", encoding="utf-8").read()
-    if MARK_START not in text or MARK_END not in text:
-        print("[gen_ptrade_config] 策略文件缺少标记区间，无法写入。", file=sys.stderr)
+    if not UNIVERSE_RE.search(text) or not SECTOR_RE.search(text):
+        print("[gen_ptrade_config] 策略文件中未找到 UNIVERSE / SECTOR_MAP 字面量块，无法写入。", file=sys.stderr)
         return 1
 
-    new_text = regenerate(text, block)
+    new_text = regenerate(text, uni_block, sec_block)
+    if new_text == text:
+        print("[gen_ptrade_config] 内容无变化，无需写回。")
+        return 0
     with open(STRATEGY_PATH, "w", encoding="utf-8") as fh:
         fh.write(new_text)
     print(f"[gen_ptrade_config] 已写回 {STRATEGY_PATH}")
