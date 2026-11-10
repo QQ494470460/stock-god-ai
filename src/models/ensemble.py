@@ -358,6 +358,16 @@ class LLMAlphaSubPredictor(SubPredictor):
         raw = max(-1.0, min(1.0, sentiment - 0.3 * risk))
         return float(50.0 + 50.0 * raw)
 
+    def health(self) -> Optional[Dict]:
+        """暴露 LLM 腿健康快照（运维/看板观测用）；不可用或单测注入时返回 None。"""
+        prov = getattr(self, "_provider", None)
+        if prov is None or not hasattr(prov, "stats"):
+            return None
+        try:
+            return prov.stats()
+        except Exception:  # noqa: BLE001
+            return None
+
 
 # ---------------------------------------------------------------------------
 # 超级集成器
@@ -509,5 +519,11 @@ class EnsemblePredictor:
         lines.append(f"  主模型 XGBoost：始终启用")
         for sub, w in self.subs:
             st = "✅" if sub.available else "⚠️不可用(降级)"
-            lines.append(f"  {sub.name}：{st}（权重 {w}）")
+            extra = ""
+            if sub.available and sub.name == "llm_alpha":
+                h = sub.health()
+                if h:
+                    extra = (f"（调用 {h['total_calls']} 成功 {h['success']} "
+                             f"失败 {h['failures']} 连续失败 {h['consecutive_failures']}）")
+            lines.append(f"  {sub.name}：{st}（权重 {w}）{extra}")
         return "\n".join(lines)

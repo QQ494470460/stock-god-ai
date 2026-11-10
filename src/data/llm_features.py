@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import random
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ class LLMFeatureConfig:
     timeout: int = 20
     retry: int = 3
     rate_limit: float = 0.2   # 每次调用间隔秒（限流）
+    backoff_base: float = 1.0 # 指数退避基数（秒）
+    backoff_cap: float = 30.0 # 退避上限（秒），避免单次等待过久
     mock: bool = False        # True=离线伪评分（不用真 LLM，用于回测/测试/无本地服务时）
     cache_dir: str = ""       # 磁盘缓存目录（默认空=不缓存）；按 (code,end_date,days) 落盘
 
@@ -82,6 +85,11 @@ class LLMFeatureProvider:
             self.cfg.mock = True
         self._client = None
         self._last_call = 0.0
+        # 健康计数（运维/看板观测 LLM 腿可用性，零泄漏无关）
+        self._stats = {
+            "total_calls": 0, "success": 0, "failures": 0,
+            "consecutive_failures": 0, "last_error": None, "last_success_ts": 0.0,
+        }
 
     # ---- 客户端（懒加载，避免无 key 时也 import openai）----
     def _get_client(self):
@@ -92,13 +100,21 @@ class LLMFeatureProvider:
         self._client = OpenAI(api_key=key, base_url=self.cfg.base_url)
         return self._client
 
-    # ---- 文本评分 ----
+    # ---- 文本评分（含指数退避 + 失败计数，便于运维观测 LLM 腿健康）----
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return ("rate limit" in msg or "429" in msg
+                or "ratelimit" in msg or "too many requests" in msg)
+
     def score_text(self, text: str, as_of_date: str = "") -> Dict:
         if not text or not text.strip():
             return {"sentiment_score": 0.0, "risk_flag": 0, "confidence": 0.0, "rationale": ""}
         if self.cfg.mock:
             return self._mock_score(text)
+        self._stats["total_calls"] += 1
         prompt = _PROMPT.format(date=as_of_date, text=text[:6000])
+        last_exc: Optional[Exception] = None
         for attempt in range(self.cfg.retry):
             try:
                 self._throttle()
@@ -111,11 +127,39 @@ class LLMFeatureProvider:
                     timeout=self.cfg.timeout,
                 )
                 content = resp.choices[0].message.content or ""
+                self._stats["success"] += 1
+                self._stats["consecutive_failures"] = 0
+                self._stats["last_success_ts"] = time.time()
                 return self._parse(content)
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"LLM 评分失败(第{attempt+1}次): {e}")
-                time.sleep(1.5 * (attempt + 1))
+                last_exc = e
+                self._stats["last_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                tag = "限流" if self._is_rate_limit(e) else "失败"
+                logger.warning(
+                    f"LLM 评分{tag}(第{attempt+1}次/{self.cfg.retry}): {e}")
+                if attempt + 1 < self.cfg.retry:
+                    self._backoff(attempt)
+        self._stats["failures"] += 1
+        self._stats["consecutive_failures"] += 1
+        logger.error(
+            f"LLM 评分在 {self.cfg.retry} 次重试后仍失败"
+            + (f"（限流）：{last_exc}" if self._is_rate_limit(last_exc) else f"：{last_exc}"))
         return {"sentiment_score": 0.0, "risk_flag": 0, "confidence": 0.0, "rationale": ""}
+
+    def _backoff(self, attempt: int) -> None:
+        """指数退避 + 抖动，避免雷鸣群效应；上限封顶。"""
+        base = float(getattr(self.cfg, "backoff_base", 1.0))
+        cap = float(getattr(self.cfg, "backoff_cap", 30.0))
+        delay = min(cap, base * (2 ** attempt))
+        jitter = random.uniform(0.0, 0.25 * delay)
+        time.sleep(delay + jitter)
+
+    def stats(self) -> Dict:
+        """返回 LLM 腿健康快照（运维/看板用）：调用数、成功/失败、连续失败、最后错误。"""
+        s = dict(self._stats)
+        # 连续失败 >=1 即「上一次调用失败」→ 视为降级（下一次成功即复位）
+        s["degraded"] = self._stats["consecutive_failures"] >= 1
+        return s
 
     def _throttle(self):
         now = time.time()
