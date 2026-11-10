@@ -399,11 +399,13 @@ class Predictor:
             try:
                 from src.models.ensemble import (
                     EnsemblePredictor, AlphaSubPredictor, LSTMSubPredictor,
+                    TransformerSubPredictor,
                 )
                 w = getattr(app_config.ml, "ensemble_weights", {}) or {}
                 ep = EnsemblePredictor(self)
                 ep.add_sub(AlphaSubPredictor(), weight=w.get("alpha_xgboost", 1.0))
                 ep.add_sub(LSTMSubPredictor(), weight=w.get("lstm", 0.8))
+                ep.add_sub(TransformerSubPredictor(), weight=w.get("transformer", 0.8))
                 self._ensemble = ep
                 logger.info("🧩 超级集成已构建")
             except Exception as e:  # noqa: BLE001

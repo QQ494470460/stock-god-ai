@@ -227,6 +227,52 @@ class LSTMSubPredictor(SubPredictor):
 
 
 # ---------------------------------------------------------------------------
+# Transformer 时序排序器子预测器（需带元数据的 transformer_best.pt）
+# ---------------------------------------------------------------------------
+class TransformerSubPredictor(SubPredictor):
+    name = "transformer"
+
+    def _ensure(self):
+        import torch  # 懒加载，避免无 torch 时 import 失败
+        self._torch = torch
+        ckpt = torch.load(MODEL_DIR / "transformer_best.pt", map_location="cpu", weights_only=False)
+        meta = ckpt.get("meta", {})
+        if "feature_cols" not in meta:
+            # 老版 checkpoint 不含特征元数据 → 主动降级
+            raise RuntimeError("transformer_best.pt 缺少 feature_cols 元数据，需重训（见 scripts/train_transformer.py）")
+        from src.models.transformer_ranker import TemporalTransformer
+        from config.settings import config as app_config
+        params = app_config.ml.transformer_params
+        self._model = TemporalTransformer(
+            input_size=ckpt["input_size"],
+            d_model=params["d_model"],
+            nhead=params["nhead"],
+            num_layers=params["num_layers"],
+            dim_feedforward=params["dim_feedforward"],
+            dropout=params["dropout"],
+        )
+        self._model.load_state_dict(ckpt["model_state_dict"])
+        self._model.eval()
+        self._feature_cols: List[str] = meta["feature_cols"]
+        self._seq_len: int = ckpt.get("sequence_length", params["sequence_length"])
+        self._classes = meta.get("classes", [-1, 0, 1])
+
+    def _score(self, df: pd.DataFrame, code: str) -> float:
+        feats = feature_engine.build_features(df)
+        if "close" in feats.columns:
+            feats = feats.drop(columns=["close"])
+        win = feats.reindex(columns=self._feature_cols, fill_value=0.0).fillna(0.0)
+        if len(win) < self._seq_len:
+            raise RuntimeError(f"样本不足 {self._seq_len} 日")
+        seq = win.iloc[-self._seq_len:].values.astype(float)
+        seq = self._torch.FloatTensor(seq.reshape(1, self._seq_len, -1))
+        with self._torch.no_grad():
+            out = self._model(seq)
+            proba = self._torch.softmax(out, dim=1).cpu().numpy()[0]
+        return _proba_to_score(proba, self._classes)
+
+
+# ---------------------------------------------------------------------------
 # 超级集成器
 # ---------------------------------------------------------------------------
 class EnsemblePredictor:

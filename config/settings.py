@@ -149,6 +149,20 @@ class MLConfig:
         "sequence_length": 60,  # 用过去60个交易日预测
         "patience": 10,  # early stopping
     })
+
+    # Transformer 时序排序器参数（替代/增强 LSTM 腿；CPU 友好，规模克制）
+    transformer_params: dict = field(default_factory=lambda: {
+        "d_model": 64,        # 特征投影维度（远小于 LSTM 的 128*2）
+        "nhead": 4,
+        "num_layers": 2,
+        "dim_feedforward": 128,
+        "dropout": 0.3,
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "epochs": 100,
+        "sequence_length": 60,  # 与 LSTM 同窗，保证同序列契约
+        "patience": 10,
+    })
     
     # 训练配置
     test_size: float = 0.2
@@ -193,7 +207,7 @@ class MLConfig:
     use_ensemble: bool = True
     # 各腿融合权重（默认按样本外 RankIC 自动归一化；此处作可选覆盖）
     ensemble_weights: dict = field(default_factory=lambda: {
-        "xgboost": 1.0, "alpha_xgboost": 1.0, "lstm": 0.8,
+        "xgboost": 1.0, "alpha_xgboost": 1.0, "lstm": 0.8, "transformer": 0.8,
     })
     # 预测方差收缩（0~1）：把子模型权重向「等权」收缩，降低对单腿过置信权重的方差。
     # 0 = 用原始权重；1 = 全部等权（最大分散、融合方差最小）；主模型权重恒为 1.0 不收缩。
