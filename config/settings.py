@@ -182,6 +182,18 @@ class MLConfig:
     enable_llm_overlay: bool = False  # 主开关（默认关闭，零影响）
     llm_mock: bool = False            # 覆盖层是否走离线 mock（无需本地 Ollama）
 
+    # LLM 另类 alpha 实时集成腿（超级集成第五腿，默认关闭）
+    # 仅当 enable_llm_alpha_leg=True 且配置了真实 LLM 时才激活：
+    #   - 云端：export DEEPSEEK_API_KEY=...（llm_alpha_provider=deepseek/openai/claude/auto）
+    #   - 本机：provider=local + llm_alpha_base_url 指向 Ollama/LM Studio
+    # 无 key / 未配置时 LLMFeatureProvider 自动转 mock，本腿**主动保持关闭**（零行为改变），
+    # 绝不把离线伪评分当信号注入回测/实盘。
+    enable_llm_alpha_leg: bool = False
+    llm_alpha_provider: str = "deepseek"   # 云端(deepseek/openai/claude/auto) | 本机(local)
+    llm_alpha_model: str = "deepseek-chat"
+    llm_alpha_base_url: str = ""           # 云端留空即用 api.deepseek.com/v1；local 填 Ollama 地址
+    llm_alpha_lookback_days: int = 20
+
     # 自进化阈值调整开关（详见 src/models/evolution.py）
     # True  = 有效阈值 = 固定基线 + 进化准确率调整 + 市场状态调整（熊市 +5、牛市 -3）
     #         进化引擎会依据回测验证准确率自动收紧/放宽阈值（需先攒够验证样本）。
@@ -208,6 +220,7 @@ class MLConfig:
     # 各腿融合权重（默认按样本外 RankIC 自动归一化；此处作可选覆盖）
     ensemble_weights: dict = field(default_factory=lambda: {
         "xgboost": 1.0, "alpha_xgboost": 1.0, "lstm": 0.8, "transformer": 0.8,
+        "llm_alpha": 0.5,
     })
     # 预测方差收缩（0~1）：把子模型权重向「等权」收缩，降低对单腿过置信权重的方差。
     # 0 = 用原始权重；1 = 全部等权（最大分散、融合方差最小）；主模型权重恒为 1.0 不收缩。

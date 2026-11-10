@@ -8,6 +8,8 @@
     XGBoost（主流生产模型，RankIC≈0.075）
         + Alpha XGBoost（生产特征 + 北向/融资/龙虎榜/行业动量，RankIC≈0.12）
         + LSTM（时间序列深度学习，捕捉时序动态）
+        + Transformer（时序排序器，CPU 友好的自注意力）
+        + LLM 另类 alpha（DeepSeek 等大模型对近期新闻/公告的定性判断，默认关闭）
 
 融合策略
 --------
@@ -270,6 +272,85 @@ class TransformerSubPredictor(SubPredictor):
             out = self._model(seq)
             proba = self._torch.softmax(out, dim=1).cpu().numpy()[0]
         return _proba_to_score(proba, self._classes)
+
+
+# ---------------------------------------------------------------------------
+# LLM 另类 alpha 实时集成子预测器（超级集成第五腿，需真实 LLM）
+# ---------------------------------------------------------------------------
+class LLMAlphaSubPredictor(SubPredictor):
+    """把 LLM 对「个股近期新闻/公告」的定性判断转成 0~100 的另类 alpha 评分。
+
+    设计原则（与覆盖层 LLM overlay 严格区分）：
+      · 这是**超级集成的一条腿**，与其他腿（XGBoost/Alpha/LSTM/Transformer）加权融合；
+        而覆盖层（_apply_llm_overlay）是对主模型 score 做**加性微调**，两者独立。
+      · **默认关闭、零行为改变**：仅当 config.ml.enable_llm_alpha_leg=True 且
+        配置了真实 LLM（有 api_key / 本机 Ollama 可达）时才激活。
+      · 任何降级（开关关 / 无 key 自动转 mock / 构造失败）都让 available=False，
+        绝不把离线伪评分当信号注入回测或实盘。
+      · 评分映射：score = 50 + 50 * clamp(sentiment - 0.3*risk, -1, 1)，
+        与 _proba_to_score 同尺度（0~100），可与各腿直接加权融合。
+
+    零泄漏：LLMFeatureProvider.features_for_stock 内部 gather_news 只用
+    publish_time <= as_of_date 的文本（as_of_date 取该股票最新交易日）。
+    """
+
+    name = "llm_alpha"
+
+    def __init__(self, provider=None, lookback_days=None):
+        # 仅供单测注入：真实路径由 _ensure 按 config 构造，不暴露构造参数。
+        self._injected_provider = provider
+        self._injected_lookback = lookback_days
+
+    def _ensure(self):
+        from config.settings import config as app_config
+        ml = app_config.ml
+        if not getattr(ml, "enable_llm_alpha_leg", False):
+            raise RuntimeError(
+                "LLM alpha 腿未启用（enable_llm_alpha_leg=False），保持关闭")
+
+        if self._injected_provider is not None:
+            # 单测注入路径：跳过真实 provider 构造与 mock 校验
+            self._provider = self._injected_provider
+            self._lookback = self._injected_lookback or getattr(
+                ml, "llm_alpha_lookback_days", 20)
+            return
+
+        # 真实路径：按 config 构造 LLMFeatureProvider（绝不走 mock）
+        from src.data.llm_features import LLMFeatureProvider, LLMFeatureConfig
+        prov = getattr(ml, "llm_alpha_provider", "deepseek")
+        model = getattr(ml, "llm_alpha_model", "deepseek-chat")
+        base_url = getattr(ml, "llm_alpha_base_url", "")
+        lookback = getattr(ml, "llm_alpha_lookback_days", 20)
+        if prov == "local" and not base_url:
+            base_url = "http://localhost:11434/v1"  # 本机 Ollama 默认
+        cfg = LLMFeatureConfig(
+            provider=prov,
+            model=model,
+            base_url=base_url,
+            mock=False,  # 关键：显式关 mock，逼出「无 key 自动转 mock」的降级
+        )
+        provider = LLMFeatureProvider(cfg)
+        if provider.cfg.mock:
+            # LLMFeatureProvider 在无 key 时自动转 mock（离线伪评分）。
+            # 本腿绝不注入伪评分，主动保持关闭。
+            raise RuntimeError(
+                "LLM alpha 腿：未检测到真实 LLM key（已自动转 mock），"
+                "保持关闭，不注入离线伪评分")
+        self._provider = provider
+        self._lookback = lookback
+
+    def _score(self, df: pd.DataFrame, code: str) -> float:
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx)
+        end_date = str(idx[-1].date()) if hasattr(idx[-1], "date") else str(idx[-1])
+        feats = self._provider.features_for_stock(
+            code, end_date, days=self._lookback)
+        sentiment = float(feats.get("llm_sentiment", 0.0) or 0.0)
+        risk = int(feats.get("llm_risk", 0) or 0)
+        # 利空风险事件扣一档（0.3），再夹到 [-1,1] 映射到 0~100
+        raw = max(-1.0, min(1.0, sentiment - 0.3 * risk))
+        return float(50.0 + 50.0 * raw)
 
 
 # ---------------------------------------------------------------------------

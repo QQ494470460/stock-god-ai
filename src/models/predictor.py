@@ -399,13 +399,17 @@ class Predictor:
             try:
                 from src.models.ensemble import (
                     EnsemblePredictor, AlphaSubPredictor, LSTMSubPredictor,
-                    TransformerSubPredictor,
+                    TransformerSubPredictor, LLMAlphaSubPredictor,
                 )
                 w = getattr(app_config.ml, "ensemble_weights", {}) or {}
                 ep = EnsemblePredictor(self)
                 ep.add_sub(AlphaSubPredictor(), weight=w.get("alpha_xgboost", 1.0))
                 ep.add_sub(LSTMSubPredictor(), weight=w.get("lstm", 0.8))
                 ep.add_sub(TransformerSubPredictor(), weight=w.get("transformer", 0.8))
+                # 第五腿（LLM 另类 alpha）：默认开关关闭，仅在 enable_llm_alpha_leg=True
+                # 且配置了真实 LLM 时装配；该开关关时完全不出现，零行为改变。
+                if getattr(app_config.ml, "enable_llm_alpha_leg", False):
+                    ep.add_sub(LLMAlphaSubPredictor(), weight=w.get("llm_alpha", 0.5))
                 self._ensemble = ep
                 logger.info("🧩 超级集成已构建")
             except Exception as e:  # noqa: BLE001
