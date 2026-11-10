@@ -398,6 +398,37 @@ class EnsemblePredictor:
             return [w * (1.0 - shrink) + uni * shrink for _, w in avail]
         return [w for _, w in avail]
 
+    def _dynamic_weights(self, avail) -> Optional[List[float]]:
+        """第六腿：按各腿样本外 RankIC 派生融合权重（替代静态权重）。
+
+        仅在 config.ml.ensemble_dynamic_weights=True 时生效。
+        返回归一化权重（与 avail 顺序对齐），或 None（触发回退静态权重）：
+          · 开关关
+          · leg_rankic.json 缺失 / 过期
+          · 全部腿均无统计（极端）
+        主模型 xgboost 恒为锚（权重 1.0），本函数只重排**子腿**相对权重。
+        """
+        ml = getattr(app_config, "ml", None)
+        if not getattr(ml, "ensemble_dynamic_weights", False):
+            return None
+        try:
+            from src.core import leg_rankic as lr
+        except Exception:  # noqa: BLE001
+            return None
+        max_age = int(getattr(ml, "ensemble_dynamic_max_age_days", 30) or 30)
+        stats = lr.load_leg_rankic(max_age_days=max_age)
+        if not stats:
+            logger.warning("动态融合：无有效 leg_rankic.json（缺失/过期），回退静态权重")
+            return None
+        floor = float(getattr(ml, "ensemble_dynamic_floor", 0.0) or 0.0)
+        names = [sub.name for sub, _ in avail]
+        fallback = [float(w) for _, w in avail]
+        try:
+            return lr.dynamic_weights_from_stats(stats, names, fallback, floor)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"动态融合：权重派生失败，回退静态权重: {e}")
+            return None
+
     def blend_one(self, pred, df: pd.DataFrame, code: str) -> bool:
         """把子模型评分融合进「单只股票」的 pred（就地改 score/agreement/ensemble_detail）。
 
@@ -411,7 +442,11 @@ class EnsemblePredictor:
         avail = self._available_subs()
         if not avail:
             return False
-        eff_ws = self._eff_weights(avail)
+        # 第六腿：动态融合（按各腿样本外 RankIC 派生权重）。开关关 / 无统计 / 过期
+        # 时返回 None → 回退到静态权重（含 ensemble_shrinkage），生产默认走这条。
+        eff_ws = self._dynamic_weights(avail)
+        if eff_ws is None:
+            eff_ws = self._eff_weights(avail)
         # 主模型贡献用 score_raw（纯概率分，与子模型 _proba_to_score 同口径），
         # 而非 pred.score（含 compute_score 的 regime/risk/预期收益加成）。
         # 否则主腿与其他腿尺度错位，融合权重失真。

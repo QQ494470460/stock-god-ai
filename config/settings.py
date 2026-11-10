@@ -228,6 +228,16 @@ class MLConfig:
     # 这里削的是权重估计带来的方差）。
     ensemble_shrinkage: float = 0.5
 
+    # 动态融合权重（超级集成第六腿开关，默认关闭、零行为改变）
+    # 开启后：各子腿的融合权重不再用上面静态 ensemble_weights，而是用它们
+    # 各自的「样本外 RankIC」派生（见 src/core/leg_rankic.py + scripts/compute_leg_rankic.py）。
+    # 权重 = 归一化(max(rankic, floor))；rankic 越高权重越大。
+    # 仅当 leg_rankic.json 存在且未过期时生效，否则**自动回退静态权重**，绝不拖垮主模型。
+    # 生产默认关闭：先由用户在耐久上下文跑 compute_leg_rankic 生成基线统计，再考虑开启。
+    ensemble_dynamic_weights: bool = False
+    ensemble_dynamic_floor: float = 0.0    # 腿 RankIC 下限；<floor 取 floor（floor=0 时负 IC 腿被剔除）
+    ensemble_dynamic_max_age_days: int = 30  # 统计超过该天数视为过期，回退静态权重
+
     # 横截面行业中性化（**2026-11-04 起关闭**）：原先在 predict_batch 内对全市场评分
     # 做「行业去均值」，声称消除「模型在某行业系统性偏高/偏低」造成的排名偏差。
     #
