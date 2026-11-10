@@ -38,23 +38,22 @@ def test_llm_alpha_disabled_by_default(ml_config):
     assert sub.score_for(None, "600000") is None
 
 
-    def test_llm_alpha_refuses_mock_provider(ml_config, monkeypatch):
-        """无真实 key 时 LLMFeatureProvider 自动转 mock，本腿应主动拒绝激活。"""
-        from src.models import ensemble as ens
+def test_llm_alpha_refuses_mock_provider(ml_config, monkeypatch):
+    """无真实 key 时 LLMFeatureProvider 自动转 mock，本腿应主动拒绝激活。"""
+    from src.models.ensemble import LLMAlphaSubPredictor
+    from src.data import llm_features as llm_mod
 
-        ml_config.enable_llm_alpha_leg = True
+    ml_config.enable_llm_alpha_leg = True
     ml_config.llm_alpha_provider = "deepseek"
 
     # 让 ensemble 在 _ensure 里 `from src.data.llm_features import LLMFeatureProvider`
     # 拿到一个立刻带 mock=True 的假 provider（模拟「无 key 自动转 mock」）
-    from src.data import llm_features as llm_mod
-
     class _FakeProvider:
         def __init__(self, *a, **k):
             self.cfg = types.SimpleNamespace(mock=True)
 
     monkeypatch.setattr(llm_mod, "LLMFeatureProvider", _FakeProvider)
-    sub = ens.LLMAlphaSubPredictor()
+    sub = LLMAlphaSubPredictor()
     assert sub.available is False, "自动转 mock 时必须拒绝激活（不注入离线伪评分）"
 
 
