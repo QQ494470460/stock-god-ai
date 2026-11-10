@@ -193,6 +193,12 @@ class MLConfig:
     llm_alpha_model: str = "deepseek-chat"
     llm_alpha_base_url: str = ""           # 云端留空即用 api.deepseek.com/v1；local 填 Ollama 地址
     llm_alpha_lookback_days: int = 20
+    # 第五腿磁盘缓存（仅 enable_llm_alpha_leg=True 时生效；默认开，纯优化、零行为改变）：
+    # 按 (code, as_of_date, lookback) 缓存 LLM 打分结果到 DATA_DIR/llm_alpha_cache/，
+    # 避免同交易日重算重复打网络 + LLM（省额度、抗抖动）。
+    # 零泄漏铁律：缓存键含 as_of_date，且命中后强制校验缓存项 end_date == 请求值，
+    # 任何「基于更晚日期」的缓存一律作废（防混入未来新闻）。
+    llm_alpha_cache: bool = True
 
     # 自进化阈值调整开关（详见 src/models/evolution.py）
     # True  = 有效阈值 = 固定基线 + 进化准确率调整 + 市场状态调整（熊市 +5、牛市 -3）

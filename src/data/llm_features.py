@@ -30,6 +30,7 @@ import time
 import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Dict
 
 logger = logging.getLogger("llm_features")
@@ -49,6 +50,7 @@ class LLMFeatureConfig:
     retry: int = 3
     rate_limit: float = 0.2   # 每次调用间隔秒（限流）
     mock: bool = False        # True=离线伪评分（不用真 LLM，用于回测/测试/无本地服务时）
+    cache_dir: str = ""       # 磁盘缓存目录（默认空=不缓存）；按 (code,end_date,days) 落盘
 
 
 _PROMPT = """你是一名严谨的 A 股量化研究员。下面是一支股票在【{date}】及之前可得的新闻/公告/研报摘要。
@@ -182,15 +184,58 @@ class LLMFeatureProvider:
             logger.debug(f"新闻汇聚失败 {code}: {e}")
             return ""
 
-    # ---- 对外：一支股的 3 个新特征 ----
+    # ---- 磁盘缓存（按 code+end_date+days；零泄漏：命中必须严格等于请求 end_date）----
+    def _cache_path(self, code: str, end_date: str, days: int):
+        if not self.cfg.cache_dir:
+            return None
+        d = Path(self.cfg.cache_dir)
+        # code/date/days 均为 [0-9A-Za-z._-]，文件名合法且不含路径分隔符。
+        return d / f"{code}__{end_date}__d{days}.json"
+
+    def _read_cache(self, code: str, end_date: str, days: int) -> Optional[Dict]:
+        p = self._cache_path(code, end_date, days)
+        if p is None or not p.exists():
+            return None
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001  坏文件直接当作 miss，绝不返回污染值
+            return None
+        # 零泄漏铁律：缓存项的 end_date / code 必须严格等于请求值。
+        # 否则该缓存是「基于更晚日期」算出来的（含未来新闻），必须作废重算。
+        if obj.get("end_date") != end_date or obj.get("code") != code:
+            return None
+        feats = obj.get("features")
+        if not isinstance(feats, dict):
+            return None
+        return feats
+
+    def _write_cache(self, code: str, end_date: str, days: int, feats: Dict) -> None:
+        p = self._cache_path(code, end_date, days)
+        if p is None:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            obj = {"code": code, "end_date": end_date, "days": days, "features": feats}
+            tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)  # 原子替换，避免半写文件被误读
+        except Exception as e:  # noqa: BLE001  缓存写回失败不致命
+            logger.debug(f"LLM 缓存写回失败 {code}@{end_date}: {e}")
+
+    # ---- 对外：一支股的 3 个新特征（命中缓存则跳过网络+LLM）----
     def features_for_stock(self, code: str, end_date: str, days: int = 20) -> Dict:
+        cached = self._read_cache(code, end_date, days)
+        if cached is not None:
+            return cached
         news = self.gather_news(code, end_date, days=days)
         sc = self.score_text(news, as_of_date=end_date)
-        return {
+        feats = {
             "llm_sentiment": sc["sentiment_score"],
             "llm_risk": sc["risk_flag"],
             "llm_confidence": sc["confidence"],
         }
+        self._write_cache(code, end_date, days, feats)
+        return feats
 
 
 if __name__ == "__main__":

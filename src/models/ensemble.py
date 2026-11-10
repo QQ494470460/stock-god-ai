@@ -323,11 +323,17 @@ class LLMAlphaSubPredictor(SubPredictor):
         lookback = getattr(ml, "llm_alpha_lookback_days", 20)
         if prov == "local" and not base_url:
             base_url = "http://localhost:11434/v1"  # 本机 Ollama 默认
+        # 第五腿磁盘缓存：仅本腿启用时生效（config.ml.llm_alpha_cache，默认开）。
+        # 落盘到 DATA_DIR/llm_alpha_cache/，按 (code, as_of_date, days) 复用，
+        # 省 LLM 调用额度、抗抖动；命中仍强制校验 end_date 以防零泄漏。
+        cache_dir = str(DATA_DIR / "llm_alpha_cache") if getattr(
+            ml, "llm_alpha_cache", True) else ""
         cfg = LLMFeatureConfig(
             provider=prov,
             model=model,
             base_url=base_url,
             mock=False,  # 关键：显式关 mock，逼出「无 key 自动转 mock」的降级
+            cache_dir=cache_dir,
         )
         provider = LLMFeatureProvider(cfg)
         if provider.cfg.mock:
