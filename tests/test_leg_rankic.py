@@ -11,9 +11,6 @@
 """
 
 import json
-from pathlib import Path
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +213,70 @@ def test_dynamic_weights_on_derives(monkeypatch):
         assert abs(w[0] - 2 / 3) < 1e-9 and abs(w[1] - 1 / 3) < 1e-9
     finally:
         app_config.ml.ensemble_dynamic_weights = old
+
+
+# ---------------------------------------------------------------------------
+# 5) 第六腿基线生成器修复 + 增量回填（纯函数层，离线）
+# ---------------------------------------------------------------------------
+def test_aggregate_day_builds_full_cross_section():
+    from src.core.leg_rankic import _aggregate_day
+
+    # 3 只股票、2 条腿；验证「按腿聚合成整段横截面」，而非逐票单点
+    by_code = {
+        "600000": {"xgboost": 0.9, "lstm": 0.7},
+        "600001": {"xgboost": 0.5, "lstm": 0.4},
+        "600002": {"xgboost": 0.2, "lstm": 0.1},
+    }
+    valid = ["600000", "600001", "600002"]
+    excess = [0.01, -0.02, 0.03]
+    day = _aggregate_day(by_code, valid, excess)
+    assert set(day.keys()) == {"xgboost", "lstm"}
+    for leg, (scs, fwd) in day.items():
+        # 修复前是逐票单点 → 样本<3 → _spearman 恒 nan → 基线恒空
+        assert len(scs) == 3, "应按腿聚合成整段横截面"
+        assert len(fwd) == 3
+        assert fwd == [0.01, -0.02, 0.03]
+
+
+def test_old_per_stock_shape_would_be_rejected():
+    """回归护栏：单票单点 ( [x], [y] ) 必须被 len>=3 守卫剔除（即旧 bug 的形状）。"""
+    from src.core.leg_rankic import _spearman
+    ic = _spearman([0.5], [0.1])  # 旧实现每票都这么传
+    assert ic != ic  # nan → 不会被计入
+
+
+def test_aggregate_from_daily_matches_aggregate():
+    from src.core.leg_rankic import (aggregate_from_daily,
+                                    aggregate_leg_rankic, _spearman)
+    day1 = ([-1.0, 0.0, 1.0], [-0.1, 0.0, 0.1])   # 正 IC
+    day2 = ([1.0, 0.0, -1.0], [-0.1, 0.0, 0.1])   # 负 IC
+    daily = {"xgboost": [("2026-01-01", _spearman(*day1)),
+                         ("2026-01-02", _spearman(*day2))]}
+    out = aggregate_from_daily(daily)
+    ref = aggregate_leg_rankic({"xgboost": [day1, day2]})
+    assert abs(out["xgboost"]["rankic"] - ref["xgboost"]["rankic"]) < 1e-9
+    assert out["xgboost"]["n_days"] == 2
+
+
+def test_merge_daily_records_appends_and_trims():
+    from src.core.leg_rankic import merge_daily_records
+
+    existing = {"xgboost": [{"date": "2026-01-01", "ic": 0.05},
+                            {"date": "2026-01-02", "ic": 0.06}]}
+    new = {"xgboost": [{"date": "2026-01-03", "ic": 0.07}]}
+    merged = merge_daily_records(existing, new, max_days=3)
+    assert [r["date"] for r in merged["xgboost"]] == [
+        "2026-01-01", "2026-01-02", "2026-01-03"]
+    # 裁剪：超过 max_days 只留最近
+    merged2 = merge_daily_records(existing, new, max_days=2)
+    assert [r["date"] for r in merged2["xgboost"]] == ["2026-01-02", "2026-01-03"]
+
+
+def test_merge_daily_records_new_overrides_existing_date():
+    from src.core.leg_rankic import merge_daily_records
+
+    existing = {"xgboost": [{"date": "2026-01-02", "ic": 0.06}]}
+    new = {"xgboost": [{"date": "2026-01-02", "ic": 0.99}]}  # 同一天重算
+    merged = merge_daily_records(existing, new, max_days=10)
+    assert len(merged["xgboost"]) == 1
+    assert merged["xgboost"][0]["ic"] == 0.99

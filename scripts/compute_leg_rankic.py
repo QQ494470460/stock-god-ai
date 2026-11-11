@@ -14,6 +14,10 @@
   python scripts/compute_leg_rankic.py [--days 30] [--sample 150] [--pool zz500]
                                        [--horizon 5] [--legs xgboost,alpha_xgboost,lstm,transformer]
                                        [--dry-run]
+                                       [--full | --incremental]   # 默认增量：只补缺失交易日
+
+增量回填：若 data/leg_rankic.json 已存在，只算「最近 days 个交易日里尚未覆盖的日期」，
+合并后落盘（含每日 IC 记录），重跑成本从 O(days) 降到 O(新增天数)。
 """
 from __future__ import annotations
 
@@ -34,6 +38,10 @@ def main():
     ap.add_argument("--legs", type=str, default="",
                     help="逗号分隔的关注腿名（仅用于提醒哪些腿无统计）；留空=全部")
     ap.add_argument("--dry-run", action="store_true", help="只列候选评分日，不真算")
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--full", action="store_true", help="全量重算（覆盖写，忽略已有记录）")
+    grp.add_argument("--incremental", dest="incremental", action="store_true",
+                     help="增量回填（默认行为，可省略）")
     args = ap.parse_args()
 
     from src.core.leg_rankic import compute_leg_rankic
@@ -47,6 +55,7 @@ def main():
         pool=args.pool,
         legs=legs,
         dry_run=args.dry_run,
+        incremental=not args.full,
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))
 

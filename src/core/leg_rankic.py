@@ -143,6 +143,73 @@ def load_leg_rankic(
 
 
 # ---------------------------------------------------------------------------
+# 纯函数层：增量回填 / 每日 IC 聚合（可离线单测）
+# ---------------------------------------------------------------------------
+def _aggregate_day(
+    by_code: Dict[str, Dict[str, float]],
+    valid: List[str],
+    excess: "np.ndarray",
+) -> Dict[str, Tuple[List[float], List[float]]]:
+    """把「当日 {code:{leg:score}}」聚合成 {leg:(scores_all, fwd_all)}（横截面，供 _spearman）。
+
+    修复：原实现把每只股票单独 append 成 ( [单点], [单点] )，样本<3 → IC 恒为 nan。
+    这里按腿把当日全部有效股票拼成一个横截面数组，才能算横截面秩相关。
+    """
+    day: Dict[str, Tuple[List[float], List[float]]] = {}
+    ex_map = {c: float(excess[i]) for i, c in enumerate(valid)}
+    for c in valid:
+        ex = ex_map[c]
+        for leg, s in by_code[c].items():
+            bucket = day.setdefault(leg, ([], []))
+            bucket[0].append(float(s))
+            bucket[1].append(ex)
+    return day
+
+
+def aggregate_from_daily(daily_ic: Dict[str, List[Tuple[str, float]]]) -> Dict[str, Dict]:
+    """由「已算好的每日 IC 记录」聚合出每腿统计（增量回填用）。
+
+    daily_ic[leg] = [(date_str, ic), ...]。等价于 aggregate_leg_rankic，但输入是
+    已聚合的每日 IC（而非原始 scores/fwd），避免落盘/重算时保存庞大的逐票数组。
+    """
+    out: Dict[str, Dict] = {}
+    for leg, recs in daily_ic.items():
+        ics = [ic for _, ic in recs if ic == ic]
+        if not ics:
+            continue
+        m = float(np.mean(ics))
+        sd = float(np.std(ics, ddof=1)) if len(ics) > 1 else float("nan")
+        ir = m / sd if (sd and sd > 0) else float("nan")
+        out[leg] = {
+            "rankic": round(m, 4),
+            "ic_ir": round(ir, 3) if ir == ir else None,
+            "n_days": len(ics),
+        }
+    return out
+
+
+def merge_daily_records(
+    existing: Dict[str, List[Dict]],
+    new: Dict[str, List[Dict]],
+    max_days: int,
+) -> Dict[str, List[Dict]]:
+    """合并新旧每日 IC 记录（同 date 以 new 为准），按 date 升序裁剪到最近 max_days。
+
+    existing / new 形如 {leg: [{date, ic}, ...]}（即可落盘格式）。返回同格式。
+    """
+    merged: Dict[str, List[Dict]] = {}
+    for leg in set(existing) | set(new):
+        recs: Dict[str, float] = {r["date"]: float(r["ic"]) for r in existing.get(leg, [])}
+        for r in new.get(leg, []):
+            recs[r["date"]] = float(r["ic"])  # new 覆盖旧
+        ordered = sorted(recs.items())  # (date, ic)
+        if max_days and len(ordered) > max_days:
+            ordered = ordered[-max_days:]
+        merged[leg] = [{"date": d, "ic": ic} for d, ic in ordered]
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # 回填计算（需联网，生产跑于耐久上下文）
 # ---------------------------------------------------------------------------
 def compute_leg_rankic(
@@ -155,10 +222,13 @@ def compute_leg_rankic(
     out: Optional[Path] = None,
     dry_run: bool = False,
     progress_cb=None,
+    incremental: bool = True,
 ) -> Dict:
-    """逐日算每条腿的 RankIC，写 leg_rankic.json。
+    """逐日算每条腿的 RankIC，写 leg_rankic.json（支持增量回填）。
 
-    Returns：{status, legs:{...}, last_date, generated_at}
+    Returns：{status, mode, legs:{...}, daily:{...}, last_date, generated_at}
+      - mode="full"      ：全量重算（覆盖写）
+      - mode="incremental"：复用已有 leg_rankic.json 的每日 IC，只算缺失的交易日并合并
     需联网；会强制临时开启集成（确保 ensemble_detail 含每腿分数），结束后还原。
     """
     from config.settings import config as app_config
@@ -194,34 +264,56 @@ def compute_leg_rankic(
 
         close = pd.DataFrame({c: df["close"] for c, df in raw.items()}).sort_index()
         all_dates = list(close.index)
-        candidates = []
+        # 候选日 = 最近 days 个「有 horizon 日后的前向收益」的交易日
+        candidate_pool = []
         i = len(all_dates) - 1
-        while i >= 0 and len(candidates) < days:
+        while i >= 0 and len(candidate_pool) < days:
             d = all_dates[i]
-            d_fwd = _next_trading_day(d, horizon)
-            if d_fwd in close.index:
-                candidates.append(d)
+            if _next_trading_day(d, horizon) in close.index:
+                candidate_pool.append(d)
             i -= 1
-        candidates = list(reversed(candidates))
+        candidate_pool = list(reversed(candidate_pool))  # 升序
 
         if dry_run:
-            return {"status": "dry_run", "candidates": len(candidates)}
+            return {"status": "dry_run", "candidates": len(candidate_pool)}
 
-        # per_day[leg] = list of (scores, fwd_excess)
-        per_day: Dict[str, List[Tuple[List[float], List[float]]]] = {}
-        last_date = None
-        for k, d in enumerate(candidates, 1):
+        # 已有记录的日期集合（增量跳过）
+        existing_daily: Dict[str, List[Dict]] = {}
+        if incremental and out.exists():
+            try:
+                prev = json.loads(out.read_text(encoding="utf-8"))
+                existing_daily = prev.get("daily", {}) or {}
+            except Exception:  # noqa: BLE001
+                existing_daily = {}
+        existing_dates = set()
+        for recs in existing_daily.values():
+            for r in recs:
+                existing_dates.add(r["date"])
+
+        if incremental and existing_daily:
+            to_compute = [d for d in candidate_pool
+                          if d.strftime("%Y-%m-%d") not in existing_dates]
+            mode = "incremental"
+        else:
+            to_compute = candidate_pool
+            mode = "full"
+
+        # 新算出的每日 IC：leg -> [(date, ic), ...]
+        new_daily_ic: Dict[str, List[Tuple[str, float]]] = {}
+        for k, d in enumerate(to_compute, 1):
             d_fwd = _next_trading_day(d, horizon)
             sliced = {c: df.loc[df.index <= d] for c, df in raw.items() if df.index[0] <= d}
             try:
                 preds = predictor.predict_batch(sliced)
             except Exception:  # noqa: BLE001
-                preds = []
+                preds = {}
+            # 修复：predict_batch 返回 {code: StockPrediction}，要 .items() 迭代
             by_code: Dict[str, Dict[str, float]] = {}
-            for p in preds:
-                det = getattr(p, "ensemble_detail", None)
-                if isinstance(det, dict) and "scores" in det:
-                    by_code[p.code] = det["scores"]
+            if isinstance(preds, dict):
+                for code, p in preds.items():
+                    det = getattr(p, "ensemble_detail", None)
+                    if isinstance(det, dict) and "scores" in det:
+                        by_code[code] = det["scores"]
             c0 = close.loc[d]
             c1 = close.loc[d_fwd]
             valid = [c for c in raw if c in by_code and c in c0 and c in c1
@@ -230,28 +322,52 @@ def compute_leg_rankic(
                 continue
             rets = np.array([c1[c] / c0[c] - 1.0 for c in valid], dtype=float)
             excess = rets - rets.mean()
-            for c in valid:
-                for leg, s in by_code[c].items():
-                    per_day.setdefault(leg, []).append(([s], [excess[valid.index(c)]]))
-            last_date = d.strftime("%Y-%m-%d")
+            # 按腿聚合当日横截面（修复：整段横截面喂给 _spearman）
+            day = _aggregate_day(by_code, valid, excess)
+            date_str = d.strftime("%Y-%m-%d")
+            for leg, (scs, fwd) in day.items():
+                ic = _spearman(scs, fwd)
+                if ic == ic and len(scs) >= 3:
+                    new_daily_ic.setdefault(leg, []).append((date_str, ic))
             if progress_cb:
-                progress_cb(len(candidates), len(candidates), k)
+                progress_cb(len(to_compute), len(to_compute), k)
 
-        if not per_day:
+        if not new_daily_ic and mode == "full":
             return {"status": "error", "error": "no_valid_scores"}
 
-        legs_stats = aggregate_leg_rankic(per_day)
-        # 若指定了 legs 但没统计（如某腿无 checkpoint），显式标 None 提醒
+        # 合并每日 IC 记录
+        if mode == "incremental" and existing_daily:
+            new_as_records = {
+                leg: [{"date": d, "ic": ic} for d, ic in recs]
+                for leg, recs in new_daily_ic.items()
+            }
+            merged = merge_daily_records(existing_daily, new_as_records, days)
+        else:
+            merged = {
+                leg: [{"date": d, "ic": ic} for d, ic in recs]
+                for leg, recs in new_daily_ic.items()
+            }
+
+        daily_ic = {leg: [(r["date"], r["ic"]) for r in recs] for leg, recs in merged.items()}
+        legs_stats = aggregate_from_daily(daily_ic)
         if legs:
             for want in legs:
                 legs_stats.setdefault(want, {"rankic": None, "ic_ir": None, "n_days": 0})
 
+        last_date = None
+        for recs in merged.values():
+            for r in recs:
+                if last_date is None or r["date"] > last_date:
+                    last_date = r["date"]
+
         result = {
             "status": "ok",
+            "mode": mode,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "last_date": last_date,
             "params": {"days": days, "sample": sample, "horizon": horizon, "pool": pool},
             "legs": legs_stats,
+            "daily": merged,
         }
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
