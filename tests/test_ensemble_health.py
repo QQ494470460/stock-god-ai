@@ -226,3 +226,69 @@ def test_health_report_is_pure_observation_no_side_effects_on_scores():
     out = ep.predict_batch({"a": _df()})
     assert abs(out["a"].score - 70.0) < 1e-6   # (60 主 + 80 子) 等权
     assert rep["n_available"] == 1
+
+
+# --------------------------------------------------------------------------
+# 3) Predictor.ensemble_degradation_alert 聚焦告警
+# --------------------------------------------------------------------------
+def _fake_ep_with(legs):
+    """构造一个 EnsemblePredictor 替身，health_report 返回给定 legs。"""
+    class _FakeEP:
+        def health_report(self):
+            return {
+                "enabled": True,
+                "n_subs": len(legs),
+                "n_available": sum(1 for l in legs if l["available"]),
+                "dynamic_weights": False,
+                "legs": legs,
+            }
+    return _FakeEP()
+
+
+def test_predictor_degradation_alert_none_when_all_healthy():
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = True
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        fake = _fake_ep_with([
+            {"name": "alpha_xgboost", "available": True, "reason": None, "weight": 1.0},
+            {"name": "lstm", "available": True, "reason": None, "weight": 0.8},
+        ])
+        with patch.object(Predictor, "_get_ensemble", return_value=fake):
+            assert p.ensemble_degradation_alert() is None
+    finally:
+        app_config.ml.use_ensemble = old
+
+
+def test_predictor_degradation_alert_text_when_a_leg_down():
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = True
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        fake = _fake_ep_with([
+            {"name": "alpha_xgboost", "available": True, "reason": None, "weight": 1.0},
+            {"name": "lstm", "available": False, "reason": "RuntimeError: lstm_best.pt 缺失",
+             "weight": 0.8},
+        ])
+        with patch.object(Predictor, "_get_ensemble", return_value=fake):
+            alert = p.ensemble_degradation_alert()
+        assert alert is not None
+        assert "lstm" in alert
+        assert "lstm_best.pt 缺失" in alert
+        assert "静默降级" in alert
+    finally:
+        app_config.ml.use_ensemble = old
+
+
+def test_predictor_degradation_alert_disabled_returns_none():
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = False
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        # use_ensemble=False → _get_ensemble 返回 None → 直接 None（不构建集成、不触网）
+        assert p.ensemble_degradation_alert() is None
+    finally:
+        app_config.ml.use_ensemble = old

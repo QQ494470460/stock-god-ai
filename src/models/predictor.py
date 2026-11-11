@@ -448,6 +448,31 @@ class Predictor:
             lines.append(line)
         return "\n".join(lines)
 
+    def ensemble_degradation_alert(self) -> Optional[str]:
+        """返回静默降级告警文本；全部腿健康 / 未启用则返回 None。
+
+        与 ensemble_report 互补：ensemble_report 是「全量可读报告」（始终有内容），
+        本方法只聚焦「有没有腿挂了」，供日志 / 日报 / 推送做**显眼告警**用，
+        避免降级被淹没在常规输出里（呼应 LSTM c10.dll / Alpha 1114 静默降级坑）。
+
+        零行为改变：use_ensemble=False 时 _get_ensemble 返回 None → 直接返回 None；
+        不触网、不重训、不改任何权重 / 评分。
+        """
+        ep = self._get_ensemble()
+        if ep is None:
+            return None
+        rep = ep.health_report()
+        down = [
+            (l["name"], l["reason"] or "未知原因")
+            for l in rep["legs"] if not l["available"]
+        ]
+        if not down:
+            return None
+        lines = ["⚠️ 超级集成有腿静默降级："]
+        for name, reason in down:
+            lines.append(f"  · {name}：{reason}")
+        return "\n".join(lines)
+
     def _enable_llm(self, mock: bool = False) -> None:
         """按需启用 LLM 定性叠加覆盖层（纯加性 score 微调，绝不重训 xgboost）。
 

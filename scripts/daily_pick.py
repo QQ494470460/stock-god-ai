@@ -51,6 +51,9 @@ try:  # 与 run_loop.py 一致：先导入 config.settings 以注入外部 libs 
 except Exception:  # noqa: BLE001
     pass
 
+from config.settings import config as app_config
+from loguru import logger
+
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
@@ -115,6 +118,17 @@ def main() -> int:
                       f"{str(r.get('推荐理由',''))[:20]}")
         else:
             print("\n  （无达标标的 —— 空仓是合法结果，闭环会按兵不动而不是清仓）")
+
+        # 超级集成健康审计：仅在启用时显眼输出（默认关 → 静默，零行为改变、零噪声）。
+        # 降级告警同时进日志，避免被淹没在常规输出里（呼应 LSTM c10.dll / Alpha 1114 坑）。
+        if getattr(app_config.ml, "use_ensemble", False):
+            eh = rep.get("ensemble_health")
+            if eh:
+                print("\n" + eh)
+            ea = rep.get("ensemble_alarm")
+            if ea:
+                print(f"\n🔴 超级集成降级告警：\n{ea}")
+                logger.warning("超级集成降级告警：\n%s", ea)
 
     # ---- 可选：立刻刷新交易计划 ----
     if args.build_plan:

@@ -394,6 +394,17 @@ def generate_daily_picks(
         else:
             logger.info(f"✅ 每日推荐生成: {len(df)} 只（阈值 {min_score:.1f}）")
 
+        # 超级集成健康审计：把各腿可用状态/降级原因透出到报告
+        # （看板/日报/运维可直接读 ensemble_health；ensemble_alarm 为聚焦告警文本）。
+        # 默认 ml.use_ensemble=False 时 ensemble_report 返回「未启用」、alarm 返回 None，
+        # 零行为改变、零额外开销（若已启用，子模型在上文 get_top_recommendations
+        # 里已被 ensure，不会二次加载）。
+        try:
+            report["ensemble_health"] = pred.ensemble_report()
+            report["ensemble_alarm"] = pred.ensemble_degradation_alert()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"超级集成健康审计失败（不影响推荐）: {e}")
+
     except Exception as e:
         report["status"] = "error"
         report["error"] = str(e)
