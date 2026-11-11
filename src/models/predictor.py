@@ -418,11 +418,35 @@ class Predictor:
         return self._ensemble
 
     def ensemble_report(self) -> str:
-        """返回超级集成各腿可用性与权重的可读报告。"""
+        """返回超级集成各腿可用性与权重的可读报告（含健康审计）。
+
+        在 EnsemblePredictor.health_report() 基础上渲染：逐腿透出「可用 / 降级的
+        真实原因 + 权重 + LLM 腿实时健康」，让看板 / 日报一眼可见哪条腿在静默降级。
+        """
         ep = self._get_ensemble()
         if ep is None:
             return "🧩 超级集成：未启用（ml.use_ensemble=False）"
-        return ep.summary()
+        rep = ep.health_report()
+        lines = [
+            "🧩 超级集成健康审计：",
+            f"  启用腿 {rep['n_available']}/{rep['n_subs']}"
+            f"（动态权重={'开' if rep['dynamic_weights'] else '关'}）",
+        ]
+        for leg in rep["legs"]:
+            if leg["available"]:
+                st = "✅ 可用"
+            else:
+                st = f"⚠️ 降级（原因：{leg['reason'] or '未知'}）"
+            line = f"  · {leg['name']}：{st}（权重 {leg['weight']}）"
+            h = leg.get("llm_health")
+            if leg["name"] == "llm_alpha" and h:
+                line += (
+                    f" [LLM: 调用 {h.get('total_calls')} 成功 {h.get('success')} "
+                    f"失败 {h.get('failures')} 连续失败 {h.get('consecutive_failures')}"
+                    f"{' 已降级' if h.get('degraded') else ''}]"
+                )
+            lines.append(line)
+        return "\n".join(lines)
 
     def _enable_llm(self, mock: bool = False) -> None:
         """按需启用 LLM 定性叠加覆盖层（纯加性 score 微调，绝不重训 xgboost）。

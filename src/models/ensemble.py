@@ -527,3 +527,36 @@ class EnsemblePredictor:
                              f"失败 {h['failures']} 连续失败 {h['consecutive_failures']}）")
             lines.append(f"  {sub.name}：{st}（权重 {w}）{extra}")
         return "\n".join(lines)
+
+    def health_report(self) -> Dict:
+        """结构化健康快照：单点透出所有腿的可用状态 / 权重 / 不可用语因 / LLM 实时健康。
+
+        正面解决「腿静默降级」坑（如 LSTM c10.dll / Alpha 1114）：运维 / 看板 / 日报
+        一眼可见哪条腿被剔除、为什么、权重几何、LLM 腿实时健康如何。
+
+        纯观测、零行为改变：
+          · 不触网、不重训；只读 sub.available（property，首次读会触发 _ensure 懒加载探测，
+            但只探测不加载权重/不改动任何评分行为）；
+          · 返回 dict，可被 ensemble_report 渲染成文本，亦可直接 JSON 透出给运维 API。
+        """
+        ml = getattr(app_config, "ml", None)
+        legs = []
+        for sub, w in self.subs:
+            leg = {
+                "name": sub.name,
+                "available": bool(sub.available),
+                # 不可用语因（_reason 在 available 探测失败时被置位）；可用时为 None
+                "reason": getattr(sub, "_reason", None),
+                "weight": float(w),
+            }
+            if sub.name == "llm_alpha":
+                # LLM 腿实时健康（调用/失败/连续失败/降级标记）；不可用时为 None
+                leg["llm_health"] = sub.health()
+            legs.append(leg)
+        return {
+            "enabled": True,
+            "n_subs": len(self.subs),
+            "n_available": sum(1 for l in legs if l["available"]),
+            "dynamic_weights": bool(getattr(ml, "ensemble_dynamic_weights", False)),
+            "legs": legs,
+        }
