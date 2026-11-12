@@ -169,3 +169,66 @@ def test_heartbeat_keeps_job_list(tmp_path, monkeypatch, jobs):
     hb = frag._scheduler_daemon_heartbeat()
     assert hb["jobs"] == jobs
     assert hb["holding"] is False
+
+
+# ---------------------------------------------------------------------------
+# 看板首屏暴露超级集成腿静默降级（心跳 ensemble_degraded → out["loop"]）
+# ---------------------------------------------------------------------------
+
+def _load_status_fragment(func_name):
+    """AST 抽取 _today_status_data，去掉 @st.cache_data 避免拉起 streamlit。"""
+    src = (ROOT / "src" / "ui" / "app.py").read_text(encoding="utf-8-sig")
+    tree = ast.parse(src)
+    for n in tree.body:
+        if isinstance(n, ast.FunctionDef) and n.name == func_name:
+            n.decorator_list = []
+            break
+    else:
+        raise AssertionError(f"app.py 找不到 {func_name}（改名了？同步更新本测试）")
+    ns = {
+        "Path": Path, "datetime": datetime, "json": json, "logger": _Log(),
+        "__file__": str(ROOT / "src" / "ui" / "app.py"),
+        "st": types.SimpleNamespace(cache_data=lambda *a, **k: (lambda f: f)),
+        "_status_read_json": _hb_read_json,
+    }
+    mod = types.ModuleType("app_status_fragment")
+    mod.__dict__.update(ns)
+    exec(compile(ast.Module(body=[n], type_ignores=[]), "<app-status-frag>", "exec"),
+         mod.__dict__)
+    return mod
+
+
+_LOOP_HB = {
+    "ts": datetime.now().isoformat(timespec="seconds"),
+    "state": "running", "guard_mode": "paper", "n_positions": 3,
+}
+
+
+def _hb_read_json(path):
+    if "loop_heartbeat.json" in str(path):
+        return dict(_LOOP_HB, **_hb_read_json._extra)
+    return None
+_hb_read_json._extra = {}
+
+
+def test_status_exposes_ensemble_degraded_when_heartbeat_has_it():
+    frag = _load_status_fragment("_today_status_data")
+    _hb_read_json._extra = {
+        "ensemble_degraded": True,
+        "ensemble_alarm": "⚠️ 超级集成有腿静默降级：\n  · lstm：RuntimeError: lstm_best.pt 缺失",
+    }
+    out = frag._today_status_data()
+    lp = out["loop"]
+    assert lp is not None
+    assert lp["ensemble_degraded"] is True
+    assert "lstm" in (lp["ensemble_alarm"] or "")
+
+
+def test_status_defaults_not_degraded_without_ensemble_fields():
+    """旧心跳 / 未启用 use_ensemble（无 ensemble 字段）不应误报降级。"""
+    frag = _load_status_fragment("_today_status_data")
+    _hb_read_json._extra = {}
+    out = frag._today_status_data()
+    lp = out["loop"]
+    assert lp is None or (lp.get("ensemble_degraded") is False
+                          and lp.get("ensemble_alarm") is None)

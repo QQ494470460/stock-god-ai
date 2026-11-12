@@ -1030,6 +1030,9 @@ def _today_status_data() -> dict:
                 "mode": hb.get("guard_mode") or "",
                 "n_pos": hb.get("n_positions"),
                 "ts": str(hb.get("ts") or "").replace("T", " ")[:16],
+                # 超级集成腿静默降级（仅启用 use_ensemble 时心跳才带；缺省未降级）
+                "ensemble_degraded": bool(hb.get("ensemble_degraded", False)),
+                "ensemble_alarm": hb.get("ensemble_alarm") or None,
             }
         except Exception:  # noqa: BLE001
             pass
@@ -1128,6 +1131,19 @@ def render_today_status() -> None:
             f'<div class="notice warn">⚠️ <b>交易闭环已停 {stale_min / 60:.1f} 小时</b>'
             f'（最后心跳 {d["loop"].get("ts") or "—"}）—— 期间不会自动下单，'
             f'请确认常驻进程（开机自启或手动 run_loop）是否在跑。</div>',
+            unsafe_allow_html=True,
+        )
+
+    # 超级集成腿静默降级：盘中实时暴露在看板（闭环活着时才有意义，冻结心跳的降级标记不展示）
+    lp = d.get("loop") or {}
+    if (lp.get("ensemble_degraded")
+            and stale_min is not None and stale_min <= _loop_stale_threshold_min()):
+        alarm = lp.get("ensemble_alarm") or "超级集成有腿静默降级（详情见交易日报 / 看门狗日志）"
+        alarm_html = str(alarm).replace("\n", "<br>")
+        st.markdown(
+            f'<div class="notice warn">⚠️ <b>超级集成有腿静默降级</b>'
+            f'（闭环仍在运行，但部分预测腿不可用，当前推荐未含其信号）：<br>'
+            f'{alarm_html}</div>',
             unsafe_allow_html=True,
         )
 
