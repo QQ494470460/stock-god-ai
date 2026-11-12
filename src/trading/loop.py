@@ -466,7 +466,9 @@ class TradingLoop:
         三天的结算报告都是 ``intents=0``，事后翻日志才分清到底是「根本没跑」还是
         「跑了但没满足调仓条件」—— 这两种情况的处置方式完全不同。
 
-        心跳文件字段：时间戳、状态、市场阶段、计划日、权益、意图/成交/拦截计数、pid。
+        心跳文件字段：时间戳、状态、市场阶段、计划日、权益、意图/成交/拦截计数、pid，
+        以及（仅启用超级集成时）逐腿健康/降级告警，使看门狗与状态 API 能在盘中
+        tick 级别实时发现「腿静默降级」，而不必等到收盘结算日报。
         读取用模块级 :func:`read_heartbeat`。
         """
         payload = {
@@ -483,6 +485,19 @@ class TradingLoop:
             "dry_run": bool(self.config.dry_run),
             "guard_mode": self.guard.safety.mode.value,
         }
+        # 超级集成健康并入心跳：仅启用时取，整体 try 包裹、只读、零行为改变。
+        # 失败（如模型未加载）绝不波及心跳落盘（交易主流程优先级最高）。
+        try:
+            from config.settings import config as _app_cfg
+            if getattr(_app_cfg.ml, "use_ensemble", False):
+                from src.models.predictor import predictor as _pred
+                _eh = _pred.ensemble_report()
+                _ea = _pred.ensemble_degradation_alert()
+                payload["ensemble_health"] = _eh
+                payload["ensemble_alarm"] = _ea
+                payload["ensemble_degraded"] = _ea is not None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"超级集成健康审计并入心跳失败（不影响心跳）: {e}")
         self.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
         self.heartbeat_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
