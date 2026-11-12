@@ -1651,6 +1651,19 @@ class TradingLoop:
             },
         }
 
+        # 超级集成健康审计：把各腿可用/降级状态并入日报（用户唯一主动翻的产物），
+        # 让「腿静默降级」在结算日报里显眼（呼应 LSTM c10.dll / Alpha 1114 坑）。
+        # 默认 use_ensemble=False 时不注入（日报保持干净）；启用时只读、零行为改变、
+        # 不触网、不重训。任何异常都被吞掉，绝不影响日报落盘。
+        try:
+            from config.settings import config as _app_cfg
+            if getattr(_app_cfg.ml, "use_ensemble", False):
+                from src.models.predictor import predictor as _pred
+                snapshot["ensemble_health"] = _pred.ensemble_report()
+                snapshot["ensemble_alarm"] = _pred.ensemble_degradation_alert()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"超级集成健康审计并入日报失败（不影响日报）: {e}")
+
         # 落盘
         try:
             out_dir = Path(DATA_DIR) / "loop_reports"
@@ -1820,6 +1833,20 @@ class TradingLoop:
                     f"{p['avg_cost']} | {p['price']} | {p['pnl_pct']:+.2f} |")
         else:
             lines.append("_（空仓）_")
+        # 超级集成健康审计：降级必须显眼（呼应 LSTM c10.dll / Alpha 1114 静默降级坑）。
+        # 仅当 use_ensemble=True 时 snapshot 才带这两个字段（见 _settle 注入逻辑）。
+        eh = s.get("ensemble_health")
+        if eh:
+            lines.append("")
+            lines.append("## 🧩 超级集成健康")
+            lines.append("")
+            lines.extend(eh.splitlines())
+        ea = s.get("ensemble_alarm")
+        if ea:
+            lines.append("")
+            lines.append("> ⚠️ **超级集成有腿静默降级**：")
+            for _al in ea.splitlines():
+                lines.append(f"> {_al}")
         return "\n".join(lines)
 
     def _push(self, title: str, markdown: str, payload: dict):
