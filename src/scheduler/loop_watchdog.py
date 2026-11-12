@@ -89,6 +89,14 @@ def in_monitoring_window(now: Optional[datetime] = None) -> bool:
     return WINDOW_START <= cur.time() <= WINDOW_END
 
 
+def _read_heartbeat_dict(path: Path) -> dict:
+    """读完整心跳字典；缺失/损坏返回空 dict（降级信号缺省=未降级）。"""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _read_last_attempt(path: Path) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
@@ -179,6 +187,11 @@ def check(
     ok = age is not None and age <= stale_sec
     active = in_monitoring_window(cur) if window is None else bool(window)
 
+    # 超级集成降级信号：心跳里只有启用 use_ensemble 时才带 ensemble_degraded，
+    # 旧文件/未启用→缺省 False，绝不制造噪声。纯观测、不影响 liveness 判定。
+    _hb_dict = _read_heartbeat_dict(hb)
+    degraded = bool(_hb_dict.get("ensemble_degraded", False))
+
     result = {
         "at": cur.isoformat(timespec="seconds"),
         "age_sec": None if age is None else round(age, 1),
@@ -186,12 +199,26 @@ def check(
         "in_window": bool(active),
         "action": "none",
         "detail": "",
+        "ensemble_degraded": degraded,
+        "ensemble_alarm": _hb_dict.get("ensemble_alarm") or None,
     }
 
     if ok:
         # 恢复了就把"上次拉起"的冷却记录清掉，下一次事故可以立刻处置。
         _clear_last_attempt(st)
         result["detail"] = f"闭环存活（心跳 {age:.0f}s）"
+        # 闭环活着但超级集成有腿静默降级：不重启（进程没死），但要显眼标记 +
+        # 落 WARN 日志，让外部监控/事后追溯能当 tick 发现「残缺集成在跑」。
+        if degraded:
+            result["detail"] += "｜⚠️ 超级集成有腿静默降级"
+            _append_log(
+                f"WARN 超级集成有腿静默降级：{result['ensemble_alarm'] or '未知腿'}",
+                lg)
+            try:
+                from loguru import logger
+                logger.warning("🩺 闭环看门狗：超级集成有腿静默降级（进程存活，仅集成降级）")
+            except Exception:  # noqa: BLE001
+                pass
         return result
 
     if not active:

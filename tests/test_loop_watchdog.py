@@ -188,3 +188,49 @@ def test_watchdog_tick_swallows_errors(tmp_path):
     finally:
         mod.check = orig
     assert log.exists() and "故意炸" in log.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 超级集成降级（进程存活但腿静默降级）
+def _hb_full(tmp_path: Path, age_sec: float, now: datetime, **extra) -> Path:
+    p = tmp_path / "loop_heartbeat.json"
+    d = {"ts": (now - timedelta(seconds=age_sec)).isoformat(timespec="seconds"),
+         "pid": 1234, "state": "running", "equity": 1.0}
+    d.update(extra)
+    p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_alive_but_ensemble_degraded_surfaces_in_result(tmp_path):
+    sp = _Spawn()
+    p = _paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW,
+             ensemble_degraded=True,
+             ensemble_alarm="⚠️ 超级集成有腿静默降级：\n  · lstm：RuntimeError: lstm_best.pt 缺失")
+    res = wd.check(now=IN_WINDOW, spawn=sp, **p)
+    assert res["ok"] is True
+    assert res["action"] == "none"          # 进程活着 → 绝不重启
+    assert sp.calls == 0
+    assert res["ensemble_degraded"] is True
+    assert "降级" in res["detail"]
+    assert "lstm" in (res["ensemble_alarm"] or "")
+
+
+def test_alive_degraded_writes_warn_log(tmp_path):
+    sp = _Spawn()
+    p = _paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="⚠️ 超级集成有腿静默降级：\n  · lstm：x")
+    wd.check(now=IN_WINDOW, spawn=sp, **p)
+    log = p["log_path"].read_text(encoding="utf-8")
+    assert "WARN 超级集成有腿静默降级" in log
+
+
+def test_alive_no_ensemble_field_defaults_not_degraded(tmp_path):
+    """旧心跳文件（无 ensemble_degraded 字段）不应误报降级 —— 默认关闭、零噪声。"""
+    sp = _Spawn()
+    p = _paths(tmp_path)
+    _hb(tmp_path, age_sec=30, now=IN_WINDOW)     # 旧格式，无 ensemble 字段
+    res = wd.check(now=IN_WINDOW, spawn=sp, **p)
+    assert res["ensemble_degraded"] is False
+    assert "降级" not in res["detail"]
+    assert res["ensemble_alarm"] is None
