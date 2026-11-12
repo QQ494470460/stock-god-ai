@@ -386,6 +386,10 @@ class EnsemblePredictor:
         self.primary = primary_predictor
         self.subs: List[Tuple[SubPredictor, float]] = []
         self.default_weight = default_weight
+        # 已告警过的腿名集合：去重「腿静默降级」日志，避免逐股票重复刷屏、
+        # 把真正重要的那一条降级告警淹没（呼应 LSTM c10.dll / Alpha 1114 坑）。
+        # 腿在运行期内不会自愈（模型文件/权重不会热替换），故按进程级去重即可。
+        self._warned_legs: set = set()
 
     def add_sub(self, sub: SubPredictor, weight: Optional[float] = None) -> None:
         self.subs.append((sub, weight if weight is not None else self.default_weight))
@@ -397,8 +401,11 @@ class EnsemblePredictor:
                 out.append((sub, w))
             else:
                 why = getattr(sub, "_reason", None)
-                logger.warning(f"  集成：{sub.name} 不可用，已跳过"
-                               + (f"（原因：{why}）" if why else ""))
+                # 同腿只告警一次：否则 predict_batch 逐股票调用会刷出数百条相同告警
+                if sub.name not in self._warned_legs:
+                    self._warned_legs.add(sub.name)
+                    logger.warning(f"  集成：{sub.name} 不可用，已跳过"
+                                   + (f"（原因：{why}）" if why else ""))
         return out
 
     def _eff_weights(self, avail) -> List[float]:

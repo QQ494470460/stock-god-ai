@@ -292,3 +292,18 @@ def test_predictor_degradation_alert_disabled_returns_none():
         assert p.ensemble_degradation_alert() is None
     finally:
         app_config.ml.use_ensemble = old
+
+
+# --------------------------------------------------------------------------
+# 4) 降级告警去重：同腿只告警一次，避免逐股票刷屏淹没真实信号
+# --------------------------------------------------------------------------
+def test_available_subs_dedupes_warning_per_leg():
+    """同一腿降级只告警一次（而非逐股票刷屏），避免淹没真正重要的那条告警。"""
+    ep = EnsemblePredictor(FakePrimary())
+    ep.add_sub(UnavailableSub(), weight=1.0)
+    with patch("src.models.ensemble.logger") as mock_log:
+        # 5 只股票各触发一次 blend_one → _available_subs 被调用 5 次
+        ep.predict_batch({f"s{i}": _df() for i in range(5)})
+    warns = [c for c in mock_log.warning.call_args_list
+             if c.args and "不可用，已跳过" in c.args[0]]
+    assert len(warns) == 1, f"期望降级告警仅 1 次，实际 {len(warns)} 次（去重失效）"
