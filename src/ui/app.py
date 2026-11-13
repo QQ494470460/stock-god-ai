@@ -1883,6 +1883,21 @@ def render_portfolio_risk_panel() -> None:
     )
 
 
+def _render_ensemble_degradation_banner(alarm):
+    """超级集成腿静默降级横幅（单股推荐页）。
+
+    alarm 为 None 时（全部腿健康 / 未启用 / 异常）不渲染，保持零噪声。
+    否则在 AI 评分面板之上给出全宽 ⚠️ 警示：本次推荐是基于「残缺集成」算出的，
+    缺腿信号、仅供参考。该横幅是「超级集成健康观测闭环」在单股页的最后一道触达。
+    """
+    if not alarm:
+        return
+    st.warning(
+        "⚠️ 本次推荐基于**残缺集成**：部分预测腿不可用，当前评分未含其信号，"
+        "仅供参考、勿直接据此下单。\n\n" + alarm
+    )
+
+
 def render_credibility_panel() -> None:
     """🛡️ 策略信誉引擎：把每个策略标签的「方向一致性(EWMA) → 权重」表现可视化。
 
@@ -2901,6 +2916,7 @@ elif page == "📊 个股分析":
             s_cls = "gray"
             _mode = "single"
             _det = {}
+            _alarm = None  # 超级集成腿静默降级告警（仅 ensemble 口径会非空）
             th_red, th_amber, th_caution, th_bear = 55.0, 49.0, 51.0, 45.0
             action, action_cls = "⚪ 观望为主", ""
             entry_range, stop_loss, target, rr_txt = "—", "—", "—", "—"
@@ -2918,6 +2934,15 @@ elif page == "📊 个股分析":
                 # 标注本次评分**实际**走的口径，避免把不显著的单模型分当成集成分来下单
                 _mode = getattr(pred, "model_mode", "single")
                 _det = getattr(pred, "ensemble_detail", {}) or {}
+                # ===== 超级集成腿静默降级警示（用户正在看的这只具体推荐）=====
+                # 复用已缓存装配的 _get_ensemble，零额外开销、不触网、不重训。
+                # 某腿降级时，本次评分实为「残缺集成」算出，必须显眼提示，
+                # 避免用户把缺腿结果当完整集成来决策（呼应 LSTM c10.dll / Alpha 1114 静默降级坑）。
+                if _mode == "ensemble":
+                    try:
+                        _alarm = predictor.ensemble_degradation_alert()
+                    except Exception:  # noqa: BLE001 任何异常都不让页面崩
+                        _alarm = None
                 # ===== 分档阈值：必须按「实际口径」分别校准，绝不能混用 =====
                 # · 单模型（2026-10-10 实测 38~60，mean 47.3）→ 红55 / 黄49 / 谨慎51 / 看空45
                 # · 集成分（2026-10-18 实测，scripts/calibrate_ensemble_thresholds.py，
@@ -2960,6 +2985,9 @@ elif page == "📊 个股分析":
                     target = f"{_tp:.2f}" + (f" / {_tp2:.2f}" if _tp2 else "")
                     _risk = last_close - _sl
                     rr_txt = f"1 : {(_tp - last_close) / _risk:.1f}" if _risk > 1e-9 else "—"
+
+            # ====== ③-补：超级集成腿降级横幅（全宽、在 AI 评分之上）======
+            _render_ensemble_degradation_banner(_alarm)
 
             # ====== ④ 双列：AI 评分 / 交易建议 ======
             _c1, _c2 = st.columns([3, 2])
