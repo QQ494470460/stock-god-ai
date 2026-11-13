@@ -4617,7 +4617,18 @@ def render_safety_panel():
     st.markdown('<div class="section-title">🧩 超级集成 (XGBoost + Alpha + LSTM)</div>', unsafe_allow_html=True)
     try:
         from src.models.predictor import predictor as _pred
-        st.code(_pred.ensemble_report(), language="text")
+        _report = _pred.ensemble_report()
+        # 顶部状态徽标：健康时也一眼可见，不只在降级时才出现（与首屏告警横幅互补）
+        if "未启用" in _report:
+            st.info("🧩 超级集成未启用（当前为单模型 XGBoost 引擎）")
+        elif "⚠️ 降级" in _report:
+            _n_bad = _report.count("⚠️ 降级")
+            st.warning(f"⚠️ 超级集成有腿静默降级（{_n_bad} 腿不可用），"
+                       "详情见下方审计；当前推荐未含其信号。")
+        else:
+            _n_ok = _report.count("✅ 可用")
+            st.success(f"🧩 超级集成正常：{_n_ok} 腿可用")
+        st.code(_report, language="text")
         st.caption(
             "由 `config.ml.use_ensemble` 控制（默认取值见该配置项）。"
             "任一腿文件缺失或推理失败会自动剔除并重新归一化权重，不影响主模型。")
