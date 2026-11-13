@@ -567,3 +567,110 @@ class EnsemblePredictor:
             "dynamic_weights": bool(getattr(ml, "ensemble_dynamic_weights", False)),
             "legs": legs,
         }
+
+
+# ---------------------------------------------------------------------------
+# 超级集成健康台账（持久化 + 趋势）
+# ---------------------------------------------------------------------------
+# 动机：前序工作已把腿降级观测铺到看板首屏横幅 / 模型页常驻面板 / 单股页横幅 /
+# 结算日报 / 每日选股 CLI / 看门狗 WARN + 实时心跳——但这些都是「瞬间态」，
+# 看门狗 WARN 还会随日志滚动消失。本台账把「腿可用性翻转」做成**可回看的事件流**，
+# 让运维能看出「某腿是不是反复闪断」「某腿挂了多久」，而非只看当下这一瞬。
+#
+# 设计原则（与全链路一致）：
+#   · 事件溯源、低开销：只在某腿可用性 *翻转* 时落盘一条事件，稳态下每 tick 调用是 no-op；
+#   · 幂等：重复相同状态不会产生重复事件（用状态文件比对 last-known 状态）；
+#   · 全失败静默：任何异常都吞掉，绝不波及调用方（心跳落盘优先级最高）；
+#   · 零行为改变：只记录、不重训、不触网、不改动权重 / 评分。
+
+def _health_paths(data_dir=None):
+    """返回 (状态文件, 事件日志文件)。data_dir 可注入（测试用），默认 DATA_DIR。"""
+    base = Path(data_dir) if data_dir is not None else DATA_DIR
+    return base / "ensemble_health_state.json", base / "ensemble_health_log.jsonl"
+
+
+def log_health_report(rep: Dict, data_dir=None) -> None:
+    """把健康快照落盘为腿状态变迁事件（仅可用性翻转时写，幂等、低开销、失败静默）。
+
+    ``rep`` 来自 :meth:`EnsemblePredictor.health_report` 的结构化 dict。
+    调用方（loop 心跳）每 tick 调一次即可，稳态下零落盘。
+    """
+    try:
+        import json
+        from datetime import datetime
+
+        legs = (rep or {}).get("legs") or []
+        if not legs:
+            return
+        state_file, log_file = _health_paths(data_dir)
+
+        # 读 last-known 状态（不存在 → 空，视为全部「首次」）
+        prev = {}
+        if state_file.exists():
+            try:
+                prev = json.loads(state_file.read_text(encoding="utf-8") or "{}")
+            except Exception:  # noqa: BLE001 坏文件直接当空，下面会重建
+                prev = {}
+
+        cur = {l["name"]: bool(l["available"]) for l in legs}
+        events = []
+        for l in legs:
+            name = l["name"]
+            avail = bool(l["available"])
+            if prev.get(name) != avail:
+                events.append({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "leg": name,
+                    "available": avail,
+                    "reason": (l.get("reason") or None) if not avail else None,
+                    "n_available": rep.get("n_available"),
+                    "n_subs": rep.get("n_subs"),
+                    "dynamic_weights": rep.get("dynamic_weights"),
+                })
+
+        if not events:
+            return  # 稳态：无任何翻转，no-op
+
+        # 追加事件（每行一条 JSON）
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+        # 原子更新状态文件（先写临时文件再 replace，避免半截写）
+        tmp = state_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, state_file)
+    except Exception as e:  # noqa: BLE001 任何异常都吞，绝不波及调用方
+        logger.debug(f"超级集成健康台账落盘失败（已忽略）: {e}")
+
+
+def recent_health_events(limit: int = 20, since_days: int = 30, data_dir=None) -> list:
+    """读取最近的健康事件（按时间升序，返回最后 ``limit`` 条）。
+
+    用于看板「最近降级事件」趋势面板。文件缺失 / 损坏 / 空 → 返回 []（不报错）。
+    """
+    try:
+        import json
+        from datetime import datetime, timedelta
+
+        _, log_file = _health_paths(data_dir)
+        if not log_file.exists():
+            return []
+        cutoff = (datetime.now() - timedelta(days=since_days)).isoformat(timespec="seconds")
+        out = []
+        with log_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:  # noqa: BLE001 跳过坏行
+                    continue
+                if ev.get("ts", "") >= cutoff:
+                    out.append(ev)
+        return out[-limit:] if limit > 0 else out
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"读取超级集成健康台账失败（返回空）: {e}")
+        return []

@@ -4660,6 +4660,26 @@ def render_safety_panel():
         st.caption(
             "由 `config.ml.use_ensemble` 控制（默认取值见该配置项）。"
             "任一腿文件缺失或推理失败会自动剔除并重新归一化权重，不影响主模型。")
+        # ----- 最近降级事件（可回看的健康趋势，事件溯源、低开销）-----
+        try:
+            from src.models.ensemble import recent_health_events
+            _evs = recent_health_events(limit=10, since_days=14)
+            if _evs:
+                _rows = []
+                for _ev in _evs:
+                    _st = "✅ 恢复" if _ev.get("available") else "⚠️ 降级"
+                    _rows.append({
+                        "时间": str(_ev.get("ts", "")).replace("T", " "),
+                        "腿": _ev.get("leg", ""),
+                        "状态": _st,
+                        "原因": (_ev.get("reason") or "—") if not _ev.get("available") else "—",
+                    })
+                st.markdown("**📜 最近降级事件**（近 14 天 · 仅可用性翻转才记录）")
+                st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+            else:
+                st.caption("📜 近 14 天无降级记录（或超级集成未启用）。")
+        except Exception as _e:  # noqa: BLE001
+            st.caption(f"降级事件读取失败: {_e}")
     except Exception as e:  # noqa: BLE001
         st.caption(f"集成状态不可用: {e}")
 

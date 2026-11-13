@@ -491,11 +491,18 @@ class TradingLoop:
             from config.settings import config as _app_cfg
             if getattr(_app_cfg.ml, "use_ensemble", False):
                 from src.models.predictor import predictor as _pred
-                _eh = _pred.ensemble_report()
+                _ep = _pred._get_ensemble()
                 _ea = _pred.ensemble_degradation_alert()
-                payload["ensemble_health"] = _eh
+                payload["ensemble_health"] = _pred.ensemble_report()
                 payload["ensemble_alarm"] = _ea
                 payload["ensemble_degraded"] = _ea is not None
+                # 落盘腿状态变迁事件（仅翻转时写、幂等、失败静默），供看板趋势面板回看
+                if _ep is not None:
+                    try:
+                        from src.models import ensemble as _ens
+                        _ens.log_health_report(_ep.health_report())
+                    except Exception as _e:  # noqa: BLE001
+                        logger.debug(f"超级集成健康台账落盘失败（不影响心跳）: {_e}")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"超级集成健康审计并入心跳失败（不影响心跳）: {e}")
         self.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
