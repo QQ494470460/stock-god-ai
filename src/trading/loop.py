@@ -498,6 +498,15 @@ class TradingLoop:
                 payload["ensemble_degraded"] = _ea is not None
                 # 落盘腿状态变迁事件（仅翻转时写、幂等、失败静默），供看板趋势面板回看
                 if _ep is not None:
+                    # 先尝试自愈不可用腿（瞬时故障 / 模型文件后来补上，不必重启）；
+                    # 成功恢复的腿会让 health_report 翻转，下面落盘即记录「恢复」事件。
+                    try:
+                        _recovered, _still = _ep.try_recover()
+                        if _recovered:
+                            logger.info(f"超级集成腿自愈成功: {_recovered}")
+                    except Exception as _e:  # noqa: BLE001
+                        logger.debug(f"超级集成腿自愈失败（忽略）: {_e}")
+                    # 落盘腿状态变迁事件（仅翻转时写、幂等、失败静默）
                     try:
                         from src.models import ensemble as _ens
                         _ens.log_health_report(_ep.health_report())

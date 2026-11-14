@@ -2943,6 +2943,22 @@ elif page == "📊 个股分析":
                         _alarm = predictor.ensemble_degradation_alert()
                     except Exception:  # noqa: BLE001 任何异常都不让页面崩
                         _alarm = None
+                    # 增强上下文：把各降级腿「最近一次降级时间」附上，
+                    # 让用户一眼判断是瞬时闪断还是长期挂掉（数据来自健康台账）。
+                    if _alarm:
+                        try:
+                            from src.models.ensemble import recent_health_events
+                            _last_down = {}
+                            for _ev in recent_health_events(limit=50, since_days=14):
+                                if not _ev.get("available"):
+                                    _last_down[_ev["leg"]] = _ev.get("ts")
+                            if _last_down:
+                                _ctx = "🕒 各腿最近降级：" + "；".join(
+                                    f"{k} {str(v).replace('T', ' ')}"
+                                    for k, v in _last_down.items())
+                                _alarm = _alarm + "\n\n" + _ctx
+                        except Exception:  # noqa: BLE001 附加上下文失败不影响主告警
+                            pass
                 # ===== 分档阈值：必须按「实际口径」分别校准，绝不能混用 =====
                 # · 单模型（2026-10-10 实测 38~60，mean 47.3）→ 红55 / 黄49 / 谨慎51 / 看空45
                 # · 集成分（2026-10-18 实测，scripts/calibrate_ensemble_thresholds.py，

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import pickle
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +51,10 @@ class SubPredictor:
     name: str = "base"
     _ready: Optional[bool] = None
     _reason: Optional[str] = None   # 不可用的原因（留给运维排查，见 _available_subs）
+    # 自愈相关：瞬时故障（DLL/锁竞争/模型文件后来补上）可在进程内重试，
+    # 不必重启。冷却 + 退避避免「文件真缺失」时每 tick 反复昂贵重载。
+    _recover_at: Optional["datetime"] = None
+    _fail_count: int = 0
 
     @property
     def available(self) -> bool:
@@ -68,6 +73,34 @@ class SubPredictor:
 
     def _ensure(self) -> None:
         """加载资源；失败抛异常即被 available 捕获为降级。"""
+
+    def _try_recover(self, now=None) -> bool:
+        """对不可用的腿尝试自愈（瞬时故障 / 模型文件后来补上）。
+
+        仅在 ``_ready is False``（已探测失败过）时介入；从未探测过的腿由
+        :attr:`available` 正常首探负责。冷却 + 指数退避兜底：持久故障（文件真缺失）
+        不会每 tick 反复昂贵重载，重试间隔 1m→2m→4m→…→上限 30m。
+
+        返回 True 表示本次自愈成功（重新可用），False 表示仍不可用 / 冷却中。
+        纯健壮性增强，不改动任何评分 / 权重行为。
+        """
+        if self._ready is not False:
+            return False  # 可用，或从未探测过（首探不由这里负责）
+        now = now or datetime.now()
+        if self._recover_at is not None and now < self._recover_at:
+            return False  # 冷却中，不重试
+        self._ready = None          # 放开短路，强制重新 _ensure
+        ok = self.available         # 重新触发懒加载探测
+        if ok:
+            self._reason = None
+            self._recover_at = None
+            self._fail_count = 0
+            return True
+        # 仍失败：退避排期下次重试
+        self._fail_count += 1
+        backoff = min(60 * (2 ** min(self._fail_count - 1, 6)), 1800)
+        self._recover_at = now + timedelta(seconds=backoff)
+        return False
 
     def score_for(self, df: pd.DataFrame, code: str) -> Optional[float]:
         """返回该股票的 0~100 评分；失败/不可用返回 None。"""
@@ -567,6 +600,27 @@ class EnsemblePredictor:
             "dynamic_weights": bool(getattr(ml, "ensemble_dynamic_weights", False)),
             "legs": legs,
         }
+
+    def try_recover(self) -> Tuple[List[str], List[str]]:
+        """尝试自愈所有不可用的腿（瞬时故障 / 模型文件后来补上）。
+
+        返回 ``(recovered_legs, still_down_legs)``。每条腿的冷却 / 退避在
+        :meth:`SubPredictor._try_recover` 内控制，这里只汇总结果。
+        纯健壮性增强：成功恢复的腿重新计入融合，不改变任何评分 / 权重算法。
+
+        由闭环心跳每 tick 调用（仅启用超级集成时）；任意异常被吞，绝不波及调用方。
+        """
+        recovered, still_down = [], []
+        now = datetime.now()
+        for sub, _w in self.subs:
+            try:
+                if sub._try_recover(now):
+                    recovered.append(sub.name)
+                elif sub._ready is False:
+                    still_down.append(sub.name)
+            except Exception as e:  # noqa: BLE001 单腿异常不影响其它腿
+                logger.debug(f"[{sub.name}] 自愈尝试异常（忽略）: {e}")
+        return recovered, still_down
 
 
 # ---------------------------------------------------------------------------

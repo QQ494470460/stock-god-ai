@@ -307,3 +307,98 @@ def test_available_subs_dedupes_warning_per_leg():
     warns = [c for c in mock_log.warning.call_args_list
              if c.args and "不可用，已跳过" in c.args[0]]
     assert len(warns) == 1, f"期望降级告警仅 1 次，实际 {len(warns)} 次（去重失效）"
+
+
+# --------------------------------------------------------------------------
+# 5) 不可用腿进程内自愈（瞬时故障 / 模型文件后来补上，不必重启）
+# --------------------------------------------------------------------------
+class FlakySub(SubPredictor):
+    """前 N 次 _ensure 抛错、之后成功的替身，模拟瞬时故障自愈。"""
+
+    name = "flaky"
+
+    def __init__(self, fail_times=1):
+        self._fail_times = fail_times
+        self._calls = 0
+
+    def _ensure(self):
+        self._calls += 1
+        if self._calls <= self._fail_times:
+            raise RuntimeError("transient: c10.dll 初始化失败")
+
+
+class AlwaysDownSub(SubPredictor):
+    """永远 _ensure 失败的替身（文件真缺失），用于验证冷却 + 退避。"""
+
+    name = "always_down"
+
+    def __init__(self):
+        self._calls = 0
+
+    def _ensure(self):
+        self._calls += 1
+        raise RuntimeError("model file missing")
+
+
+def test_sub_recover_succeeds_on_retry():
+    """已探测失败（_ready=False）的腿，重试一次成功 → 重新可用、清原因。"""
+    sub = FlakySub(fail_times=1)
+    assert sub.available is False          # 首次懒探测失败
+    assert sub._ready is False
+    ok = sub._try_recover()
+    assert ok is True
+    assert sub.available is True
+    assert sub._reason is None
+    assert sub._recover_at is None
+    assert sub._fail_count == 0
+    assert sub._calls == 2                 # 首次探测 + 1 次重试
+
+
+def test_sub_recover_ignores_unprobed_and_available():
+    """从未探测（_ready=None）或已可用（_ready=True）的腿，_try_recover 不介入。"""
+    fresh = FlakySub()
+    assert fresh._try_recover() is False   # 未探测，不动
+    good = FakeSub(80.0)
+    assert good.available is True
+    assert good._try_recover() is False    # 已可用，不动
+
+
+def test_sub_recover_respects_cooldown_and_backoff():
+    """持久故障：冷却内不重试（不反复昂贵重载），越过冷却才再试，退避翻倍。"""
+    from datetime import datetime, timedelta
+
+    sub = AlwaysDownSub()
+    assert sub.available is False
+    now = datetime(2026, 11, 14, 10, 0, 0)
+    ok1 = sub._try_recover(now)
+    assert ok1 is False
+    assert sub._recover_at is not None and sub._recover_at > now
+    calls1 = sub._calls
+    # 冷却内（now 不变）→ 不再调 _ensure
+    assert sub._try_recover(now) is False
+    assert sub._calls == calls1
+    # 越过冷却（now+61s）→ 再试一次 _ensure（仍失败）
+    ok3 = sub._try_recover(now + timedelta(seconds=61))
+    assert ok3 is False
+    assert sub._calls == calls1 + 1
+    # 退避应翻倍到 120s：下一次排期 = 本次 now + 120s
+    assert sub._recover_at == (now + timedelta(seconds=61)) + timedelta(seconds=120)
+
+
+def test_ensemble_try_recover_reports_recovered_and_still_down():
+    """EnsemblePredictor.try_recover 汇总：瞬时故障腿归队、持久故障腿留在 still_down。"""
+    ep = EnsemblePredictor(FakePrimary())
+    flaky = FlakySub(fail_times=1)
+    down = AlwaysDownSub()
+    ep.add_sub(flaky, weight=1.0)
+    ep.add_sub(down, weight=0.8)
+    _ = flaky.available                   # 预探测：flaky 失败、down 失败
+    _ = down.available
+    recovered, still = ep.try_recover()
+    assert "flaky" in recovered
+    assert "always_down" in still
+    # 再跑一次：flaky 已可用 → recovered 空；down 仍在冷却/失败
+    recovered2, still2 = ep.try_recover()
+    assert recovered2 == []
+    assert "always_down" in still2
+
