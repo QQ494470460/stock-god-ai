@@ -148,3 +148,18 @@ def test_corrupt_state_file_does_not_raise(_tmp_data_dir):
     # 不应抛异常
     ensemble.log_health_report(rep)
     assert (ensemble._health_paths(_tmp_data_dir)[1]).exists()
+
+
+def test_unconfigured_optional_leg_not_logged(_tmp_data_dir):
+    """未配置的可选腿（configured=False）不进台账，避免看门狗误判「持续降级」。"""
+    rep = _rep([
+        {"name": "alpha", "available": True, "configured": True,
+         "reason": None, "weight": 1.0},
+        {"name": "transformer", "available": False, "configured": False,
+         "reason": "FileNotFoundError: transformer_best.pt", "weight": 0.8},
+    ])
+    ensemble.log_health_report(rep)
+    events = _read_events(_tmp_data_dir)
+    assert all(e["leg"] != "transformer" for e in events), \
+        "未配置的可选腿不得进台账（否则看门狗会当持续降级升级 ERROR）"
+    assert any(e["leg"] == "alpha" for e in events), "已配置腿仍应正常记录"

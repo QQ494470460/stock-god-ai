@@ -55,6 +55,21 @@ class SubPredictor:
     # 不必重启。冷却 + 退避避免「文件真缺失」时每 tick 反复昂贵重载。
     _recover_at: Optional["datetime"] = None
     _fail_count: int = 0
+    # 可选腿：模型文件可能尚未训练（如第四腿 transformer）。该类腿「文件缺失」
+    # 应视为「未配置」而非「故障降级」——不该每 tick 报警。核心腿（alpha/lstm）
+    # optional=False，缺文件属真故障，必须告警。
+    optional: bool = False
+    model_file: Optional[str] = None   # 相对 MODEL_DIR 的主模型文件名（判「是否已配置」）
+
+    @property
+    def configured(self) -> bool:
+        """该腿是否已配置：可选腿=主模型文件存在；核心腿/无文件腿恒 True。"""
+        if not self.optional or not self.model_file:
+            return True
+        try:
+            return (MODEL_DIR / self.model_file).exists()
+        except Exception:  # noqa: BLE001
+            return True
 
     @property
     def available(self) -> bool:
@@ -67,7 +82,11 @@ class SubPredictor:
                 # 只有 DEBUG 一行 WinError 1114（torch 的 c10.dll 初始化失败），
                 # INFO 层只说「已跳过」，看板上看不出集成其实只剩两条腿。
                 self._reason = f"{type(e).__name__}: {str(e)[:160]}"
-                logger.warning(f"[{self.name}] 子模型不可用，已降级: {e}")
+                if not self.configured:
+                    # 可选腿模型文件缺失（未训练）→ 「未配置」，不是故障，别报 WARNING
+                    logger.info(f"[{self.name}] 可选腿未配置（模型文件缺失，待训练）: {e}")
+                else:
+                    logger.warning(f"[{self.name}] 子模型不可用，已降级: {e}")
                 self._ready = False
         return self._ready
 
@@ -150,6 +169,7 @@ _ALPHA_LAG = int(os.environ.get("ALPHA_LAG_DAYS", "0") or 0)
 
 class AlphaSubPredictor(SubPredictor):
     name = "alpha_xgboost"
+    model_file = "alpha_xgboost_model.pkl"   # 核心腿：缺文件=真故障
 
     def _ensure(self):
         import json
@@ -222,6 +242,7 @@ class AlphaSubPredictor(SubPredictor):
 # ---------------------------------------------------------------------------
 class LSTMSubPredictor(SubPredictor):
     name = "lstm"
+    model_file = "lstm_best.pt"   # 核心腿：缺文件=真故障
 
     def _ensure(self):
         import torch  # 懒加载，避免无 torch 时 import 失败
@@ -266,6 +287,8 @@ class LSTMSubPredictor(SubPredictor):
 # ---------------------------------------------------------------------------
 class TransformerSubPredictor(SubPredictor):
     name = "transformer"
+    model_file = "transformer_best.pt"   # 第四腿：可选，未训练=「未配置」不报警
+    optional = True
 
     def _ensure(self):
         import torch  # 懒加载，避免无 torch 时 import 失败
@@ -328,6 +351,7 @@ class LLMAlphaSubPredictor(SubPredictor):
     """
 
     name = "llm_alpha"
+    optional = True   # 第五腿：可选（仅启用时装配）
 
     def __init__(self, provider=None, lookback_days=None):
         # 仅供单测注入：真实路径由 _ensure 按 config 构造，不暴露构造参数。
@@ -437,8 +461,12 @@ class EnsemblePredictor:
                 # 同腿只告警一次：否则 predict_batch 逐股票调用会刷出数百条相同告警
                 if sub.name not in self._warned_legs:
                     self._warned_legs.add(sub.name)
-                    logger.warning(f"  集成：{sub.name} 不可用，已跳过"
-                                   + (f"（原因：{why}）" if why else ""))
+                    if not getattr(sub, "configured", True):
+                        # 可选腿未训练/文件缺失 → 「未配置」，不是故障，别 WARNING
+                        logger.info(f"  集成：{sub.name} 未配置（可选腿模型文件缺失，跳过）")
+                    else:
+                        logger.warning(f"  集成：{sub.name} 不可用，已跳过"
+                                       + (f"（原因：{why}）" if why else ""))
         return out
 
     def _eff_weights(self, avail) -> List[float]:
@@ -585,6 +613,9 @@ class EnsemblePredictor:
             leg = {
                 "name": sub.name,
                 "available": bool(sub.available),
+                # 可选腿文件缺失 → configured=False（「未配置」而非「降级」）
+                "configured": bool(getattr(sub, "configured", True)),
+                "optional": bool(getattr(sub, "optional", False)),
                 # 不可用语因（_reason 在 available 探测失败时被置位）；可用时为 None
                 "reason": getattr(sub, "_reason", None),
                 "weight": float(w),
@@ -597,6 +628,11 @@ class EnsemblePredictor:
             "enabled": True,
             "n_subs": len(self.subs),
             "n_available": sum(1 for l in legs if l["available"]),
+            # 真降级 = 已配置但不可用；未配置 = 可选腿文件缺失（未训练）
+            "n_configured": sum(1 for l in legs if l.get("configured", True)),
+            "n_degraded": sum(1 for l in legs
+                              if l.get("configured", True) and not l["available"]),
+            "n_not_configured": sum(1 for l in legs if not l.get("configured", True)),
             "dynamic_weights": bool(getattr(ml, "ensemble_dynamic_weights", False)),
             "legs": legs,
         }
@@ -654,6 +690,9 @@ def log_health_report(rep: Dict, data_dir=None) -> None:
         from datetime import datetime
 
         legs = (rep or {}).get("legs") or []
+        # 未配置的可选腿（如未训练的 transformer）不进台账：避免被当成「持续降级」
+        # 触发看门狗 ERROR。它们只属于「未配置」展示，不属于「故障事件」。
+        legs = [l for l in legs if l.get("configured", True)]
         if not legs:
             return
         state_file, log_file = _health_paths(data_dir)

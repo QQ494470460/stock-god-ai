@@ -232,13 +232,20 @@ def test_health_report_is_pure_observation_no_side_effects_on_scores():
 # 3) Predictor.ensemble_degradation_alert 聚焦告警
 # --------------------------------------------------------------------------
 def _fake_ep_with(legs):
-    """构造一个 EnsemblePredictor 替身，health_report 返回给定 legs。"""
+    """构造一个 EnsemblePredictor 替身，health_report 返回给定 legs。
+
+    未给 ``configured`` 的腿按「已配置」处理（向后兼容旧用例）。
+    """
     class _FakeEP:
         def health_report(self):
             return {
                 "enabled": True,
                 "n_subs": len(legs),
                 "n_available": sum(1 for l in legs if l["available"]),
+                "n_configured": sum(1 for l in legs if l.get("configured", True)),
+                "n_not_configured": sum(1 for l in legs if not l.get("configured", True)),
+                "n_degraded": sum(1 for l in legs
+                                  if l.get("configured", True) and not l["available"]),
                 "dynamic_weights": False,
                 "legs": legs,
             }
@@ -401,4 +408,98 @@ def test_ensemble_try_recover_reports_recovered_and_still_down():
     recovered2, still2 = ep.try_recover()
     assert recovered2 == []
     assert "always_down" in still2
+
+
+# --------------------------------------------------------------------------
+# 6) 可选腿未配置（文件缺失/未训练）≠ 降级，不报警
+# --------------------------------------------------------------------------
+class OptionalMissingSub(SubPredictor):
+    """模拟未训练的第四腿：optional=True 且主模型文件不存在。"""
+
+    name = "transformer"
+    optional = True
+    model_file = "__definitely_absent_model__.pt"   # 必不存在
+
+    def _ensure(self):
+        raise FileNotFoundError("transformer_best.pt 缺失")
+
+
+def test_optional_missing_leg_is_not_configured_not_degraded():
+    ep = EnsemblePredictor(FakePrimary())
+    ep.add_sub(FakeSub(90.0), weight=1.0)          # 核心可用
+    ep.add_sub(OptionalMissingSub(), weight=0.8)   # 可选、未配置
+    rep = ep.health_report()
+    assert rep["n_subs"] == 2
+    assert rep["n_available"] == 1
+    assert rep["n_degraded"] == 0                  # 未配置 ≠ 降级
+    assert rep["n_not_configured"] == 1
+    by = {l["name"]: l for l in rep["legs"]}
+    assert by["transformer"]["configured"] is False
+    assert by["transformer"]["optional"] is True
+    assert by["fake_xgboost"]["configured"] is True
+
+
+def test_optional_missing_leg_does_not_raise_degradation_alert():
+    """只有未配置的可选腿不可用 → 不算降级，alert 返回 None（不报警）。"""
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = True
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        fake = _fake_ep_with([
+            {"name": "alpha_xgboost", "available": True, "configured": True,
+             "optional": False, "reason": None, "weight": 1.0},
+            {"name": "transformer", "available": False, "configured": False,
+             "optional": True, "reason": "FileNotFoundError: transformer_best.pt",
+             "weight": 0.8},
+        ])
+        with patch.object(Predictor, "_get_ensemble", return_value=fake):
+            assert p.ensemble_degradation_alert() is None
+    finally:
+        app_config.ml.use_ensemble = old
+
+
+def test_optional_missing_leg_renders_not_configured_in_report():
+    """报告里未配置腿显示「⚪ 未配置」，不得出现「⚠️ 降级」。"""
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = True
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        fake = _fake_ep_with([
+            {"name": "alpha_xgboost", "available": True, "configured": True,
+             "optional": False, "reason": None, "weight": 1.0},
+            {"name": "transformer", "available": False, "configured": False,
+             "optional": True, "reason": "FileNotFoundError: transformer_best.pt",
+             "weight": 0.8},
+        ])
+        with patch.object(Predictor, "_get_ensemble", return_value=fake):
+            out = p.ensemble_report()
+        assert "⚪ 未配置" in out
+        assert "⚠️ 降级" not in out
+        assert "1/1" in out                       # n_available/n_configured
+        assert "另有 1 条可选腿未配置" in out
+    finally:
+        app_config.ml.use_ensemble = old
+
+
+def test_core_missing_leg_still_alerts():
+    """核心腿缺文件仍是真故障 → 必须报警（不能靠 optional 掩盖）。"""
+    old = app_config.ml.use_ensemble
+    app_config.ml.use_ensemble = True
+    try:
+        from src.models.predictor import Predictor
+        p = Predictor()
+        fake = _fake_ep_with([
+            {"name": "alpha_xgboost", "available": True, "configured": True,
+             "optional": False, "reason": None, "weight": 1.0},
+            {"name": "lstm", "available": False, "configured": True,
+             "optional": False, "reason": "FileNotFoundError: lstm_best.pt",
+             "weight": 0.8},
+        ])
+        with patch.object(Predictor, "_get_ensemble", return_value=fake):
+            alert = p.ensemble_degradation_alert()
+        assert alert is not None and "lstm" in alert
+    finally:
+        app_config.ml.use_ensemble = old
 

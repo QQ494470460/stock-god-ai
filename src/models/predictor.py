@@ -427,14 +427,20 @@ class Predictor:
         if ep is None:
             return "🧩 超级集成：未启用（ml.use_ensemble=False）"
         rep = ep.health_report()
+        _n_cfg = rep.get("n_configured", rep["n_subs"])
+        _n_nc = rep.get("n_not_configured", 0)
+        _suffix = f"，另有 {_n_nc} 条可选腿未配置" if _n_nc else ""
         lines = [
             "🧩 超级集成健康审计：",
-            f"  启用腿 {rep['n_available']}/{rep['n_subs']}"
-            f"（动态权重={'开' if rep['dynamic_weights'] else '关'}）",
+            f"  启用腿 {rep['n_available']}/{_n_cfg}"
+            f"（动态权重={'开' if rep['dynamic_weights'] else '关'}{_suffix}）",
         ]
         for leg in rep["legs"]:
             if leg["available"]:
                 st = "✅ 可用"
+            elif not leg.get("configured", True):
+                # 可选腿模型文件缺失（未训练）→ 「未配置」而非「降级」，不报警
+                st = "⚪ 未配置（可选腿，模型文件缺失，待训练）"
             else:
                 st = f"⚠️ 降级（原因：{leg['reason'] or '未知'}）"
             line = f"  · {leg['name']}：{st}（权重 {leg['weight']}）"
@@ -462,9 +468,11 @@ class Predictor:
         if ep is None:
             return None
         rep = ep.health_report()
+        # 只把「已配置但不可用」视为真降级；未配置的可选腿（未训练）不算故障。
         down = [
             (l["name"], l["reason"] or "未知原因")
-            for l in rep["legs"] if not l["available"]
+            for l in rep["legs"]
+            if not l["available"] and l.get("configured", True)
         ]
         if not down:
             return None
