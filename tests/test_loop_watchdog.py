@@ -234,3 +234,118 @@ def test_alive_no_ensemble_field_defaults_not_degraded(tmp_path):
     assert res["ensemble_degraded"] is False
     assert "降级" not in res["detail"]
     assert res["ensemble_alarm"] is None
+
+
+# ---------------------------------------------------------------- 持续降级升级告警
+def _write_ledger(path: Path, events):
+    """events: [(leg, available, ts_str), ...]，按顺序写入 JSONL。"""
+    lines = []
+    for leg, avail, ts in events:
+        lines.append(json.dumps({
+            "ts": ts, "leg": leg, "available": avail,
+            "reason": None if avail else "RuntimeError: x",
+        }, ensure_ascii=False))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _dg_paths(tmp_path: Path):
+    d = _paths(tmp_path)
+    d["degrade_ledger_path"] = tmp_path / "ensemble_health_log.jsonl"
+    d["degrade_state_path"] = tmp_path / ".watchdog_degrade_alert"
+    return d
+
+
+def test_persistent_degradation_escalates_to_error(tmp_path):
+    """某腿持续降级超阈值 → 升 ERROR（不再只是 WARN），并透出持续时长。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="⚠️ 超级集成有腿静默降级：\n  · lstm：x")
+    ts = (IN_WINDOW - timedelta(minutes=40)).isoformat(timespec="seconds")
+    _write_ledger(p["degrade_ledger_path"], [("lstm", False, ts)])
+    res = wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert res["escalated"] is True
+    assert res["persistent_legs"] == ["lstm"]
+    assert res["degraded_durations"]["lstm"] >= 2400
+    assert res["action"] == "none" and sp.calls == 0   # 进程活着，绝不重启
+    log = p["log_path"].read_text(encoding="utf-8")
+    assert "ERROR 超级集成腿持续降级" in log
+    assert "WARN 超级集成有腿静默降级" in log          # 原有 WARN 保留
+
+
+def test_short_degradation_not_escalated(tmp_path):
+    """降级时长未超阈值 → 不升级 ERROR（只保留 WARN）。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="⚠️ 超级集成有腿静默降级：\n  · lstm：x")
+    ts = (IN_WINDOW - timedelta(minutes=5)).isoformat(timespec="seconds")
+    _write_ledger(p["degrade_ledger_path"], [("lstm", False, ts)])
+    res = wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert res["escalated"] is False
+    assert res["persistent_legs"] == []
+    log = p["log_path"].read_text(encoding="utf-8")
+    assert "ERROR 超级集成腿持续降级" not in log
+
+
+def test_persistent_degradation_cooldown_dedupes(tmp_path):
+    """持续降级在冷却窗口内只升一次 ERROR，避免每 60s 刷屏。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="x")
+    ts = (IN_WINDOW - timedelta(minutes=40)).isoformat(timespec="seconds")
+    _write_ledger(p["degrade_ledger_path"], [("lstm", False, ts)])
+    r1 = wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert r1["escalated"] is True
+    # 冷却内（+120s，仍 < 30min 冷却）→ 不再升级
+    r2 = wd.check(now=IN_WINDOW + timedelta(seconds=120), spawn=sp, persist_sec=1800, **p)
+    assert r2["escalated"] is False
+    # 心跳未更新 → 用同一心跳即可（age 仍很小），但为稳妥刷新心跳
+    log = p["log_path"].read_text(encoding="utf-8")
+    assert log.count("ERROR 超级集成腿持续降级") == 1
+
+
+def test_no_ledger_no_escalation(tmp_path):
+    """有降级信号但无台账 → 无法判断时长，不升级（仅 WARN），绝不误报持续降级。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="x")
+    # 不写台账
+    res = wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert res["escalated"] is False
+    assert res["persistent_legs"] == []
+    assert "WARN 超级集成有腿静默降级" in p["log_path"].read_text(encoding="utf-8")
+
+
+def test_ledger_recovered_leg_not_counted(tmp_path):
+    """台账里最后一条是「恢复」的腿，不算持续降级。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True,
+             ensemble_alarm="x")
+    t_down = (IN_WINDOW - timedelta(minutes=60)).isoformat(timespec="seconds")
+    t_up = (IN_WINDOW - timedelta(minutes=10)).isoformat(timespec="seconds")
+    _write_ledger(p["degrade_ledger_path"],
+                  [("lstm", False, t_down), ("lstm", True, t_up)])
+    res = wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert res["escalated"] is False
+    assert "lstm" not in (res["degraded_durations"] or {})
+
+
+def test_recovery_clears_degrade_alert_state(tmp_path):
+    """恢复后清掉持续降级告警冷却，下一次事故能立刻升级。"""
+    sp = _Spawn()
+    p = _dg_paths(tmp_path)
+    # 先持续降级 → 写 dg_state
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW, ensemble_degraded=True, ensemble_alarm="x")
+    ts = (IN_WINDOW - timedelta(minutes=40)).isoformat(timespec="seconds")
+    _write_ledger(p["degrade_ledger_path"], [("lstm", False, ts)])
+    wd.check(now=IN_WINDOW, spawn=sp, persist_sec=1800, **p)
+    assert p["degrade_state_path"].exists()
+    # 恢复（未降级）→ 清 dg_state
+    _hb_full(tmp_path, age_sec=30, now=IN_WINDOW + timedelta(seconds=60),
+             ensemble_degraded=False)
+    wd.check(now=IN_WINDOW + timedelta(seconds=60), spawn=sp, persist_sec=1800, **p)
+    assert not p["degrade_state_path"].exists()

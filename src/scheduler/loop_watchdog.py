@@ -37,6 +37,8 @@ from typing import Callable, Optional
 # ---------------------------------------------------------------- 常量
 STALE_SEC = 240.0          # 心跳超过 4 分钟没更新 = 闭环没在转（它 30s 写一次）
 COOLDOWN_SEC = 600.0       # 两次"拉起启动器"之间至少间隔 10 分钟
+PERSIST_DEGRADE_SEC = 1800.0        # 某腿持续降级超 30 分钟 = 升级 ERROR（不再只是 WARN）
+DEGRADE_ALERT_COOLDOWN_SEC = 1800.0  # 持续降级 ERROR 至多每 30 分钟报一次，避免刷屏
 WINDOW_START = dtime(9, 15)
 WINDOW_END = dtime(15, 10)  # 收盘 15:00 后留 10 分钟给结算 tick
 
@@ -93,6 +95,44 @@ def _read_heartbeat_dict(path: Path) -> dict:
     """读完整心跳字典；缺失/损坏返回空 dict（降级信号缺省=未降级）。"""
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _ledger_down_durations(now: datetime, log_file: Optional[Path] = None) -> dict:
+    """从健康台账读「当前仍降级的腿 → 已持续降级秒数」。
+
+    台账每条是腿可用性翻转事件；某腿**最后一条**事件为 ``available=False`` 即「当前
+    仍在降级」，持续时长 = now - 该事件 ts。文件缺失 / 坏行 / 无台账 → 返回 ``{}``
+    （绝不误报）。看门狗是独立进程，故直接读 JSONL，不 import 重的 ensemble 模块。
+    """
+    p = Path(log_file) if log_file else (_data_dir() / "ensemble_health_log.jsonl")
+    try:
+        if not p.exists():
+            return {}
+        last = {}
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:  # noqa: BLE001 坏行跳过
+                continue
+            leg = ev.get("leg")
+            if not leg:
+                continue
+            last[leg] = (bool(ev.get("available")), ev.get("ts"))
+        out = {}
+        for leg, (avail, ts) in last.items():
+            if avail:
+                continue
+            try:
+                t0 = datetime.fromisoformat(str(ts))
+            except Exception:  # noqa: BLE001 时间戳坏了跳过
+                continue
+            out[leg] = max(0.0, (now - t0).total_seconds())
+        return out
     except Exception:  # noqa: BLE001
         return {}
 
@@ -173,15 +213,23 @@ def check(
     restart: bool = True,
     spawn: Optional[Callable[[], bool]] = None,
     window: Optional[bool] = None,
+    persist_sec: float = PERSIST_DEGRADE_SEC,
+    degrade_cooldown_sec: float = DEGRADE_ALERT_COOLDOWN_SEC,
+    degrade_state_path: Optional[Path] = None,
+    degrade_ledger_path: Optional[Path] = None,
 ) -> dict:
     """做一次存活检查。返回可序列化的结果字典（便于日志/自检/测试断言）。
 
     ``window`` 显式给定时不看时间（测试用）；否则自动判定是否在监控时段内。
+    ``persist_sec`` / ``degrade_cooldown_sec`` / ``degrade_state_path`` /
+    ``degrade_ledger_path`` 控制「持续降级升级告警」，均可注入（测试用）。
     """
     cur = now or datetime.now()
     hb = Path(heartbeat_path) if heartbeat_path else _hb_path()
     st = Path(state_path) if state_path else _state_path()
     lg = Path(log_path) if log_path else None
+    dg_state = (Path(degrade_state_path) if degrade_state_path
+                else (_data_dir() / ".watchdog_degrade_alert"))
 
     age = heartbeat_age_sec(hb, cur)
     ok = age is not None and age <= stale_sec
@@ -201,6 +249,9 @@ def check(
         "detail": "",
         "ensemble_degraded": degraded,
         "ensemble_alarm": _hb_dict.get("ensemble_alarm") or None,
+        "degraded_durations": {},
+        "persistent_legs": [],
+        "escalated": False,
     }
 
     if ok:
@@ -219,6 +270,29 @@ def check(
                 logger.warning("🩺 闭环看门狗：超级集成有腿静默降级（进程存活，仅集成降级）")
             except Exception:  # noqa: BLE001
                 pass
+            # 持续降级升级告警：读台账算各腿已降级多久，超 persist_sec 则 ERROR，
+            # 并按 degrade_cooldown_sec 去重（避免持续故障时每 60s 刷一条 ERROR）。
+            down = _ledger_down_durations(cur, degrade_ledger_path)
+            if down:
+                result["degraded_durations"] = {k: round(v, 1) for k, v in down.items()}
+            persistent = {k: v for k, v in down.items() if v >= persist_sec}
+            if persistent:
+                result["persistent_legs"] = sorted(persistent)
+                last_dg = _read_last_attempt(dg_state)
+                if last_dg is None or (cur - last_dg).total_seconds() >= degrade_cooldown_sec:
+                    _write_last_attempt(dg_state, cur)
+                    _msgs = "、".join(f"{k}（{v / 60:.0f} 分钟）" for k, v in persistent.items())
+                    result["escalated"] = True
+                    _append_log(
+                        f"ERROR 超级集成腿持续降级超 {persist_sec / 60:.0f} 分钟: {_msgs}", lg)
+                    try:
+                        from loguru import logger
+                        logger.error(f"🩺 闭环看门狗：超级集成腿持续降级 {_msgs}")
+                    except Exception:  # noqa: BLE001
+                        pass
+        else:
+            # 恢复：清掉持续降级告警冷却记录，让下一次事故能立刻升级。
+            _clear_last_attempt(dg_state)
         return result
 
     if not active:
