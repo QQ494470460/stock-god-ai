@@ -139,6 +139,8 @@ class Predictor:
 
         # 超级集成（懒加载；use_ensemble 开启且有可用子模型时才生效）
         self._ensemble = None
+        # 最近一次批量预测的全截面评分快照（信号强度诊断用；纯观测）
+        self.last_batch_scores: Optional[Dict[str, Any]] = None
 
         # 行业映射缓存（predict_batch 做截面中性化时懒取一次，避免每次打接口/读盘）
         self._industry_map_cache: Optional[Dict[str, str]] = None
@@ -608,11 +610,16 @@ class Predictor:
         code: str = "000000",
         name: str = "未知",
         apply_ensemble: bool = False,
+        feats: Optional[pd.DataFrame] = None,
     ) -> StockPrediction:
         """对单只股票进行预测。
 
         ``apply_ensemble=True`` 时走超级集成融合（与选股批量共用
         ``EnsemblePredictor.blend_one``，口径一致）。
+
+        ``feats``：可选的**预计算特征矩阵**（``build_features`` 去掉 close 列之后）。
+        批量选股时由 ``EnsemblePredictor.predict_batch`` 统一算一次，主模型与各条腿
+        共用 —— 原先主模型和各腿各算一遍，425 只白烧 52 秒。传 None 时行为不变。
 
         默认 **False** 是刻意的：``EnsemblePredictor.predict_batch`` 内部就是
         调本方法再做 blend，若这里默认 True 会**双重融合**。故只有「直接面向
@@ -622,10 +629,13 @@ class Predictor:
         if not self.is_ready:
             raise RuntimeError("模型未加载，请先训练模型")
         
-        # 构建特征
-        features = feature_engine.build_features(df)
-        if "close" in features.columns:
-            features = features.drop(columns=["close"])
+        # 构建特征（批量路径可传入已算好的矩阵，避免同一份 df 重复计算）
+        if feats is not None:
+            features = feats
+        else:
+            features = feature_engine.build_features(df)
+            if "close" in features.columns:
+                features = features.drop(columns=["close"])
         
         # 取最新一条
         latest_features = features.iloc[-1:].fillna(0)
@@ -986,7 +996,23 @@ class Predictor:
 
         # 按评分排序
         predictions.sort(key=lambda x: x.score, reverse=True)
-        
+
+        # 全截面评分快照（供「信号强度」诊断读取）。
+        # 只存纯数值、只增一个属性，不参与任何排序 / 过滤决策 —— 零行为改变。
+        # 为什么存全截面而不是只存 Top-N：区分度（标准差）与达标率必须用
+        # 整个横截面算，只看 Top40 会把"模型整体塌陷"误判成"今天没选出好票"。
+        try:
+            self.last_batch_scores = {
+                "n": len(predictions),
+                "scores": [float(p.score) for p in predictions],
+                "prob_up": [float(getattr(p, "prob_up", 0.0) or 0.0) for p in predictions],
+                "prob_down": [float(getattr(p, "prob_down", 0.0) or 0.0) for p in predictions],
+                "as_of": datetime.now().isoformat(timespec="seconds"),
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"信号强度快照记录失败（不影响推荐）: {e}")
+            self.last_batch_scores = None
+
         logger.info(f"批量预测完成: {len(predictions)} 只股票")
         return predictions
     

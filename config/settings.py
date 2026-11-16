@@ -363,6 +363,12 @@ class SchedulerConfig:
     # 截断到 2.5 以下，回测收益吃不满。截断仍由 trading_loop.max_positions=8 负责，
     # 这里只是把候选池加宽，不改变实际持仓只数。
     pick_pool: str = "zz500"
+    # 「宁缺毋滥」：只买严格达标的票，不做排名补足。**默认关**（保持与回测一致的
+    # 分散度 —— 达标不足时按排名补满 target_n）。
+    # 打开后：达标几只就买几只，0 只就空仓等信号。适用于"模型区分度已经塌了、
+    # 不想拿硬币结果建仓"的场合（信号强度见 report['signal_strength'] 与
+    # data/signal_strength_history.jsonl；2026-11-13 实测达标 0 只、σ 1.38）。
+    require_strict_pass: bool = False
     # 多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票后
     # 「集体看空则剔除、一致看多则加权」。默认关，需显式开启；
     # 开关持久化在 config/scheduler_state.json（与 enabled 一起）。

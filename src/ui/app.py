@@ -972,7 +972,7 @@ def _today_status_data() -> dict:
     """汇总首屏运营快照。全部读本地文件，TTL 60 秒。"""
     root = Path(__file__).parent.parent.parent
     out: dict = {"plan": None, "acct": None, "loop": None,
-                 "pred": None, "ic": None}
+                 "pred": None, "ic": None, "signal": None}
 
     # --- 交易计划：取 plan_date 最大的一份（通常是"下一个交易日"） ---
     try:
@@ -1053,6 +1053,29 @@ def _today_status_data() -> dict:
         out["ic"] = {"mean_ic": ic.get("mean_ic"), "ir": ic.get("ir_mean_std"),
                      "last": ic.get("last_date"), "n": ic.get("total")}
 
+    # --- 最近一次选股的「信号强度」（质量诊断：区分度/达标率） ---
+    out["signal"] = None
+    try:
+        reps = sorted((root / "data" / "daily_reports").glob("daily_picks_*.json"))
+        for f in reversed(reps[-6:]):
+            r = _status_read_json(f) or {}
+            ss = r.get("signal_strength")
+            if isinstance(ss, dict) and ss.get("level") not in (None, "unknown"):
+                out["signal"] = {
+                    "level": ss.get("level"),
+                    "level_cn": ss.get("level_cn") or "",
+                    "strength": ss.get("strength"),
+                    "dispersion": ss.get("dispersion"),
+                    "strict_pass": ss.get("strict_pass"),
+                    "note": ss.get("note") or "",
+                    "trend": ss.get("trend") or "",
+                    "trend_note": ss.get("trend_note") or "",
+                    "generated_at": str(r.get("generated_at") or "")[:16],
+                }
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
     return out
 
 
@@ -1122,6 +1145,16 @@ def render_today_status() -> None:
             "tone": "up" if float(ic["mean_ic"]) > 0 else "down",
         })
 
+    if d.get("signal"):
+        sg = d["signal"]
+        cards.append({
+            "label": "📶 信号强度",
+            "value": f"{sg.get('level_cn') or '—'}"
+                     + (f" {sg['strength']:.0f}" if isinstance(sg.get("strength"), (int, float)) else ""),
+            "sub": f"区分度 σ{sg.get('dispersion')} · 达标 {sg.get('strict_pass')} 只",
+            "tone": {"strong": "up", "ok": "plain", "weak": "warn"}.get(sg.get("level"), "down"),
+        })
+
     if cards:
         kpi_row(cards)
 
@@ -1146,6 +1179,36 @@ def render_today_status() -> None:
             f'{alarm_html}</div>',
             unsafe_allow_html=True,
         )
+
+    # 选股信号强度：模型"有没有边际"必须比"选了几只"更显眼。
+    # 11-13 实测：达标 0 只、截面 σ 1.38，系统仍补满 8 只 —— 用户看到的
+    # 是"AI 给了 8 只票"，看不到"这 8 只票接近随机"。这一行就是补上那句话。
+    _sig_banner = _signal_strength_banner(d.get("signal"))
+    if _sig_banner:
+        st.markdown(_sig_banner, unsafe_allow_html=True)
+
+
+def _signal_strength_banner(sg: dict) -> str | None:
+    """把「今日信号强度」渲染成警示 HTML；信号健康时返回 None。
+
+    抽成纯函数是为了可测：横幅文案是用户判断"今天该不该按推荐建仓"的唯一依据，
+    埋在 render_today_status 里就只能靠肉眼看。
+    """
+    if not isinstance(sg, dict) or sg.get("level") not in ("none", "weak"):
+        return None
+    head = "⚠️ 今日选股基本无信号" if sg.get("level") == "none" else "⚠️ 今日选股信号偏弱"
+    bits = [str(sg.get("note") or "").strip()]
+    if sg.get("trend") == "decaying" and sg.get("trend_note"):
+        bits.append(str(sg["trend_note"]))
+    detail = "<br>".join(b for b in bits if b)
+    return (
+        f'<div class="notice warn">{head}'
+        f'（{sg.get("generated_at") or "—"} 那次选股 · 区分度 σ{sg.get("dispersion")}'
+        f' · 达标 {sg.get("strict_pass")} 只）：<br>{detail}<br>'
+        f'<span class="text-sub">推荐由排名补足而来，并非达标信号；'
+        f'如需"只买达标票"，把 config 里 scheduler.require_strict_pass 设为 true。</span>'
+        f'</div>'
+    )
 
 
 # ========== 页面配置 ==========

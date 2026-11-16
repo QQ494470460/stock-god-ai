@@ -59,6 +59,9 @@ class SubPredictor:
     # 应视为「未配置」而非「故障降级」——不该每 tick 报警。核心腿（alpha/lstm）
     # optional=False，缺文件属真故障，必须告警。
     optional: bool = False
+    # 该腿是否吃技术特征矩阵（feature_engine.build_features）。批量预测时据此
+    # 决定「要不要为这只股票预先算一次共享特征」——LLM 腿不读特征，别为它白算。
+    needs_features: bool = True
     model_file: Optional[str] = None   # 相对 MODEL_DIR 的主模型文件名（判「是否已配置」）
 
     @property
@@ -121,8 +124,20 @@ class SubPredictor:
         self._recover_at = now + timedelta(seconds=backoff)
         return False
 
-    def score_for(self, df: pd.DataFrame, code: str) -> Optional[float]:
-        """返回该股票的 0~100 评分；失败/不可用返回 None。"""
+    def score_for(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        feats: Optional[pd.DataFrame] = None,
+    ) -> Optional[float]:
+        """返回该股票的 0~100 评分；失败/不可用返回 None。
+
+        ``feats`` 为**可选的预计算特征矩阵**（``feature_engine.build_features(df)``
+        去掉 close 列之后的结果）。批量预测时由 :meth:`EnsemblePredictor.predict_batch`
+        统一算一次、各腿共用 —— 三条腿原本各算一遍，同一份 df 被重复
+        ``build_features`` 2~3 次（实测每只 86ms，425 只即白烧 37~73 秒）。
+        传 ``None`` 时行为与历史完全一致（腿内自己算）。
+        """
         if not self.available:
             return None
         try:
@@ -131,8 +146,47 @@ class SubPredictor:
             logger.debug(f"[{self.name}] 评分失败 {code}: {e}")
             return None
 
-    def _score(self, df: pd.DataFrame, code: str) -> float:
+    def score_with(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        feats: Optional[pd.DataFrame] = None,
+    ) -> Optional[float]:
+        """带共享特征的评分入口：优先走 ``_score(..., feats=)``，老签名自动降级。
+
+        与 :meth:`score_for` 的区别只在"能不能吃预计算特征"，异常语义完全一致。
+        """
+        if not self.available:
+            return None
+        try:
+            return self._score(df, code, feats=feats)
+        except TypeError:
+            try:
+                return self._score(df, code)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[{self.name}] 评分失败 {code}: {e}")
+                return None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{self.name}] 评分失败 {code}: {e}")
+            return None
+
+    def _score(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        feats: Optional[pd.DataFrame] = None,
+    ) -> float:
         raise NotImplementedError
+
+    @staticmethod
+    def _resolve_feats(df: pd.DataFrame, feats: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """统一取特征：有预计算的就用，没有就现算（并去掉 close 列）。"""
+        if feats is not None:
+            return feats
+        f = feature_engine.build_features(df)
+        if "close" in f.columns:
+            f = f.drop(columns=["close"])
+        return f
 
 
 def _proba_to_score(proba: np.ndarray, classes) -> float:
@@ -194,6 +248,34 @@ class AlphaSubPredictor(SubPredictor):
         self._ref_cols = [c for c in self._cols if not c.startswith("alpha_")]
         self._classes = list(self._le.classes_)
 
+    def _panel(self, path: Path) -> Optional[pd.DataFrame]:
+        """读取 alpha 面板 parquet，**进程内只读一次**（按 mtime 失效）。
+
+        为什么必须缓存（2026-11-16 实测）
+        --------------------------------
+        ``_alpha_for_code`` 原先对**每只股票**都把 3 个 alpha 面板整份 read_parquet
+        一遍：``alpha_margin`` 2.5MB × 3 列 × 425 只 ⇒ 实测 366ms/只、单次选股
+        **205 秒**，而三个面板加起来才 2.9MB。这是"AI 选股很慢"的最大单一来源，
+        比特征工程（52s）和数据拉取（118s）加起来还多。
+
+        缓存键带 mtime：面板被重新回填后自动失效，不会喂旧数据给模型。
+        """
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        cache = getattr(self, "_panel_cache", None)
+        if cache is None:
+            cache = {}
+            self._panel_cache = cache
+        key = str(path)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        df = pd.read_parquet(path)
+        cache[key] = (mtime, df)
+        return df
+
     def _alpha_for_code(self, code: str, index: pd.DatetimeIndex) -> pd.DataFrame:
         """从本地 alpha parquet 缓存读取该 code 的 alpha 列，对齐到 index。"""
         if not self._alpha_cols:
@@ -202,10 +284,10 @@ class AlphaSubPredictor(SubPredictor):
         for col in self._alpha_cols:
             name = col[len("alpha_"):]
             p = DATA_DIR / f"alpha_{name}.parquet"
-            if not p.exists():
+            panel = self._panel(p) if p.exists() else None
+            if panel is None:
                 frames.append(pd.DataFrame({col: np.nan}, index=index))
                 continue
-            panel = pd.read_parquet(p)
             if code in panel.columns:
                 s = panel[code]
             else:
@@ -214,10 +296,9 @@ class AlphaSubPredictor(SubPredictor):
             frames.append(pd.DataFrame({col: s.values}, index=index))
         return pd.concat(frames, axis=1) if frames else pd.DataFrame(index=index)
 
-    def _score(self, df: pd.DataFrame, code: str) -> float:
-        feats = feature_engine.build_features(df)
-        if "close" in feats.columns:
-            feats = feats.drop(columns=["close"])
+    def _score(self, df: pd.DataFrame, code: str,
+               feats: Optional[pd.DataFrame] = None) -> float:
+        feats = self._resolve_feats(df, feats)
         latest = feats.iloc[-1:]
         if self._alpha_cols:
             if _ALPHA_LAG > 0:
@@ -267,10 +348,9 @@ class LSTMSubPredictor(SubPredictor):
         self._seq_len: int = ckpt.get("sequence_length", params["sequence_length"])
         self._classes = meta.get("classes", [-1, 0, 1])
 
-    def _score(self, df: pd.DataFrame, code: str) -> float:
-        feats = feature_engine.build_features(df)
-        if "close" in feats.columns:
-            feats = feats.drop(columns=["close"])
+    def _score(self, df: pd.DataFrame, code: str,
+               feats: Optional[pd.DataFrame] = None) -> float:
+        feats = self._resolve_feats(df, feats)
         win = feats.reindex(columns=self._feature_cols, fill_value=0.0).fillna(0.0)
         if len(win) < self._seq_len:
             raise RuntimeError(f"样本不足 {self._seq_len} 日")
@@ -315,10 +395,9 @@ class TransformerSubPredictor(SubPredictor):
         self._seq_len: int = ckpt.get("sequence_length", params["sequence_length"])
         self._classes = meta.get("classes", [-1, 0, 1])
 
-    def _score(self, df: pd.DataFrame, code: str) -> float:
-        feats = feature_engine.build_features(df)
-        if "close" in feats.columns:
-            feats = feats.drop(columns=["close"])
+    def _score(self, df: pd.DataFrame, code: str,
+               feats: Optional[pd.DataFrame] = None) -> float:
+        feats = self._resolve_feats(df, feats)
         win = feats.reindex(columns=self._feature_cols, fill_value=0.0).fillna(0.0)
         if len(win) < self._seq_len:
             raise RuntimeError(f"样本不足 {self._seq_len} 日")
@@ -335,7 +414,6 @@ class TransformerSubPredictor(SubPredictor):
 # ---------------------------------------------------------------------------
 class LLMAlphaSubPredictor(SubPredictor):
     """把 LLM 对「个股近期新闻/公告」的定性判断转成 0~100 的另类 alpha 评分。
-
     设计原则（与覆盖层 LLM overlay 严格区分）：
       · 这是**超级集成的一条腿**，与其他腿（XGBoost/Alpha/LSTM/Transformer）加权融合；
         而覆盖层（_apply_llm_overlay）是对主模型 score 做**加性微调**，两者独立。
@@ -352,6 +430,7 @@ class LLMAlphaSubPredictor(SubPredictor):
 
     name = "llm_alpha"
     optional = True   # 第五腿：可选（仅启用时装配）
+    needs_features = False   # 只吃 LLM 结论，不读技术特征矩阵
 
     def __init__(self, provider=None, lookback_days=None):
         # 仅供单测注入：真实路径由 _ensure 按 config 构造，不暴露构造参数。
@@ -402,7 +481,9 @@ class LLMAlphaSubPredictor(SubPredictor):
         self._provider = provider
         self._lookback = lookback
 
-    def _score(self, df: pd.DataFrame, code: str) -> float:
+    def _score(self, df: pd.DataFrame, code: str,
+               feats: Optional[pd.DataFrame] = None) -> float:
+        # 本腿只吃 LLM 结论，不需要技术特征矩阵（feats 参数只为统一签名，直接忽略）
         idx = df.index
         if not isinstance(idx, pd.DatetimeIndex):
             idx = pd.to_datetime(idx)
@@ -513,7 +594,8 @@ class EnsemblePredictor:
             logger.warning(f"动态融合：权重派生失败，回退静态权重: {e}")
             return None
 
-    def blend_one(self, pred, df: pd.DataFrame, code: str) -> bool:
+    def blend_one(self, pred, df: pd.DataFrame, code: str,
+                  feats: Optional[pd.DataFrame] = None) -> bool:
         """把子模型评分融合进「单只股票」的 pred（就地改 score/agreement/ensemble_detail）。
 
         **predict_batch 与 Predictor.predict_single 共用这一条路径**，保证
@@ -522,6 +604,9 @@ class EnsemblePredictor:
 
         返回是否真的发生了融合。任一腿缺失 / 评分失败都保留原单模型分
         （model_mode 仍为 "single"），绝不拖垮调用方。
+
+        ``feats``：本只股票已算好的特征矩阵（可选）。批量路径传入后，三条腿
+        共用同一份结果，而不是各算一遍。
         """
         avail = self._available_subs()
         if not avail:
@@ -543,7 +628,7 @@ class EnsemblePredictor:
         sub_weights = [1.0]
         used_names = ["xgboost"]
         for (sub, _), ew in zip(avail, eff_ws):
-            sc = sub.score_for(df, code)
+            sc = self._sub_score(sub, df, code, feats)
             if sc is not None:
                 sub_scores.append(sc)
                 sub_weights.append(ew)
@@ -567,18 +652,58 @@ class EnsemblePredictor:
         pred.model_mode = "ensemble"
         return True
 
+    @staticmethod
+    def _sub_score(sub, df: pd.DataFrame, code: str,
+                   feats: Optional[pd.DataFrame] = None) -> Optional[float]:
+        """调一条腿的评分：有 ``score_with`` 就走它，老的鸭子类型桩退回 ``score_for``。
+
+        测试里有大量只实现 ``score_for(df, code)`` 的假腿，不能用 isinstance 硬判；
+        用 hasattr 探测既兼容又不引入耦合。
+        """
+        try:
+            fn = getattr(sub, "score_with", None)
+            if callable(fn):
+                return fn(df, code, feats)
+            return sub.score_for(df, code)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{getattr(sub, 'name', '?')}] 评分异常 {code}: {e}")
+            return None
+
     def predict_batch(self, stock_data: Dict[str, pd.DataFrame]) -> Dict[str, object]:
-        """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。"""
+        """对一批股票做预测，返回 {code: StockPrediction}（score 为融合值）。
+
+        **特征只算一次**：原先三条腿各自 ``build_features(df)``，同一只股票被重复
+        计算 2~3 遍（实测 86ms/次，425 只 = 白烧 37~73 秒）。这里在循环内算一次
+        并传给 ``blend_one``，算完即释放（内存只多留一只股票的矩阵，
+        不像整批缓存那样会吃掉 1GB）。
+        """
         results: Dict[str, object] = {}
+        avail = self._available_subs()
+        need_feats = bool(avail) and any(
+            getattr(s, "needs_features", True) for s, _ in avail)
         for code, df in stock_data.items():
+            feats = None
+            # 先算特征、再给主模型和各腿共用（主模型 predict_single 原本也自己算一遍）
+            try:
+                feats = SubPredictor._resolve_feats(df, None)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"共享特征构建失败 {code}（各处各自回退现算）: {e}")
+                feats = None
             try:
                 # apply_ensemble 默认 False：融合统一由下面的 blend_one 做，
                 # 避免「predict_single 内部再融一次」的双重加权。
-                pred = self.primary.predict_single(df, code=code)
+                pred = self.primary.predict_single(df, code=code, feats=feats)
+            except TypeError:
+                # 老签名 primary（测试桩 / 历史实现）不吃 feats
+                try:
+                    pred = self.primary.predict_single(df, code=code)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"主模型预测失败 {code}: {e}")
+                    continue
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"主模型预测失败 {code}: {e}")
                 continue
-            self.blend_one(pred, df, code)
+            self.blend_one(pred, df, code, feats=feats if need_feats else None)
             results[code] = pred
         return results
 

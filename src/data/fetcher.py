@@ -228,7 +228,44 @@ class DataFetcher:
         # 负缓存：确认拉不到数据的代码（部分科创板 CDR、已退市），
         # 避免每次扫描重复走网络 + 重试，白等十几秒
         self._fail_codes: set = set()
+        # 限速状态：最近一次真正发起网络请求的单调时钟时间（见 _throttle）
+        self._last_net_ts: float = 0.0
         logger.info("DataFetcher initialized")
+
+    def _throttle(self, interval: float) -> float:
+        """按「最小请求间隔」限速：只补足差额，而不是无条件 sleep 固定秒数。
+
+        为什么改（2026-11-16 实测）
+        --------------------------
+        旧实现是 ``time.sleep(rate_limit)`` **再加**发起请求，单只真实周期 =
+        1.5s 睡眠 + 1.5~2.4s 网络 ≈ 3.0~3.9s。425 只 / 8 进程 ⇒ 光"睡"就烧掉
+        ~80 秒，而 ``data.rate_limit`` 配置项的语义本来就是"请求间隔秒数"，
+        不是"请求前先固定睡这么久"。
+
+        改成最小间隔后，只要网络本身耗时 ≥ 间隔就不再睡；单只周期回落到
+        ~1.9s，同样 425 只约省 60~80 秒。**对数据源的实际压力上限不变**
+        （仍是"同一进程内两次请求至少间隔 interval 秒"），只是不再叠加等待。
+
+        Args:
+            interval: 最小间隔秒数；<=0 表示不限速。
+
+        Returns:
+            实际睡眠的秒数（便于测试断言与耗时统计）。
+        """
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = 0.0
+        if interval <= 0:
+            self._last_net_ts = time.monotonic()
+            return 0.0
+        now = time.monotonic()
+        last = float(getattr(self, "_last_net_ts", 0.0) or 0.0)
+        wait = interval - (now - last) if last > 0 else 0.0
+        if wait > 0:
+            time.sleep(wait)
+        self._last_net_ts = time.monotonic()
+        return max(0.0, wait)
     
     def _merge_into_cache(self, cache_file: Path, new_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -518,8 +555,8 @@ class DataFetcher:
         last_err = None
         for attempt in range(max_retries):
             try:
-                wait = app_config.data.rate_limit * (attempt + 1)
-                time.sleep(wait)  # 限速
+                # 限速按「最小间隔」补差（重试轮次间隔按 attempt 递增，语义不变）
+                self._throttle(app_config.data.rate_limit * (attempt + 1))
                 logger.debug(f"获取 {code} 日线数据... (尝试 {attempt+1}/{max_retries})")
 
                 # 主源新浪，失败回退同花顺。

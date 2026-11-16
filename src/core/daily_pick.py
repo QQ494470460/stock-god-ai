@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,13 @@ from src.data.fetcher import fetcher
 from src.models.predictor import predictor
 from src.models.evolution import evolution
 from src.models.evolution import THRESHOLD_MIN as _SCORE_FLOOR
+from src.core.signal_strength import (
+    compute_signal_strength,
+    format_signal_strength,
+    record_signal_history,
+    signal_strength_alert,
+    signal_trend,
+)
 
 
 # 大盘状态 → 中文语境（与 evolution.detect_regime 返回值对齐）
@@ -153,6 +161,7 @@ def _apply_score_threshold(
     min_score: float,
     target_n: int,
     report: Optional[Dict[str, Any]] = None,
+    allow_fill: bool = True,
 ) -> pd.DataFrame:
     """按「过关优先 + 排名补足」筛选候选，而不是用绝对门槛一票否决。
 
@@ -174,6 +183,10 @@ def _apply_score_threshold(
         df: 按评分降序的完整榜单（应按 ``max(max_picks, target_n)`` 宽取）
         min_score: 当前生效阈值（基线 + 进化 + 市场状态）
         target_n: 目标持仓只数（``trading_loop.max_positions``）
+        report: 结构化报告（就地写入 n_passed_strict / n_filled / fill_note）
+        allow_fill: 是否允许「排名补足」。默认 True（与回测口径一致）。
+            设为 False 即「宁缺毋滥」：达标几只就是几只，0 只就空仓 —— 由
+            ``scheduler.require_strict_pass`` 显式开启，绝不悄悄改默认行为。
 
     Returns:
         过滤后的 DataFrame，仍为评分降序；不足目标数时返回尽可能多的票。
@@ -189,6 +202,18 @@ def _apply_score_threshold(
     n_pass = len(passed)
     if report is not None:
         report["n_passed_strict"] = int(n_pass)
+        report["fill_allowed"] = bool(allow_fill)
+
+    if not allow_fill:
+        if report is not None:
+            report["n_filled"] = 0
+            report["fill_note"] = (
+                f"宁缺毋滥（require_strict_pass=True）：仅保留达标 {n_pass} 只，"
+                f"不做排名补足（目标 {int(target_n)} 只）"
+            )
+            if n_pass < int(target_n):
+                logger.warning(report["fill_note"])
+        return passed
 
     need = int(target_n) - n_pass
     if need <= 0:
@@ -294,13 +319,18 @@ def generate_daily_picks(
         "status": "ok",
         "error": None,
     }
+    # 阶段耗时（秒）：把"选股为什么慢"从猜测变成可核对的数字
+    timing: Dict[str, float] = {}
+    _t_all = time.perf_counter()
 
     try:
         codes = fet.get_stock_pool(pool)
         report["n_scanned"] = len(codes)
 
         # 拉取行情（会顺带刷新本地缓存）
+        _t0 = time.perf_counter()
         raw = fet.get_batch_daily_kline(codes, max_workers=8)
+        timing["fetch_kline"] = round(time.perf_counter() - _t0, 1)
         stock_data = {
             c: df for c, df in raw.items()
             if df is not None and len(df) >= 60
@@ -328,14 +358,43 @@ def generate_daily_picks(
         _target_n = int(getattr(app_config.trading_loop, "max_positions", 8) or 8)
         _slack = float(getattr(app_config.trading_loop, "hold_rank_slack", 1.0) or 1.0)
         _wide_n = max(int(max_picks), _target_n, int(round(_target_n * max(_slack, 1.0))))
+        _t0 = time.perf_counter()
         df_wide = pred.get_top_recommendations(
             stock_data, stock_names, top_n=_wide_n, min_score=0.0
         )
+        timing["score_all"] = round(time.perf_counter() - _t0, 1)
         # 完整榜单落进报告：交易计划的排名表用它，而不是用「筛过门槛的 picks」。
         # 两者不是一回事 —— picks 是**今天要买什么**，ranking 是**模型怎么看全市场**，
         # 「老持仓该不该留」问的是后者。
         report["ranking"] = _ranking_of(df_wide)
-        df = _apply_score_threshold(df_wide, float(min_score), _target_n, report)
+
+        # 信号强度诊断（纯观测）：回答"今天这套推荐到底还有没有统计边际"。
+        # 用**全截面**评分算区分度与达标率，而不是只用 Top40 —— 否则
+        # "模型整体塌陷"会被误读成"今天没选出好票"。失败不影响选股。
+        _signal = None
+        try:
+            _signal = compute_signal_strength(
+                getattr(pred, "last_batch_scores", None), float(min_score), _target_n)
+            _as_of = datetime.now().strftime("%Y-%m-%d")
+            _signal["date"] = _as_of       # 供趋势比对时排除"今天这条自己"
+            _trend = signal_trend(_signal)
+            _signal["trend"] = _trend.get("state")
+            _signal["trend_note"] = _trend.get("note")
+            report["signal_strength"] = _signal
+            report["signal_trend"] = _trend
+            record_signal_history(_signal, as_of=_as_of)
+            logger.info(format_signal_strength(_signal, _trend))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"信号强度诊断失败（不影响推荐）: {e}")
+
+        # 「宁缺毋滥」闸门（默认关）：开启后不再按排名补足，只买严格达标的票。
+        # 11-13 那种「达标 0 只仍补满 8 只」的局面下，它会让组合空仓等信号 ——
+        # 是"质量优先"的显式选择，而不是偷偷改默认行为。
+        _allow_fill = not bool(getattr(app_config.scheduler, "require_strict_pass", False))
+        if not _allow_fill:
+            logger.info("选股闸门：require_strict_pass=True，本次不做排名补足（只买达标票）")
+        df = _apply_score_threshold(df_wide, float(min_score), _target_n, report,
+                                    allow_fill=_allow_fill)
 
         # 参考价：把推荐时点的最新收盘价带进 picks，供交易计划 / 执行侧做
         # 「跳空太多就不追」这类校验。早期没有这一步，计划里 price 恒为 0.0，
@@ -405,6 +464,17 @@ def generate_daily_picks(
         except Exception as e:  # noqa: BLE001
             logger.debug(f"超级集成健康审计失败（不影响推荐）: {e}")
 
+        # 耗时拆解：直接回答"选股为什么慢"，也让优化前后的收益可核对
+        timing["total"] = round(time.perf_counter() - _t_all, 1)
+        timing["other"] = round(max(0.0, timing["total"]
+                                    - timing.get("fetch_kline", 0.0)
+                                    - timing.get("score_all", 0.0)), 1)
+        report["timing"] = timing
+        logger.info(
+            f"⏱️ 选股耗时：合计 {timing['total']}s（拉行情 {timing.get('fetch_kline', 0)}s"
+            f" / 打分 {timing.get('score_all', 0)}s / 其他 {timing['other']}s）"
+            f" · {report.get('n_scanned', 0)} 只")
+
     except Exception as e:
         report["status"] = "error"
         report["error"] = str(e)
@@ -440,6 +510,24 @@ def _to_markdown(report: Dict[str, Any]) -> str:
         f"- 扫描 {report['n_scanned']} 只 → 达标 {report['n_passed']} 只",
         "",
     ]
+    ss = report.get("signal_strength")
+    if isinstance(ss, dict) and ss.get("level") not in (None, "unknown"):
+        trend = report.get("signal_trend") if isinstance(report.get("signal_trend"), dict) else None
+        lines.append("```")
+        lines.append(format_signal_strength(ss, trend))
+        lines.append("```")
+        alarm = signal_strength_alert(ss, trend)
+        if alarm:
+            lines.append("")
+            lines.append("> " + alarm.replace("\n", "\n> "))
+        lines.append("")
+    tm = report.get("timing")
+    if isinstance(tm, dict) and tm.get("total") is not None:
+        lines.append(
+            f"- 耗时：合计 {tm.get('total')}s（拉行情 {tm.get('fetch_kline', 0)}s"
+            f" / 打分 {tm.get('score_all', 0)}s / 其他 {tm.get('other', 0)}s）"
+        )
+        lines.append("")
     picks = report.get("picks") or []
     if not picks:
         lines.append("_（本次无达标标的）_")
