@@ -39,6 +39,11 @@ from src.core.signal_strength import (
     signal_strength_alert,
     signal_trend,
 )
+from src.core.pick_quality import (
+    format_pick_quality,
+    quality_alert,
+    quality_report,
+)
 
 
 # 大盘状态 → 中文语境（与 evolution.detect_regime 返回值对齐）
@@ -448,6 +453,22 @@ def generate_daily_picks(
         except Exception as e:  # noqa: BLE001
             logger.debug(f"信号强度诊断失败（不影响推荐）: {e}")
 
+        # 选股质量诊断（纯观测）：回答"分数到底能不能排序未来收益"。
+        # signal_strength 看的是**今天分数散不散**（σ/达标数），是个代理指标；
+        # 它会在"分数散得很好、但排序对收益毫无预测力"时误报"信号良"。
+        # 这里补上真正的那把尺子：历史 RankIC 台账 + 监控自身存活状态。
+        # 任何异常都不影响推荐（与信号强度诊断同一纪律）。
+        try:
+            _quality = quality_report()
+            report["pick_quality"] = _quality
+            logger.info(format_pick_quality(_quality))
+            _q_alarm = quality_alert(_quality, _signal)
+            if _q_alarm:
+                report["pick_quality_alert"] = _q_alarm
+                logger.warning(_q_alarm)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"选股质量诊断失败（不影响推荐）: {e}")
+
         # 「宁缺毋滥」闸门（默认关）：开启后不再按排名补足，只买严格达标的票。
         # 11-13 那种「达标 0 只仍补满 8 只」的局面下，它会让组合空仓等信号 ——
         # 是"质量优先"的显式选择，而不是偷偷改默认行为。
@@ -584,6 +605,18 @@ def _to_markdown(report: Dict[str, Any]) -> str:
         if alarm:
             lines.append("")
             lines.append("> " + alarm.replace("\n", "\n> "))
+        lines.append("")
+    # 选股质量（预测力）—— 与信号强度并列展示：前者说"分数散不散"，
+    # 后者说"排序到底能不能预测收益"。两者一起才看得出"假强信号"。
+    _pq = report.get("pick_quality")
+    if isinstance(_pq, dict):
+        lines.append("```")
+        lines.append(format_pick_quality(_pq))
+        lines.append("```")
+        _pq_alarm = report.get("pick_quality_alert")
+        if _pq_alarm:
+            lines.append("")
+            lines.append("> " + str(_pq_alarm).replace("\n", "\n> "))
         lines.append("")
     tm = report.get("timing")
     if isinstance(tm, dict) and tm.get("total") is not None:

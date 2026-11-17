@@ -20,7 +20,7 @@ for p in (str(ROOT), str(ROOT / "src")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-_WANT = ("_signal_strength_banner",)
+_WANT = ("_signal_strength_banner", "_pick_quality_banner")
 
 
 def _load():
@@ -76,3 +76,72 @@ def test_banner_survives_missing_fields():
     f = _load()
     html = f._signal_strength_banner({"level": "weak"})
     assert html and "<div" in html
+
+
+# ---------------------------------------------------------------------------
+# 选股预测力横幅（比信号强度更硬的一条）
+# ---------------------------------------------------------------------------
+
+def test_quality_banner_none_when_effective_and_monitor_ok():
+    f = _load()
+    assert f._pick_quality_banner(
+        {"verdict": "effective", "monitor": {"stalled": False}}) is None
+    assert f._pick_quality_banner(None) is None
+    assert f._pick_quality_banner({}) is None
+    assert f._pick_quality_banner({"verdict": "no_data"}) is None
+
+
+def test_quality_banner_flags_false_strong_signal():
+    """σ 很分散（信号判"良"）但 RankIC 已衰减 —— 这是最会骗人加仓的组合。"""
+    f = _load()
+    html = f._pick_quality_banner(
+        {"verdict": "decayed", "verdict_cn": "已衰减",
+         "note": "近 20 日均值 -0.0099", "monitor": {"stalled": False}},
+        {"level": "ok", "level_cn": "良", "dispersion": 3.27},
+    )
+    assert html and "假强信号" in html
+    assert "σ3.27" in html and "已衰减" in html
+    assert "调阈值无效" in html, "必须点明真正的改进方向，否则用户只会去调阈值"
+
+
+def test_quality_banner_without_signal_context_still_warns():
+    f = _load()
+    html = f._pick_quality_banner(
+        {"verdict": "decayed", "verdict_cn": "已衰减",
+         "note": "均值为负", "monitor": {"stalled": False}}, None)
+    assert html and "预测力已衰减" in html
+    assert "假强信号" not in html
+
+
+def test_quality_banner_surfaces_stalled_monitor():
+    """监控死了必须单独说一句 —— 否则"质量看起来还行"其实是陈旧数据。"""
+    f = _load()
+    html = f._pick_quality_banner(
+        {"verdict": "decayed", "verdict_cn": "已衰减", "note": "x",
+         "monitor": {"stalled": True, "note": "状态停在 running 已 103.2h"}},
+        {"level": "weak", "level_cn": "弱"},
+    )
+    assert html and "质量监控自身出问题" in html
+    assert "103.2h" in html
+
+
+def test_quality_banner_survives_minimal_dict():
+    f = _load()
+    html = f._pick_quality_banner({"verdict": "marginal"})
+    assert html and "<div" in html
+
+
+def test_quality_banner_leads_with_rank_no_edge():
+    """名次无信息比"全池 IC 样本不足"更贴近体感，应当占据标题位。"""
+    f = _load()
+    html = f._pick_quality_banner(
+        {"verdict": "insufficient", "note": "全池仅 7 日",
+         "monitor": {"stalled": False},
+         "list_ic": {"verdict": "no_edge", "verdict_cn": "名次无信息",
+                     "n_periods": 21, "horizon": "5", "note": "名次没有预测力"}},
+        None,
+    )
+    assert html and "名单内名次无预测力" in html
+    assert "名次没有预测力" in html and "21 期" in html
+
+

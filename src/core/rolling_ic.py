@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -22,12 +23,46 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parents[2]
 IC_LOG = ROOT / "data" / "rolling_ic_log.json"
 PROD_METRICS = ROOT / "models" / "production_metrics.json"
 STATUS_FILE = ROOT / "data" / "rolling_ic_status.json"
 OUT_HTML = ROOT / "data" / "rolling_ic_curve.html"
 OUT_SVG = ROOT / "data" / "rolling_ic_curve.svg"
+
+# ``status="running"`` 超过这么多小时即视为「进程已被强杀、状态无人回收」。
+# 实测一次增量回填（days=5，150 只）是**分钟级**，6 小时给了 100 倍余量，
+# 不会把"还在正常跑"误判成"死了"。
+STATUS_RUNNING_STALE_HOURS: float = 6.0
+
+
+def equidistant_sample(codes: List[str], k: int) -> List[str]:
+    """从代码列表里**等距**抽 ``k`` 只（保持原顺序，去重）。
+
+    为什么不能用 ``codes[:k]``（2026-11-18 实测，这个坑让质量结论完全反向）
+    ------------------------------------------------------------------
+    股票池按代码排序，``codes[:150]`` 拿到的是一段**代码序前缀** —— 深市
+    000/001/002 打头的一批，板块与风格高度同质，横截面区分度被人为压掉。
+    实测同一根台账里：前缀抽样 41 天均值 **+0.0010**，全池 7 天均值 **+0.1569**。
+
+    等距抽样让人为选中的样本覆盖整个代码空间（≈整个市场），大幅降低这种
+    系统性偏差；成本与 ``[:k]`` 完全相同（还是拉 k 只）。
+    """
+    n = len(codes)
+    k = int(k)
+    if k <= 0 or k >= n:
+        return list(codes)
+    step = n / float(k)
+    picked: List[str] = []
+    seen = set()
+    for i in range(k):
+        c = codes[min(n - 1, int(i * step))]
+        if c not in seen:
+            seen.add(c)
+            picked.append(c)
+    return picked
 
 
 def _load_json(path: Path):
@@ -64,6 +99,63 @@ def _write_status(d: Dict) -> None:
         STATUS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def heal_stale_status(now: Optional[datetime] = None,
+                      max_hours: float = STATUS_RUNNING_STALE_HOURS,
+                      path: Optional[Path] = None) -> Optional[Dict]:
+    """把「被强杀后残留的 running 状态」校正成如实的 ``aborted``。
+
+    为什么必须有（2026-11-18 实测故障）
+    ----------------------------------
+    :func:`run_backfill` 开头就把状态写成 ``running``，而**进程被 ``taskkill /F``
+    杀掉时没有任何 ``finally`` 能执行**。于是状态永久停在 ``running``：实测
+    ``started_at=2026-11-13T19:15``、台账最后一条却是 ``2026-11-04`` ——
+    质量监控已经死了 7 个交易日，所有读状态文件的地方都还当它"正在运行"。
+
+    ``catch_up_missed()`` 只补 ``data_update``/``daily_pick``（刻意为之：凌晨补跑
+    重作业会与选股抢同一批网络 IO，2026-11-18 的 393s 就是这么来的），所以
+    ``rolling_ic`` 错过晚间窗口不会自己补。**补不了，至少别撒谎** ——
+    这就是本函数存在的全部理由。
+
+    Returns:
+        被校正后的状态 dict；无需校正（无 running / 仍然新鲜）返回 ``None``。
+    """
+    cur = _load_json(Path(path) if path else STATUS_FILE)
+    if not isinstance(cur, dict) or str(cur.get("status")) != "running":
+        return None
+    now = now or datetime.now()
+    started_raw = cur.get("started_at")
+    try:
+        started = datetime.fromisoformat(str(started_raw))
+    except Exception:  # noqa: BLE001
+        started = None
+    if started is not None:
+        hours = (now - started).total_seconds() / 3600.0
+        if hours < float(max_hours):
+            return None                     # 还在正常耗时范围内，别乱改
+    else:
+        hours = None
+    fixed = {
+        "status": "aborted",
+        "reason": ("回填进程被强制终止，状态未回收（running 无人改回）"
+                   if hours is None else
+                   f"回填进程被强制终止：starting {hours:.1f}h 仍未收官"),
+        "started_at": started_raw,
+        "hours": None if hours is None else round(hours, 1),
+        "at": now.isoformat(timespec="seconds"),
+    }
+    if path is not None:
+        try:
+            Path(path).write_text(json.dumps(fixed, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        _write_status(fixed)
+    logger.warning(f"🔧 校正残留的 rolling_ic 状态：running → aborted"
+                   f"（{fixed['reason']}）")
+    return fixed
 
 
 def _stats_from_entries(entries: List[Dict]) -> Dict:
@@ -138,7 +230,7 @@ def run_backfill(
     try:
         codes = list(fetcher.get_stock_pool(pool))
         if sample and sample < len(codes):
-            codes = codes[:sample]
+            codes = equidistant_sample(codes, sample)
 
         raw: Dict[str, pd.DataFrame] = {}
         for i, code in enumerate(codes, 1):

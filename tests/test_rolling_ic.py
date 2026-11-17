@@ -216,3 +216,26 @@ def test_scheduler_wires_rolling_ic():
     src_txt = inspect.getsource(sch.start_scheduler)
     assert '("rolling_ic"' in src_txt
     assert "rolling_ic_cron" in src_txt
+
+
+# ---------------------------------------------------------------------------
+# 抽样口径：不许用代码序前缀（否则 IC 与生产口径系统性偏离）
+# ---------------------------------------------------------------------------
+
+def test_equidistant_sample_spans_whole_universe():
+    codes = [f"{i:06d}" for i in range(500)]
+    picked = rolling_ic.equidistant_sample(codes, 150)
+    assert len(picked) == 150 and len(set(picked)) == 150
+    # 覆盖整个代码空间：既要有低位也要有高位
+    assert picked[0] == codes[0]
+    assert int(picked[-1]) > 450, "等距抽样必须覆盖到池尾，不能挤在前缀里"
+    # 均值接近全池（前缀切片的均值只有全池的 ~30%）
+    assert abs(np.mean([int(c) for c in picked]) - 249.5) < 20
+
+
+def test_equidistant_sample_noop_on_edge_inputs():
+    codes = [f"{i:06d}" for i in range(10)]
+    assert rolling_ic.equidistant_sample(codes, 0) == codes
+    assert rolling_ic.equidistant_sample(codes, 10) == codes
+    assert rolling_ic.equidistant_sample(codes, 99) == codes
+    assert rolling_ic.equidistant_sample([], 5) == []

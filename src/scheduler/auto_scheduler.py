@@ -668,9 +668,16 @@ def job_rolling_ic(days: int = 5, dry_run: bool = False) -> Dict:
 
 
 def _job_rolling_ic_impl(days: int = 5, dry_run: bool = False) -> Dict:
+    # 用**全池**口径（sample=0）而不是默认的 150 只抽样。
+    # 为什么（2026-11-18 实测）：抽样算出的 RankIC 与生产口径不是一把尺子 ——
+    # 同一根台账里「前缀抽样 41 天均值 +0.0010 / 全池 7 天均值 +0.1569」，
+    # 结论完全相反，混着平均就是 Simpson 悖论。质量诊断若基于错口径，
+    # "质量太差"这种判断就无从证伪。
+    # 成本可接受：data_update（18:45）已把行情缓存焐热，本作业 19:15 跑，
+    # 取数基本全是缓存命中；一天的打分实测约 76s（全池 425 只）。
     try:
         from src.core.rolling_ic import run_backfill
-        res = run_backfill(days=days, dry_run=dry_run)
+        res = run_backfill(days=days, sample=0, dry_run=dry_run)
     except Exception as e:  # noqa: BLE001
         logger.exception("rolling_ic 回填失败")
         return {"job": "rolling_ic", "status": "error", "error": str(e),
@@ -782,6 +789,20 @@ def start_scheduler() -> Optional["BackgroundScheduler"]:
             )
             return None
         _sched_holder = lock
+
+        # 校正「被强杀后残留的 running 状态」：rolling_ic 回填进程被 taskkill /F
+        # 杀掉时没有 finally 可执行，状态会永久停在 running（实测 2026-11-13→11-18
+        # 卡了 103 小时，看板一直显示"正在运行"）。这里在每次拉起调度器时校正一次，
+        # 让"监控死了"这件事至少是**如实的**。只改状态文件，不做任何重活。
+        try:
+            from src.core.rolling_ic import heal_stale_status
+            healed = heal_stale_status()
+            if healed:
+                logger.warning(f"⚠️ 质量监控上次未正常收官，状态已校正为 aborted："
+                               f"{healed.get('reason')}；建议手动跑 "
+                               f"scripts/rolling_ic_backfill.py 补台账")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"校正 rolling_ic 状态失败（不影响调度）: {e}")
 
         sched = BackgroundScheduler(timezone=app_config.scheduler.timezone)
         jobs = [

@@ -17,13 +17,21 @@ paper_shadow_audit.py --live-ic 只在「跑那一下」产出 1 个点，所以
 ----------
   · 成本 ≈ (评分日数) × (宇宙只数) 次单股打分。默认 --days 30 --sample 150，
     约 4500 次，后台跑几分钟到十几分钟。机器够快可调大。
-  · --sample 截断宇宙（取前 N 只），只为控制成本，不影响 IC 口径。
+  · --sample 是**等距抽样**（``equidistant_sample``），不是"取前 N 只"。
+    ⚠️ 2026-11-18 实测：原来按 ``codes[:N]`` 取代码序前缀，抽出来的一批挤在
+    深市 000/001/002 段，横截面高度同质 → 前缀抽样 41 天均值 **+0.0010**，
+    而全池 7 天均值 **+0.1569**，两套口径的结论完全相反。所以：
+      - 想得到**与生产一致**的 IC，用 ``--sample 0``（全池）。缓存热时成本很低
+        （每日定时作业就是全池口径）。
+      - 只想控制成本时，抽样也已经是等距的，但仍属"抽样口径"，
+        ``pick_quality`` 不会拿它去判断生产预测力。
   · 可重入：已存在于日志的评分日自动跳过；日志只保留最近 250 点。
   · 纯离线无需券商；但需要联网拿行情（fetcher），这是本机看板已具备的能力。
 
 用法
 ----
-    python scripts/rolling_ic_backfill.py                 # 默认 zz500，近 30 交易日，150 只
+    python scripts/rolling_ic_backfill.py                 # 默认 zz500，近 30 交易日，150 只等距抽样
+    python scripts/rolling_ic_backfill.py --days 30 --sample 0    # 全池口径（与生产一致，推荐）
     python scripts/rolling_ic_backfill.py --days 60 --sample 300
     python scripts/rolling_ic_backfill.py --pool hs300 --horizon 5
     python scripts/rolling_ic_backfill.py --dry-run       # 只报告规模，不跑模型
@@ -47,7 +55,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="RankIC 历史回填（累积 rolling_ic_log.json）")
     ap.add_argument("--pool", default="zz500", help="股票池 hs300/zz500/zz1000/all")
     ap.add_argument("--days", type=int, default=30, help="回溯的评分日数量（交易日）")
-    ap.add_argument("--sample", type=int, default=150, help="宇宙截断只数（取前 N 只，控制成本）")
+    ap.add_argument("--sample", type=int, default=150,
+                    help="宇宙只数：0=全池（与生产口径一致，推荐）；N>0=等距抽样 N 只（控成本）")
     ap.add_argument("--horizon", type=int, default=5, help="前向收益跨度（交易日）")
     ap.add_argument("--min-stocks", type=int, default=30, help="单日有效样本下限，低于则跳过该日")
     ap.add_argument("--out", type=Path, default=IC_LOG, help="输出日志 JSON")

@@ -1076,6 +1076,35 @@ def _today_status_data() -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    # --- 选股质量（预测力）：分数究竟能不能排序未来收益 ---
+    # 与「信号强度」并列：前者说"今天分数散不散"，这里说"历史上这个排序有没有用"。
+    # 直接按**原始台账**现算（48 条，毫秒级），不复用 pick_quality.json ——
+    # 否则文件里的 monitor 状态会冻结在写入那一刻，"监控今天是否还活着"就失真了。
+    out["quality"] = None
+    try:
+        from src.core.pick_quality import ic_stats, list_ic_stats, monitor_freshness
+        log = _status_read_json(root / "data" / "rolling_ic_log.json")
+        stt = _status_read_json(root / "data" / "rolling_ic_status.json")
+        log = log if isinstance(log, list) else []
+        q = ic_stats(log)
+        q["monitor"] = monitor_freshness(log, stt if isinstance(stt, dict) else {})
+        q["list_ic"] = list_ic_stats(recs if isinstance(recs, list) else [])
+        out["quality"] = {
+            "verdict": q.get("verdict"),
+            "verdict_cn": q.get("verdict_cn"),
+            "tone": q.get("tone"),
+            "mean_ic": q.get("mean_ic"),
+            "t_stat": q.get("t_stat"),
+            "recent_mean_ic": q.get("recent_mean_ic"),
+            "n": q.get("n"),
+            "universe_cn": q.get("universe_cn") or "",
+            "note": q.get("note") or "",
+            "monitor": q.get("monitor") or {},
+            "list_ic": q.get("list_ic") or {},
+        }
+    except Exception:  # noqa: BLE001
+        pass
+
     return out
 
 
@@ -1155,6 +1184,26 @@ def render_today_status() -> None:
             "tone": {"strong": "up", "ok": "plain", "weak": "warn"}.get(sg.get("level"), "down"),
         })
 
+    if d.get("quality") and d["quality"].get("verdict") not in (None, "no_data"):
+        q = d["quality"]
+        mon = q.get("monitor") or {}
+        li = q.get("list_ic") or {}
+        _ic = q.get("mean_ic")
+        bits = []
+        if isinstance(_ic, (int, float)):
+            bits.append(f"全池 {_ic:+.3f}")
+        if isinstance(li.get("mean_ic"), (int, float)):
+            bits.append(f"名次 {li['mean_ic']:+.3f}")
+        if mon.get("stalled"):
+            bits.append("监控停摆")
+        cards.append({
+            "label": "🎯 选股预测力",
+            "value": (li.get("verdict_cn") or q.get("verdict_cn") or "—"),
+            "sub": " · ".join(bits) if bits else f"{q.get('n')} 日",
+            "tone": (li.get("tone") if li.get("verdict") == "no_edge"
+                     else (q.get("tone") or "plain")),
+        })
+
     if cards:
         kpi_row(cards)
 
@@ -1186,6 +1235,65 @@ def render_today_status() -> None:
     _sig_banner = _signal_strength_banner(d.get("signal"))
     if _sig_banner:
         st.markdown(_sig_banner, unsafe_allow_html=True)
+
+    # 选股质量（预测力）：比"信号强度"更硬的一条 —— 分数散得漂亮不代表能排序收益。
+    # 本项目实测就是这个组合：σ=3.27（判"良"）但近 20 日 RankIC 已转负。
+    _pq_banner = _pick_quality_banner(d.get("quality"), d.get("signal"))
+    if _pq_banner:
+        st.markdown(_pq_banner, unsafe_allow_html=True)
+
+
+def _pick_quality_banner(q: dict, sg: dict | None = None) -> str | None:
+    """把「选股预测力」渲染成警示 HTML；预测力有效且监控正常时返回 None。
+
+    抽成纯函数的原因与 ``_signal_strength_banner`` 相同：这是用户判断
+    "要不要按排名集中下注"的直接依据，必须可单测。
+    """
+    if not isinstance(q, dict) or q.get("verdict") in (None, "no_data"):
+        return None
+    mon = q.get("monitor") or {}
+    verdict = q.get("verdict")
+    # 健康且监控正常 → 不占屏
+    if verdict == "effective" and not mon.get("stalled"):
+        return None
+
+    head_map = {
+        "decayed": "⚠️ 选股预测力已衰减",
+        "marginal": "⚠️ 选股预测力偏弱",
+        "insufficient": "ℹ️ 选股预测力样本不足",
+    }
+    li = q.get("list_ic") or {}
+    # 名次无信息是最贴近体感的结论（"给了 8 只却挑不准"），优先占标题位；
+    # 全池 IC 的"样本不足"是度量问题，放正文说。
+    if li.get("verdict") == "no_edge":
+        head = "⚠️ 名单内名次无预测力"
+    else:
+        head = head_map.get(verdict, "⚠️ 选股质量存疑")
+    bits: list[str] = []
+
+    # 名次无信息 —— 这是"给了 8 只却挑不准"的量化解释，比全池 IC 更贴近体感
+    if li.get("verdict") == "no_edge" and li.get("note"):
+        bits.append(f'<b>名次无信息</b>（{li.get("n_periods")} 期 / '
+                    f'{li.get("horizon")} 日）：{li.get("note")}')
+
+    # 假强信号：分数分布漂亮但历史排序无预测力 —— 最容易骗人加仓的一种情形
+    if verdict in ("decayed", "marginal") and isinstance(sg, dict) \
+            and sg.get("level") in ("strong", "ok"):
+        bits.append(
+            f'<b>假强信号</b>：今日截面分散度 σ{sg.get("dispersion")}'
+            f'（判"{sg.get("level_cn")}"），但历史 RankIC 判定为"{q.get("verdict_cn")}"'
+            f' —— 分数散 ≠ 排序有预测力')
+    if q.get("note"):
+        bits.append(str(q["note"]))
+    if mon.get("stalled"):
+        bits.append(f'<b>质量监控自身出问题</b>：{mon.get("note")}')
+
+    detail = "<br>".join(b for b in bits if b)
+    tail = ('<span class="text-sub">排名是噪声时"取前 8 名"等于随机取 8 只 —— '
+            '建议把推荐当候选池、按风险分散建仓，而不是按名次集中下注。'
+            '要真正提升质量需重训模型（transformer / leg_rankic），调阈值无效。'
+            '</span>')
+    return f'<div class="notice warn">{head}：<br>{detail}<br>{tail}</div>'
 
 
 def _signal_strength_banner(sg: dict) -> str | None:
