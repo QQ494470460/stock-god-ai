@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 import requests
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from loguru import logger
@@ -266,7 +266,7 @@ class DataFetcher:
             time.sleep(wait)
         self._last_net_ts = time.monotonic()
         return max(0.0, wait)
-    
+
     def _merge_into_cache(self, cache_file: Path, new_df: pd.DataFrame) -> pd.DataFrame:
         """
         将新数据合并进缓存文件（按日期取并集），返回合并后的完整数据
@@ -498,6 +498,8 @@ class DataFetcher:
             return self._daily_cache[cache_key].copy()
         
         cache_file = self.cache_dir / f"daily_{code}_{adjust}.parquet"
+        # 代码清洗：去掉交易所后缀（缓存文件名/负缓存/白拉冷却都用它）
+        code_clean = code.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
         
         # 尝试从缓存加载
         # ⚠️ 这一步**必须**容错：它是全函数第一处读缓存，且不在下面的重试 try 里。
@@ -543,8 +545,6 @@ class DataFetcher:
                 elif is_stale:
                     logger.info(f"{code} 缓存过期 (最新: {latest_date})，重新拉取…")
         
-        # 代码清洗：去掉交易所后缀
-        code_clean = code.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
         # 负缓存：本进程内已确认拉不到数据的代码，不再重复走网络+重试
         #（科创板 CDR 如 689xxx 新浪返回非 JSON，每次扫描白等 20s）
         if code_clean in getattr(self, "_fail_codes", set()):
@@ -764,7 +764,8 @@ class DataFetcher:
             return self._batch_serial(codes, start_date, ed, progress_callback, min_rows=1)
         try:
             return _mp_batch_fetch(
-                codes, start_date, ed, max_workers, progress_callback, min_rows=1
+                codes, start_date, ed, max_workers, progress_callback, min_rows=1,
+                cache_dir=str(self.cache_dir),
             )
         except Exception as e:  # noqa: 进程池起不来时回退串行，保证可用
             logger.error(f"进程池批量拉取失败，回退串行: {e}")
@@ -1587,35 +1588,44 @@ class DataFetcher:
 # 内存上限：akshare 单进程很吃内存，最多 8 个 worker 进程，避免 OOM。
 # ============================================================================
 _MP_MAX_PROC = 8
-_MP_FETCHER = None
+_MP_FETCHERS: Dict[str, "DataFetcher"] = {}
 
 
-def _mp_get_fetcher() -> "DataFetcher":
-    """每个 worker 进程内懒加载一个 DataFetcher 单例（复用缓存目录与负缓存）。"""
-    global _MP_FETCHER
-    if _MP_FETCHER is None:
-        _MP_FETCHER = DataFetcher()
-    return _MP_FETCHER
+def _mp_get_fetcher(cache_dir: Optional[str] = None) -> "DataFetcher":
+    """每个 worker 进程内按缓存目录懒加载 DataFetcher（复用缓存与负缓存）。
+
+    ``cache_dir`` 必须透传：否则 ``get_batch_daily_kline`` 在自定义缓存目录
+    （单测 / 多实例 / 影子环境）下调用时，worker 会静默写进**生产 data/**，
+    测试与真实数据互相污染。按目录分别缓存实例，避免串味。
+    """
+    key = str(cache_dir or "")
+    f = _MP_FETCHERS.get(key)
+    if f is None:
+        f = DataFetcher(cache_dir=Path(cache_dir)) if cache_dir else DataFetcher()
+        _MP_FETCHERS[key] = f
+    return f
 
 
 def _mp_fetch_one(task):
     """进程池 worker：拉取单只股票日线，异常不影响整体。"""
-    code, start_date, end_date, adjust = task
+    code, start_date, end_date, adjust = task[:4]
+    cache_dir = task[4] if len(task) > 4 else None
     try:
-        df = _mp_get_fetcher().get_daily_kline(code, start_date, end_date, adjust)
+        df = _mp_get_fetcher(cache_dir).get_daily_kline(code, start_date, end_date, adjust)
         return code, (df if df is not None else pd.DataFrame())
     except Exception as e:  # noqa
         logger.error(f"[mp] {code} 拉取失败: {e}")
         return code, pd.DataFrame()
 
 
-def _mp_batch_fetch(codes, start_date, end_date, max_workers, progress_callback=None, min_rows=1):
+def _mp_batch_fetch(codes, start_date, end_date, max_workers, progress_callback=None,
+                    min_rows=1, cache_dir=None):
     """用 spawn 进程池并发拉取，返回 {code: df}。"""
     import multiprocessing as mp
 
     ctx = mp.get_context("spawn")
     n_proc = max(1, min(int(max_workers), _MP_MAX_PROC))
-    tasks = [(c, start_date, end_date, "qfq") for c in codes]
+    tasks = [(c, start_date, end_date, "qfq", cache_dir) for c in codes]
 
     results: Dict[str, pd.DataFrame] = {}
     total = len(tasks)

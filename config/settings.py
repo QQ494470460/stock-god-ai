@@ -369,6 +369,11 @@ class SchedulerConfig:
     # 不想拿硬币结果建仓"的场合（信号强度见 report['signal_strength'] 与
     # data/signal_strength_history.jsonl；2026-11-13 实测达标 0 只、σ 1.38）。
     require_strict_pass: bool = False
+    # 选股前等待「另一个进程正在跑的 data_update」写完（秒，0=不等）。
+    # 背景：补跑时曾出现「run_loop 在拉全池 + daily_pick 又拉一遍」的双份并发，
+    # 拉行情从 130s 涨到 393s，而那批数据 daily_pick 一行都不需要（写完就能命中）。
+    # 上限 900s < 锁的 1800s 陈旧阈值，保证不会因残留锁永久卡住。
+    wait_for_data_update_sec: int = 900
     # 多策略复核：量化三策略（多因子/均值回归/融合）对 AI 候选投票后
     # 「集体看空则剔除、一致看多则加权」。默认关，需显式开启；
     # 开关持久化在 config/scheduler_state.json（与 enabled 一起）。

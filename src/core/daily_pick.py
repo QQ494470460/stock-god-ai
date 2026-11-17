@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 from loguru import logger
 
-from config.settings import config as app_config
+from config.settings import config as app_config, DATA_DIR
 from src.data.fetcher import fetcher
 from src.models.predictor import predictor
 from src.models.evolution import evolution
@@ -268,6 +268,64 @@ def _ranking_of(df: Optional[pd.DataFrame]) -> list:
     return out
 
 
+# data_update 的跨进程锁（与 auto_scheduler._job_lease 同一位置：data/.job_<id>.lock）
+_DATA_UPDATE_LOCK = str(Path(DATA_DIR) / ".job_data_update.lock")
+
+
+def _wait_for_data_update(max_wait: Optional[float] = None, poll: float = 5.0) -> float:
+    """若**另一个进程**正在跑 ``data_update``（拉全池行情），先等它写完再读数。
+
+    为什么值得等（2026-11-18 实测）
+    ------------------------------
+    凌晨补跑时出现过这样的现场：常驻 run_loop 正在执行 data_update（拉全池），
+    而另一进程补跑的 daily_pick 因为"缓存还是旧的"又自己拉了 425 只全量 ——
+    两拨 8 进程并发抢同一条网络，双方都变慢：daily_pick 的拉行情从正常 130s
+    涨到 **393s**（占整次选股 79%），而这批数据它**一行都不需要**：
+    data_update 写完缓存后，daily_pick 本来就能直接命中。
+
+    等锁释放（最多 ``max_wait`` 秒）通常比"重复拉一遍全池"快 3 倍以上；
+    超时则照常自己拉，绝不把选股卡死。
+
+    Returns:
+        实际等待秒数（0 表示无需等待）。
+    """
+    if max_wait is None:
+        try:
+            max_wait = float(getattr(app_config.scheduler, "wait_for_data_update_sec", 900) or 0)
+        except Exception:  # noqa: BLE001
+            max_wait = 900.0
+    if max_wait <= 0:
+        return 0.0
+    path = Path(_DATA_UPDATE_LOCK)
+    if not path.exists():
+        return 0.0
+    # 与 auto_scheduler._job_lease 同一口径：锁超过 1800s 视为陈旧（持锁进程已死）
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return 0.0
+    if age >= 1800:
+        return 0.0
+    logger.info(
+        f"⏳ 另一个进程正在更新行情（锁 {path.name}，已 {age:.0f}s），"
+        f"先等它写完，最多等 {max_wait:.0f}s —— 避免重复拉全池")
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        time.sleep(poll)
+        if not path.exists():
+            waited = time.time() - t0
+            logger.info(f"✅ 行情更新已完成（等待 {waited:.0f}s），直接使用缓存")
+            return waited
+        try:
+            if time.time() - path.stat().st_mtime >= 1800:
+                logger.warning("⚠️ 行情更新锁已陈旧（>1800s），不再等待，自行刷新")
+                return time.time() - t0
+        except OSError:
+            return time.time() - t0
+    logger.warning(f"⚠️ 等待行情更新超时（{max_wait:.0f}s），改为自行拉取")
+    return time.time() - t0
+
+
 def generate_daily_picks(
     pool: Optional[str] = None,
     max_picks: Optional[int] = None,
@@ -328,6 +386,9 @@ def generate_daily_picks(
         report["n_scanned"] = len(codes)
 
         # 拉取行情（会顺带刷新本地缓存）
+        # 若另一进程正在跑 data_update，先等它（见 _wait_for_data_update）：
+        # 等 1 分钟比重复拉 425 只全量（实测 393s）划算得多。
+        timing["wait_data_update"] = round(_wait_for_data_update(), 1)
         _t0 = time.perf_counter()
         raw = fet.get_batch_daily_kline(codes, max_workers=8)
         timing["fetch_kline"] = round(time.perf_counter() - _t0, 1)
@@ -468,11 +529,14 @@ def generate_daily_picks(
         timing["total"] = round(time.perf_counter() - _t_all, 1)
         timing["other"] = round(max(0.0, timing["total"]
                                     - timing.get("fetch_kline", 0.0)
-                                    - timing.get("score_all", 0.0)), 1)
+                                    - timing.get("score_all", 0.0)
+                                    - timing.get("wait_data_update", 0.0)), 1)
         report["timing"] = timing
+        _wait_s = timing.get("wait_data_update", 0.0)
         logger.info(
             f"⏱️ 选股耗时：合计 {timing['total']}s（拉行情 {timing.get('fetch_kline', 0)}s"
-            f" / 打分 {timing.get('score_all', 0)}s / 其他 {timing['other']}s）"
+            + (f" / 等行情更新 {_wait_s}s" if _wait_s else "")
+            + f" / 打分 {timing.get('score_all', 0)}s / 其他 {timing['other']}s）"
             f" · {report.get('n_scanned', 0)} 只")
 
     except Exception as e:
