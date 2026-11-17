@@ -285,6 +285,39 @@ def test_heal_stale_status_treats_missing_started_at_as_dead(tmp_path):
     assert out and out["status"] == "aborted" and out["hours"] is None
 
 
+def test_stale_threshold_scales_with_horizon():
+    """健康台账天生落后 horizon 个交易日 —— 门槛必须随之放宽。
+
+    2026-11-18 第一版把阈值写死 2 天，结果回填**刚刚成功**也报"停摆 6 个交易日"，
+    是个永久假告警。horizon=5 时门槛应为 7 个交易日。
+    """
+    entries = _entries([0.1] * 5, start="2026-11-10")
+    f = pq.monitor_freshness(entries, {"status": "ok"},
+                             now=datetime(2026, 11, 18), horizon=5)
+    assert f["expect_lag_trading_days"] == 5 + pq.STALE_SLACK_TRADING_DAYS
+    assert f["state"] == "ok", "落后 6 个交易日在 horizon=5 下是正常的，不许报停摆"
+
+
+def test_stale_when_lag_exceeds_horizon_plus_slack():
+    entries = _entries([0.1] * 3, start="2026-10-20")
+    f = pq.monitor_freshness(entries, {"status": "ok"},
+                             now=datetime(2026, 11, 18), horizon=5)
+    assert f["state"] == "stale"
+    assert f["stalled"] is True
+
+
+def test_horizon_one_needs_a_tighter_threshold():
+    """horizon=1 时不该沿用 horizon=5 的宽门槛。"""
+    entries = _entries([0.1] * 3, start="2026-11-05")
+    loose = pq.monitor_freshness(entries, {"status": "ok"},
+                                 now=datetime(2026, 11, 18), horizon=5)
+    tight = pq.monitor_freshness(entries, {"status": "ok"},
+                                 now=datetime(2026, 11, 18), horizon=1)
+    assert tight["state"] == "stale"
+    assert tight["expect_lag_trading_days"] == 1 + pq.STALE_SLACK_TRADING_DAYS
+    assert loose["expect_lag_trading_days"] == 5 + pq.STALE_SLACK_TRADING_DAYS
+
+
 def test_aborted_status_is_reported_as_stalled():
     """校正之后 monitor 仍要判 stalled —— 否则"改了状态"就等于"报平安"。"""
     f = pq.monitor_freshness(

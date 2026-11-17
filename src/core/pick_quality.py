@@ -76,7 +76,13 @@ RECENT_WINDOW = 20         # 「近期」= 最近 20 个评分日（约一个月
 # 全池口径的下限（zz500 生产实测 423~430 只）。低于这个数就是**抽样口径**，
 # 与生产口径不可混算 —— 见 :func:`ic_stats` 的 universe 拆分。
 FULL_UNIVERSE_MIN = 300
-STALE_TRADING_DAYS = 2     # 台账落后 ≥2 个交易日 → 监控停摆（picks 滞后 1 是设计值）
+# 台账落后多少个交易日算「监控停摆」。
+# ⚠️ 不能只看"落后几天"：前向收益需要 ``horizon`` 个交易日的未来数据，
+# 所以**健康的台账天生就落后 horizon 天**（horizon=5 时，今天最多只能算到
+# 5 个交易日前的评分日）。2026-11-18 第一版把阈值设成 2 天，结果回填刚刚成功
+# 也照样报"停摆 6 个交易日"—— 一个永久假告警。真正口径是 horizon + 余量。
+STALE_SLACK_TRADING_DAYS = 2
+DEFAULT_HORIZON = 5        # 与 run_backfill / job_rolling_ic 的默认一致
 # 「running 卡多久算进程已死」的唯一口径在 rolling_ic 里（它才是状态文件的写入方），
 # 这里只做别名，绝不另立一套阈值 —— 两处阈值不一致会导致"一个说死一个说活"。
 RUNNING_STALE_HOURS = STATUS_RUNNING_STALE_HOURS
@@ -429,11 +435,14 @@ def monitor_freshness(
     entries: Optional[List[Dict[str, Any]]] = None,
     status: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
+    horizon: int = DEFAULT_HORIZON,
 ) -> Dict[str, Any]:
     """判断质量监控**本身**是否还活着（这是本项目真踩过的坑）。
 
     两个独立信号：
     1. 台账落后：``last_date`` 距今天数（优先用交易日，日历不可用时退化用自然日）。
+       门槛是 ``horizon + STALE_SLACK_TRADING_DAYS``，不是固定 2 天 —— 前向收益
+       本来就要等 ``horizon`` 个交易日，健康的台账也必然落后那么多。
     2. 状态卡死：``status == "running"`` 但 ``started_at`` 已过去很久 —— 进程被
        ``taskkill /F`` 杀掉时不会有 ``finally``，状态就永久停在 running。
 
@@ -474,23 +483,32 @@ def monitor_freshness(
         except Exception:  # noqa: BLE001
             pass
 
+    # 健康台账天生落后 horizon 个交易日（前向收益还没走完），所以门槛必须加余量
+    try:
+        expect_lag = max(0, int(horizon)) + STALE_SLACK_TRADING_DAYS
+    except (TypeError, ValueError):
+        expect_lag = DEFAULT_HORIZON + STALE_SLACK_TRADING_DAYS
+
     if not rows and st not in ("running", "aborted"):
         state = "empty"
     elif stuck:
         state = "stuck"
     elif st == "aborted":
         state = "aborted"
-    elif lag_trading is not None and lag_trading >= STALE_TRADING_DAYS:
+    elif lag_trading is not None and lag_trading > expect_lag:
         state = "stale"
-    elif lag_trading is None and lag_days is not None and lag_days >= 3:
+    elif lag_trading is None and lag_days is not None and lag_days > expect_lag * 2:
         state = "stale"
     else:
         state = "ok"
 
     note = {
-        "ok": f"质量监控正常（最后评分日 {last_date}）",
+        "ok": (f"质量监控正常（最后评分日 {last_date}"
+               + (f"，落后 {lag_trading} 个交易日，在 horizon={horizon} 的合理范围内"
+                  if lag_trading is not None else "") + "）"),
         "stale": (f"质量监控停摆：台账最后一条是 {last_date}"
                   + (f"，已落后 {lag_trading} 个交易日" if lag_trading is not None else "")
+                  + f"（超过 horizon {horizon} + 余量 {STALE_SLACK_TRADING_DAYS} 天）"
                   + "。晚间 rolling_ic 作业错过即永久丢失（catch_up 只补 data_update/daily_pick）"),
         "stuck": (f"质量监控卡死：状态停在 running 已 {running_hours}h"
                   f"（最后评分日 {last_date}）——回填进程多半被强杀，"
@@ -509,7 +527,8 @@ def monitor_freshness(
         "lag_days": lag_days,
         "lag_trading_days": lag_trading,
         "running_hours": running_hours,
-        "stale_trading_days": STALE_TRADING_DAYS,
+        "expect_lag_trading_days": expect_lag,
+        "horizon": horizon,
         "note": note,
     }
 
@@ -521,6 +540,7 @@ def quality_report(
     now: Optional[datetime] = None,
     history_path: Optional[Path] = None,
     list_horizon: str = "5",
+    ic_horizon: int = DEFAULT_HORIZON,
 ) -> Dict[str, Any]:
     """一次算全：全池预测力 + 名单内名次预测力 + 监控存活状态。
 
@@ -533,7 +553,7 @@ def quality_report(
             entries = []
         status = _load_json(Path(status_path) if status_path else STATUS_FILE)
         stats = ic_stats(entries)
-        fresh = monitor_freshness(entries, status, now=now)
+        fresh = monitor_freshness(entries, status, now=now, horizon=ic_horizon)
         hist = _load_json(Path(history_path) if history_path
                           else ROOT / "data" / "prediction_history.json")
         out = dict(stats)
@@ -671,6 +691,7 @@ __all__ = [
     "IC_FLOOR",
     "T_SIG",
     "RECENT_WINDOW",
-    "STALE_TRADING_DAYS",
+    "STALE_SLACK_TRADING_DAYS",
+    "DEFAULT_HORIZON",
     "FULL_UNIVERSE_MIN",
 ]
