@@ -352,9 +352,47 @@ CATCH_UP_JOBS: tuple = ("data_update", "daily_pick")
 # 后天，对今天毫无意义，只会白占 CPU —— 那时该由 TradingLoop._ensure_plan 兜底。
 CATCH_UP_MAX_LAG_SEC: int = 12 * 3600
 
+# ---- 日线作业的「按交易日」补跑（2026-11-19 新增）----
+# 为什么要有这一层：``CATCH_UP_MAX_LAG_SEC=12h`` 对 18:45 的选股来说**太短**。
+# 实测（11-14 ~ 11-19）：loop 整晚不在是常态，18:45 的 daily_pick 每天都没触发；
+# 而补跑窗口到次日 06:45 就关闭，于是**每日选股实际只覆盖了约一半的交易日**。
+# 11-19 盘中查到的现场就是这样：当天计划来自 11-18 00:36、用的是 11-17 的收盘
+# 数据 —— 拿两天前的信号在交易，而界面上一切正常。
+#
+# 对 daily_pick 来说，「补跑还有没有意义」的正确判据不是「漏了多久」，而是
+# **最近一个已收盘交易日到底做过没有**：只要做过，就已经有计划；没做过，补跑
+# 一定产出面向未来交易日的计划，永远不白跑。
+_CLOSED_DAY_JOBS: tuple = ("daily_pick",)
+
+# 「该做完」的时刻（交易日收盘后 N 点）。用**固定时刻**而不是 cron 触发时刻，
+# 是为了避免死循环：若按 18:45 判，则在 17:00 补跑成功后 at=17:00 < 18:45，
+# 下一轮 10 分钟检查又会判「没做」→ 每 10 分钟扫一次全池。
+# 17:00 既给了行情源 1.5 小时落库，又早于 18:30/18:45 的正常 cron。
+CATCH_UP_CLOSED_HOUR: int = 17
+
 # 反推 cron 触发时刻的回溯上限。只给枚举一个起点，
 # 真正的时效判断由 CATCH_UP_MAX_LAG_SEC 负责。
 _CATCH_UP_LOOKBACK_DAYS: int = 7
+
+
+def _last_closed_trading_day(now: Optional[datetime] = None):
+    """最近一个**已收盘**的交易日（今天是交易日且已过 15:30 → 就是今天）。
+
+    日历不可用时返回 ``None``，调用方据此退回原来的秒数窗口判据。
+    """
+    now = now or datetime.now()
+    try:
+        from src.trading.calendar import is_trading_day, recent_trading_days
+
+        closed_today = bool(is_trading_day(now)) and (now.hour, now.minute) > (15, 30)
+    except Exception:  # noqa: BLE001
+        return None
+    end = now.date() if closed_today else (now.date() - timedelta(days=1))
+    try:
+        days = recent_trading_days(1, end=end)
+    except Exception:  # noqa: BLE001
+        return None
+    return days[0] if days else None
 
 
 def _job_runs_load() -> Dict[str, dict]:
@@ -513,17 +551,35 @@ def missed_jobs(now: Optional[datetime] = None,
 
     runs = _job_runs_load()
     out: List[dict] = []
+    lcd = _last_closed_trading_day(now)
     for jid, cron in _catch_up_crons().items():
         if not cron:
             continue
         fire = last_fire_time(cron, now)
         if fire is None:
             continue
+        rec = runs.get(jid) or {}
+        at = _parse_iso(rec.get("at"))
+
+        # ---- 日线作业：按「最近一个已收盘交易日做过没有」判，而不是按漏了多久 ----
+        if jid in _CLOSED_DAY_JOBS and lcd is not None:
+            done_at = datetime(lcd.year, lcd.month, lcd.day, CATCH_UP_CLOSED_HOUR)
+            if done_at > now:
+                continue            # 今天还没到「该做完」的时刻，等 cron 自己跑
+            if at is None:
+                logger.info(f"作业 {jid} 无记账记录，跳过补跑（无法判断是否真的漏了）")
+                continue
+            if at >= done_at:
+                continue            # 最近交易日收盘后已经做过
+            lag = (now - done_at).total_seconds()
+            out.append({"job": jid, "missed_at": done_at.isoformat(timespec="seconds"),
+                        "lag_sec": int(lag), "last_run": rec.get("at"),
+                        "basis": "closed_day"})
+            continue
+
         lag = (now - fire).total_seconds()
         if lag < 0 or lag > CATCH_UP_MAX_LAG_SEC:
             continue
-        rec = runs.get(jid) or {}
-        at = _parse_iso(rec.get("at"))
         if at is None:
             # 没有记账 = 无法判断是否真漏（也可能只是刚部署、从没记过账）。
             # 宁可少补，也不要每次启动都白跑一遍全池选股。

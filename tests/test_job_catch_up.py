@@ -320,3 +320,91 @@ def test_bootstrap_does_not_suppress_a_real_miss(_state):
     A._job_runs_bootstrap(_at(THU - timedelta(days=1), 20, 0))
     got = {m["job"] for m in _missed(_at(THU, 19, 30))}
     assert got == {"data_update", "daily_pick"}
+
+
+# ---------------------------------------------------------------------------
+# 日线作业（daily_pick）按「最近一个已收盘交易日」补跑
+#
+# 背景（2026-11-19 实测）：``CATCH_UP_MAX_LAG_SEC=12h`` 对 18:45 的选股太短。
+# loop 整晚不在是常态，18:45 每天都没触发，而补跑窗口到次日 06:45 就关 ——
+# 实测每日选股只覆盖了约一半交易日，11-19 用的是 11-17 收盘数据算的计划，
+# 界面却一切正常。判据换成「最近一个已收盘交易日到底做过没有」后，
+# 只要没做过，补跑一定产出面向未来交易日的计划，永远不白跑。
+# ---------------------------------------------------------------------------
+
+def test_last_closed_trading_day_boundaries():
+    """15:30 整还不算收盘（当天数据没落库），15:31 才算。"""
+    assert A._last_closed_trading_day(datetime(2026, 11, 5, 15, 30)) == \
+        datetime(2026, 11, 4).date()
+    assert A._last_closed_trading_day(_at(THU, 15, 31)) == THU.date()
+    # 周六 → 最近已收盘的是周五
+    assert A._last_closed_trading_day(datetime(2026, 11, 7, 12, 0)) == \
+        datetime(2026, 11, 6).date()
+    # 周一开盘前 → 上周五
+    assert A._last_closed_trading_day(datetime(2026, 11, 9, 8, 0)) == \
+        datetime(2026, 11, 6).date()
+
+
+def test_daily_pick_missed_last_night_is_caught_up_next_morning(_state):
+    """**本条是这次改动的全部意义**：昨晚 18:45 漏了，今早 08:00 仍要补。
+
+    按旧的 12h 窗口，08:00 距 18:45 已 13.25h → 判「作废」，于是整整一个
+    交易日用的是两天前的信号。而补跑产出的是「面向下一个交易日」的计划，
+    开盘前补完全有意义。
+    """
+    _mark("data_update", _at(THU, 18, 30))
+    _mark("daily_pick", _at(THU - timedelta(days=2), 18, 45))   # 前天做过
+    nxt = _at(datetime(2026, 11, 6), 8, 0)                      # 次日开盘前
+    got = {m["job"]: m for m in _missed(nxt)}
+    assert "daily_pick" in got
+    assert got["daily_pick"]["basis"] == "closed_day"
+
+
+def test_daily_pick_before_closed_hour_waits_for_cron(_state):
+    """15:31 时不补 —— 还没到「该做完」的 17:00，等 cron 自己跑。
+
+    若此处就补，补完 at=15:31 < 当日 17:00，十分钟后又判「没做」→ 死循环。
+    """
+    _mark("data_update", _at(THU, 18, 30))
+    _mark("daily_pick", _at(THU - timedelta(days=1), 18, 45))
+    assert [m["job"] for m in _missed(_at(THU, 15, 31))] == []
+
+
+def test_daily_pick_caught_up_once_closed_hour_passes(_state):
+    _mark("data_update", _at(THU, 18, 30))
+    _mark("daily_pick", _at(THU - timedelta(days=1), 18, 45))
+    got = [m for m in _missed(_at(THU, 17, 1)) if m["job"] == "daily_pick"]
+    assert got and got[0]["basis"] == "closed_day"
+
+
+def test_daily_pick_not_repeated_after_it_ran(_state):
+    """补跑/正常跑过之后（at 已过当日 17:00）不许再补 —— 防每 10 分钟扫一次全池。"""
+    _mark("data_update", _at(THU, 18, 30))
+    _mark("daily_pick", _at(THU, 17, 5))
+    assert [m["job"] for m in _missed(_at(THU, 19, 30))] == []
+
+
+def test_daily_pick_without_record_is_still_skipped(_state):
+    """无记账照旧不补 —— 无法区分「真漏了」和「刚部署没记过账」。"""
+    assert _missed(_at(THU, 19, 30)) == []
+
+
+def test_data_update_keeps_the_old_window(_state):
+    """data_update 仍按 12h 窗口走，不被这次改动波及。
+
+    次日 08:00 距昨天 18:30 已 13.5h → 超窗口，不补；daily_pick 昨晚已做。
+    """
+    _mark("data_update", _at(THU, 18, 30))
+    _mark("daily_pick", _at(THU, 18, 52))
+    nxt = _at(datetime(2026, 11, 6), 8, 0)
+    assert _missed(nxt) == []
+
+
+def test_calendar_unavailable_falls_back_to_lag_window(_state, monkeypatch):
+    """日历挂掉时退回原来的秒数窗口，绝不因此少补或多补。"""
+    monkeypatch.setattr(A, "_last_closed_trading_day", lambda *a, **k: None)
+    _mark("data_update", _at(THU, 18, 31))
+    _mark("daily_pick", _at(THU - timedelta(days=1), 18, 45))
+    got = _missed(_at(THU, 19, 30))
+    assert [m["job"] for m in got] == ["daily_pick"]
+    assert got[0].get("basis") is None      # 走的是 lag 分支
