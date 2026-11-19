@@ -611,10 +611,19 @@ def catch_up_missed(now: Optional[datetime] = None, dry_run: bool = False,
     results: List[dict] = []
     for item in todo:
         jid = item["job"]
-        logger.warning(
-            f"⏰ 补跑错过的作业 {jid}：本该在 {item['missed_at']} 触发，"
-            f"已晚 {item['lag_sec'] // 60} 分钟（上次成功 {item['last_run']}）"
-        )
+        if item.get("basis") == "closed_day":
+            # 两种判据的「晚了多久」含义完全不同：lag 分支是「距上次 cron 触发」，
+            # closed_day 分支是「距该交易日 17:00 这个该做完的时刻」。文案混用会
+            # 让运维把"晚 900 分钟"误读成"作业迟到了 15 小时"。
+            logger.warning(
+                f"⏰ 补跑 {jid}：最近一个已收盘交易日的收盘后作业没有做过"
+                f"（自 {item['missed_at']} 起算，上次成功 {item['last_run']}）"
+            )
+        else:
+            logger.warning(
+                f"⏰ 补跑错过的作业 {jid}：本该在 {item['missed_at']} 触发，"
+                f"已晚 {item['lag_sec'] // 60} 分钟（上次成功 {item['last_run']}）"
+            )
         if dry_run:
             results.append({**item, "status": "would_run"})
             continue
